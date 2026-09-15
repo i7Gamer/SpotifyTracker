@@ -12,6 +12,7 @@ instance/
 .env
 .env.*
 .token-savior-cache.json
+AGENTS.md
 # coverage.py output (see requirements-dev.txt)
 .coverage
 .coverage.*
