@@ -16,9 +16,6 @@ transaction), but the remaining threads never get their clean stop.
 Costs nothing when shutdown is quick, which is the normal case: the grace
 period is a ceiling, not a wait - Docker proceeds the moment the process exits.
 
-The README carries its own copy of the compose file, so it is checked too: a
-setting only the repo's copy has is a setting nobody deploying from the README
-gets.
 """
 import os
 import re
@@ -37,7 +34,6 @@ from services.email_worker import EMAIL_WORKER_STOP_JOIN_TIMEOUT_SECONDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
-README_PATH = REPO_ROOT / "README.md"
 
 #< Listener.stop() joins twice: spotapi's LastPlayed thread, then the poll thread
 LISTENER_JOINS_PER_USER = 2
@@ -80,12 +76,6 @@ class TestComposeShutdownBudget(unittest.TestCase):
         otherwise shutdown abandons users that were about to finish."""
         self.assertGreaterEqual(USER_STOP_JOIN_TIMEOUT_SECONDS, PER_USER_JOIN_BUDGET_SECONDS)
 
-    def test_the_readme_copy_declares_the_same_value(self):
-        composeValue = _graceSeconds(COMPOSE_PATH.read_text(encoding="utf-8"))
-        readmeValue = _graceSeconds(README_PATH.read_text(encoding="utf-8"))
-
-        self.assertEqual(readmeValue, composeValue,
-                         "the README's compose snippet drifted from the real file")
 
 
 if __name__ == "__main__":

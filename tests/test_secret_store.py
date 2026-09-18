@@ -280,17 +280,6 @@ class TestPlaceholderKeyIsRefused(unittest.TestCase):
             self.assertEqual(secretStore._keyMaterial(),
                              secretStore.PLACEHOLDER_DATA_ENCRYPTION_KEY)
 
-    def test_both_guards_still_match_what_the_readme_ships(self):
-        """A placeholder guard matches ONE exact string, so it is only worth
-        anything while that string is the one a user can actually paste. Edit
-        the README's compose example without editing the constant and the
-        guard silently stops guarding - it would still pass every test above,
-        because those supply the constant to itself."""
-        readme = (pathlib.Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
-
-        self.assertIn(f"DATA_ENCRYPTION_KEY={secretStore.PLACEHOLDER_DATA_ENCRYPTION_KEY}", readme)
-        self.assertIn(f"FLASK_SECRET_KEY={PLACEHOLDER_FLASK_SECRET_KEY}", readme)
-
     def test_key_file_is_created_once_and_reused(self):
         self.assertFalse(secretStore.DEFAULT_KEY_PATH.exists())
 

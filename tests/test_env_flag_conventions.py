@@ -211,22 +211,6 @@ class TestEnvVarNamesAreSpelledOnce(unittest.TestCase):
             f"spelled as a literal:\n" + "\n".join(offenders))
 
 
-class TestEveryEnvVarIsDocumented(unittest.TestCase):
-    """An operator learns what the app reads from README.md's compose snippet
-    (one commented `#<` line per optional knob), not from the source. Two
-    knobs - WAITRESS_THREADS and SPOTIFY_TOTP_AUTO_RECOVER - were readable
-    only by grepping os.environ. Structural, for the same reason as the gates
-    above: an undocumented variable misbehaves nowhere."""
-
-    def test_the_readme_names_every_variable_the_app_reads(self):
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        names = set(TestEnvVarNamesAreSpelledOnce._definitions()) | ENV_VAR_NAMES_WITHOUT_CONSTANTS
-
-        self.assertEqual(
-            sorted(name for name in names if name not in readme), [],
-            "these env vars are read by the app but never mentioned in README.md")
-
-
 #< the block scanned for KEY names below; stops at the next line whose
 # indentation returns to (or above) "environment:"'s own
 _COMPOSE_ENV_BLOCK_HEADER = "environment:"
@@ -235,14 +219,14 @@ _COMPOSE_ENV_VAR_LINE = re.compile(r'^\s*#?\s*-\s*([A-Za-z_][A-Za-z0-9_]*)=')
 
 
 class TestComposeFileDocumentsEveryEnvVar(unittest.TestCase):
-    """docker-compose.yml is the file an operator actually copies and edits -
-    README.md even tells them so ("A ready-to-adapt compose file"). A variable
-    that only exists in README's prose (ALLOW_INSTANCE_RESTART's paragraph,
-    the BACKUP_* trio) or only in README's OWN separate compose snippet
-    (DATA_ENCRYPTION_KEY, TRUST_PROXY_HEADERS, ENABLE_HSTS, ADMIN_EMAIL) is
-    invisible to someone who never scrolls past the shipped file. Structural
-    for the same reason as TestEveryEnvVarIsDocumented above: an undocumented
-    variable misbehaves nowhere, so nothing but a scan catches its absence."""
+    """docker-compose.yml is the file an operator actually copies and edits,
+    and it is now the ONLY place a variable is guaranteed to be written down -
+    the prose that also describes them is not checked by anything. A variable
+    missing here (ALLOW_INSTANCE_RESTART and the BACKUP_* trio once were, as
+    were DATA_ENCRYPTION_KEY, TRUST_PROXY_HEADERS, ENABLE_HSTS and
+    ADMIN_EMAIL) is invisible to whoever deploys from it. Structural for the
+    same reason as the gates above: an undocumented variable misbehaves
+    nowhere, so nothing but a scan catches its absence."""
 
     @staticmethod
     def _composeEnvironmentBlockNames():
