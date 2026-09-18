@@ -17,19 +17,22 @@
 
 If you find it useful, consider giving the [repo](https://github.com/i7Gamer/SpotifyStatsTracker) a ⭐.
 
-<img width="1438" height="2337" alt="Overview" src="https://github.com/user-attachments/assets/44009d72-edbe-4681-8d7d-3b6f4c2e3419" />
+<img src="docs/screenshots/dashboard.jpg" alt="The dashboard: listening streak, trend cards, a contribution-style calendar and milestone progress" width="900">
 
 <details>
-<summary><b>More screenshots</b> — Compare, Genres, Wrapped, Admin, Top Songs, song detail</summary>
+<summary><b>More screenshots</b> — Overview, Top Songs, Wrapped, Compare, Genres, song detail, Admin</summary>
 
-<img width="1438" height="2265" alt="Compare" src="https://github.com/user-attachments/assets/c3495dfb-268b-48b2-8f83-4388fbda3ab8" />
-<img width="1437" height="2373" alt="Genres" src="https://github.com/user-attachments/assets/e34579e5-a397-43aa-97a0-102f4cb3974d" />
-<img width="1438" height="1744" alt="Wrapped" src="https://github.com/user-attachments/assets/be8526a3-efdf-4a48-8912-384c53439ee2" />
-<img width="1437" height="2297" alt="Admin console" src="https://github.com/user-attachments/assets/8aebd4be-041b-4991-9a0f-a85e88800a30" />
-<img width="1438" height="867" alt="Top Songs" src="https://github.com/user-attachments/assets/a7bb6a78-fd65-47ea-a0f6-bfecca2498a9" />
-<img width="1438" height="2308" alt="Song detail page" src="https://github.com/user-attachments/assets/328ab683-b803-4671-8749-bc13e579d53c" />
+<img src="docs/screenshots/overview.jpg" alt="Overview page" width="900">
+<img src="docs/screenshots/top-songs.jpg" alt="Top Songs" width="900">
+<img src="docs/screenshots/wrapped.jpg" alt="Yearly Wrapped" width="900">
+<img src="docs/screenshots/compare.jpg" alt="Compare page" width="900">
+<img src="docs/screenshots/genres.jpg" alt="Genres page" width="900">
+<img src="docs/screenshots/song-detail.jpg" alt="Song detail page" width="900">
+<img src="docs/screenshots/admin.jpg" alt="Admin console" width="900">
 
 </details>
+
+<sub>Screenshots come from a preview instance seeded with generated data — the artists, albums, songs and cover art are invented.</sub>
 
 ## Contents
 
