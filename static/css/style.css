@@ -14,11 +14,12 @@
   --text: #f6f6f6;
   --muted: #a0a0a0;
   --border: rgba(255, 255, 255, 0.08);
-  /* Resting height of the sticky .topbar: 14px padding, a 1.2rem brand line and
-     a 1px border. Used as a scroll offset so #anchor jumps do not land under
-     it. Approximate on purpose - the bar is flex-wrap, so badges can make it
-     taller; erring low just leaves the target slightly higher on the screen. */
-  --topbar-height: 52px;
+  /* Resting height of the sticky .topbar: 6px padding top and bottom, the
+     48px-tall brand image (layout.html) and a 1px border. Used as a scroll
+     offset so #anchor jumps do not land under it. Approximate on purpose -
+     the bar is flex-wrap, so badges can make it taller; erring low just
+     leaves the target slightly higher on the screen. */
+  --topbar-height: 61px;
   /* Tokens the admin/profile inline styles reference with a hardcoded fallback
      (var(--fg, #f0f0f0) etc.). Defining them once here - at their existing
      fallback values, so appearance is unchanged - single-sources them and lets
@@ -185,7 +186,11 @@ button {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 14px 24px;
+  /* Vertical padding is 6px rather than the 14px the rest of the chrome uses:
+     the brand image is 48px tall (the size its lettering has to be to match
+     the 1.2rem text it replaced), and at 14px that made a 77px bar. The nav
+     links and badges have their own padding, so they keep their hit areas. */
+  padding: 6px 24px;
   border-bottom: 1px solid var(--glass-border);
   background: var(--glass-bg);
   backdrop-filter: blur(16px) saturate(180%);

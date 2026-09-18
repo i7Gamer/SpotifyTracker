@@ -133,7 +133,7 @@ const LISTENER_STATUS_POLL_MS = 10 * 1000;
   // viewport, so its height is (viewport - topbar). .topbar is flex-wrap and
   // grows a second row for any of the four badges (share request, accepted
   // share, milestone, Spotify reauth), so that height is not a constant: the
-  // literal this replaces said 62px, --topbar-height says 52px, and with a
+  // literal this replaces said 62px, --topbar-height says 61px, and with a
   // badge showing neither was right.
   const TOPBAR_HEIGHT_VAR = '--topbar-current-height';
 
