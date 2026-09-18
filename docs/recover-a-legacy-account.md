@@ -1,10 +1,13 @@
 # Recover a legacy account
 
 Reached from the warning `dashboard/user_registry.py` logs when a login is
-given a suffixed username instead of a legacy row's history. The guarded
-`UPDATE` below is executed against disposable accounts by
-`tests/test_user_registry.py`, so it is checked rather than merely written
-down - edit it there and here together.
+given a suffixed username instead of a legacy row's history.
+
+> **Nothing tests the SQL below.** It used to be executed against disposable
+> accounts by `tests/test_user_registry.py`; that test was removed. Run it on
+> a copy of the backup first, and check `rows_updated` before committing -
+> the guards in the `UPDATE` are the only thing standing between a typo and
+> the wrong account.
 
 Older databases can contain a user whose `email` is `NULL`. A later login whose
 sanitized email prefix matches that username is deliberately assigned a suffixed

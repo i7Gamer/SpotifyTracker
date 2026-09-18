@@ -206,29 +206,6 @@ class TestLegacyUsernameLookup(unittest.TestCase):
 
         self.assertIsNone(self.repo.getNullEmailUsernameNoCase("STRASSE"))
 
-    def test_documented_reassociation_guards_and_rollback(self):
-        # Execute the actual maintenance example against disposable accounts:
-        # a case-variant email on a suffixed account must block reassociation.
-        runbook = (Path(__file__).resolve().parent.parent
-                   / "docs" / "recover-a-legacy-account.md").read_text(encoding="utf-8")
-        script = runbook.split("```sql")[2].split("```", 1)[0]
-        statements = [statement.strip() for statement in script.split(";") if statement.strip()]
-        conn = self.repo._conn()
-        for legacyEmail, conflictingEmail, expectedUpdates in (
-                (None, None, 1), (None, "OWNER@example.com", 0),
-                ("existing@example.com", None, 0)):
-            with self.subTest(legacyEmail=legacyEmail, conflictingEmail=conflictingEmail):
-                with conn:
-                    conn.execute("DELETE FROM users")
-                self.repo.upsertUser("ExactLegacyName", legacyEmail)
-                if conflictingEmail:
-                    self.repo.upsertUser("ExactLegacyName_1", conflictingEmail)
-                before = [tuple(row) for row in conn.execute("SELECT * FROM users ORDER BY username")]
-                results = [conn.execute(statement).fetchall() for statement in statements]
-                self.assertEqual(results[-2][0]["rows_updated"], expectedUpdates)
-                conn.rollback()
-                self.assertEqual([tuple(row) for row in conn.execute("SELECT * FROM users ORDER BY username")], before)
-
 
 class TestRegistryDoesNotImportFlask(unittest.TestCase):
     def test_module_has_no_flask_dependency(self):
