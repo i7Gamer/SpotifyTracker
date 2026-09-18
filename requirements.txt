@@ -72,4 +72,4 @@ tzdata==2026.3
 # as "unused". (pymongo used to arrive transitively via spotipyFree; with that
 # wrapper replaced by Database/Spotify/, it has to be named here.)
 redis==8.1.0
-pymongo==4.18.0
+pymongo==4.18.1
