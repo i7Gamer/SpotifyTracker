@@ -40,7 +40,7 @@ def test_reports_each_bypassed_legacy_row(registry, caplog, rows, expected_name,
     messages = [record.getMessage() for record in caplog.records if record.name == LOGGER_NAME]
     assert messages == [
         f"Legacy account {name} has no associated email; allocated new account {expected_name}. "
-        "See README.md#recover-a-legacy-account before reassociating either account."
+        "See docs/recover-a-legacy-account.md before reassociating either account."
         for name in warned_names
     ]
     assert all(NEW_EMAIL not in message for message in messages)

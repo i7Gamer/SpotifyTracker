@@ -124,7 +124,7 @@ class UserRegistryMixin:
                 if legacyUsername is not None:
                     logger.warning(
                         "Legacy account %s has no associated email; allocated new account %s. "
-                        "See README.md#recover-a-legacy-account before reassociating either account.",
+                        "See docs/recover-a-legacy-account.md before reassociating either account.",
                         legacyUsername,
                         username,
                     )

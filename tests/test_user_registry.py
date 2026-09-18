@@ -140,7 +140,7 @@ class TestLegacyAccountAllocationWarning(unittest.TestCase):
         rendered = warning.call_args.args[0] % warning.call_args.args[1:]
         self.assertIn("Alice", rendered)
         self.assertIn("alice_1", rendered)
-        self.assertIn("README", rendered)
+        self.assertIn("docs/recover-a-legacy-account.md", rendered)
         self.assertNotIn("alice@example.com", rendered)
 
     def test_different_email_username_collision_does_not_warn(self):
@@ -209,9 +209,9 @@ class TestLegacyUsernameLookup(unittest.TestCase):
     def test_documented_reassociation_guards_and_rollback(self):
         # Execute the actual maintenance example against disposable accounts:
         # a case-variant email on a suffixed account must block reassociation.
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
-        recovery = readme.split("### Recover a legacy account", 1)[1]
-        script = recovery.split("```sql")[2].split("```", 1)[0]
+        runbook = (Path(__file__).resolve().parent.parent
+                   / "docs" / "recover-a-legacy-account.md").read_text(encoding="utf-8")
+        script = runbook.split("```sql")[2].split("```", 1)[0]
         statements = [statement.strip() for statement in script.split(";") if statement.strip()]
         conn = self.repo._conn()
         for legacyEmail, conflictingEmail, expectedUpdates in (
