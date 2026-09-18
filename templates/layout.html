@@ -31,11 +31,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#000000">
-    <meta name="title" content="Spotify Tracker" />
-    <meta name="description" content="Keep track of your Spotify listening habits with this Spotify Tracker.">
+    <meta name="title" content="SpotifyTracker" />
+    <meta name="description" content="Keep track of your Spotify listening habits with SpotifyTracker.">
     {#- Page-specific first, app name second: a narrow tab strip truncates from
         the right, so the part that tells two open tabs apart has to lead. -#}
-    <title>{% block title %}Spotify Tracker{% endblock %}</title>
+    <title>{% block title %}SpotifyTracker{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='images/favicon.png') }}">
@@ -67,7 +67,17 @@
     <a class="skip-link" href="#main-content">Skip to main content</a>
     <header class="topbar">
       <a class="brand" href="{{ url_for('overviewPage') }}">
-        Spotify Tracker
+        {#- The name is artwork now, so the alt text IS this link's accessible
+            name - on both images, because CSS decides which one is displayed
+            (the wordmark, or the square mark alone once the bar gets narrow)
+            and the hidden one is out of the accessibility tree either way.
+            width/height are declared because .topbar is sticky and flex-wrap:
+            without a reserved box the whole row, badges included, reflows the
+            moment the PNG decodes. tests/test_brand_assets.py. -#}
+        <img class="brand-logo" width="104" height="32" alt="SpotifyTracker"
+             src="{{ url_for('static', filename='images/brand/wordmark-on-dark.png') }}">
+        <img class="brand-mark" width="32" height="32" alt="SpotifyTracker"
+             src="{{ url_for('static', filename='images/brand/icon.png') }}">
         {# UI-07 (2026-09-02 review): the pill's state was colour (its class)
            and a hover-only title - nothing a screen reader could read without
            hovering an element with no text of its own. static/js/layout-

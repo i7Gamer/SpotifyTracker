@@ -39,7 +39,7 @@ SETTING_INSTANCE_PUBLIC_URL = "instance_public_url"
 
 DEFAULT_SMTP_PORT = 587
 DEFAULT_SMTP_ENCRYPTION = "tls"
-DEFAULT_SMTP_FROM_NAME = "Spotify Stats Tracker"
+DEFAULT_SMTP_FROM_NAME = "SpotifyTracker"
 # Bounds every SMTP connect/read. smtplib's own default is no timeout at all,
 # so without this a black-holed host holds whichever thread is sending - an
 # admin's /admin/test_email request thread, or the email worker - indefinitely.
@@ -257,13 +257,13 @@ def send_test_email(repo: Repository, recipient_email: str) -> tuple[bool, str |
     if not config["host"]:
         return False, "SMTP host is empty. Please enter SMTP settings first."
 
-    subject = "Spotify Stats Tracker — Test Email"
-    text_body = "This is a test notification email from your Spotify Stats Tracker instance."
+    subject = "SpotifyTracker — Test Email"
+    text_body = "This is a test notification email from your SpotifyTracker instance."
     html_body = """
     <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #121212; color: #ffffff;">
-      <h2 style="color: #1db954;">Spotify Stats Tracker</h2>
+      <h2 style="color: #1db954;">SpotifyTracker</h2>
       <p>This is a test notification email verifying that your SMTP credentials are configured correctly.</p>
-      <p style="color: #888888; font-size: 0.85em;">Sent by Spotify Stats Tracker Admin Settings</p>
+      <p style="color: #888888; font-size: 0.85em;">Sent by SpotifyTracker Admin Settings</p>
     </div>
     """
 
@@ -321,10 +321,10 @@ def _render_event_template(
     htmlUsername = html.escape(username)
 
     if event_type == EVENT_INVALID_COOKIES:
-        subject = "Spotify Stats Tracker — Action Required: Re-authenticate Session"
+        subject = "SpotifyTracker — Action Required: Re-authenticate Session"
         text_body = (
             f"Hello {username},\n\nYour Spotify session cookies are invalid or expired. "
-            "Spotify Stats Tracker cannot log your listening activity until you log in again.\n\n"
+            "SpotifyTracker cannot log your listening activity until you log in again.\n\n"
             + (f"Log in here: {link}" if link else "Please visit your tracker instance to update your session.")
         )
         cta = _ctaButton(link, "Log In to Re-authenticate") if link else \
@@ -338,7 +338,7 @@ def _render_event_template(
         </div>
         """
     elif event_type == EVENT_API_KEY_FAILED:
-        subject = "Spotify Stats Tracker — API Key Error"
+        subject = "SpotifyTracker — API Key Error"
         text_body = (
             f"Hello {username},\n\nYour Spotify or Last.fm API credentials returned an authentication error during backfill.\n\n"
             + (f"Update them here: {link}" if link else "Please check your account Connections on your profile page.")
@@ -355,9 +355,9 @@ def _render_event_template(
         """
     elif event_type == EVENT_SHARE_REQUEST:
         requester = context.get("requester_username", "A user")
-        subject = f"Spotify Stats Tracker — New Share Request from {requester}"
+        subject = f"SpotifyTracker — New Share Request from {requester}"
         text_body = (
-            f"Hello {username},\n\n{requester} requested to share listening data with you on Spotify Stats Tracker.\n\n"
+            f"Hello {username},\n\n{requester} requested to share listening data with you on SpotifyTracker.\n\n"
             + (f"Respond here: {link}" if link else "Log in to accept or decline this request on your profile Sharing page.")
         )
         cta = _ctaButton(link, "View Request") if link else \
@@ -379,11 +379,11 @@ def _render_event_template(
         milestones = context.get("milestones") or []
         count = len(milestones)
         if count == 1:
-            subject = f"Spotify Stats Tracker — Milestone Reached: {milestones[0].get('label', 'Milestone reached')}"
+            subject = f"SpotifyTracker — Milestone Reached: {milestones[0].get('label', 'Milestone reached')}"
         elif count > 1:
-            subject = f"Spotify Stats Tracker — {count} New Milestones Reached"
+            subject = f"SpotifyTracker — {count} New Milestones Reached"
         else:
-            subject = "Spotify Stats Tracker — Milestone Reached"
+            subject = "SpotifyTracker — Milestone Reached"
 
         if milestones:
             textLines = "\n".join(f"- {m.get('icon', '')} {m.get('label', '')}".strip() for m in milestones)
@@ -402,7 +402,7 @@ def _render_event_template(
             + (f"See it on your dashboard: {link}" if link else "Log in to see it on your dashboard.")
         )
         cta = _ctaButton(link, "View Your Milestones") if link else \
-            "Log in to your Spotify Stats Tracker dashboard to see it."
+            "Log in to your SpotifyTracker dashboard to see it."
         html_body = f"""
         <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #121212; color: #ffffff;">
           <h2 style="color: #1db954;">Milestone Reached!</h2>
@@ -412,8 +412,8 @@ def _render_event_template(
         </div>
         """
     else:
-        subject = f"Spotify Stats Tracker — Notification ({event_type})"
-        text_body = f"Hello {username},\n\nYou have a new notification on Spotify Stats Tracker."
+        subject = f"SpotifyTracker — Notification ({event_type})"
+        text_body = f"Hello {username},\n\nYou have a new notification on SpotifyTracker."
         html_body = f"<p>Hello {htmlUsername}, you have a new notification.</p>"
 
     return subject, text_body, html_body

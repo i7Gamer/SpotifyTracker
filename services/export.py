@@ -282,7 +282,7 @@ def _xspfSafeText(value: str) -> str:
     return (value or "").translate(_XSPF_ILLEGAL_CHARS)
 
 
-def generatePlaylistXspf(tracks: list[dict], title: str = "Spotify Tracker Playlist"):
+def generatePlaylistXspf(tracks: list[dict], title: str = "SpotifyTracker Playlist"):
     import xml.sax.saxutils as xml_escape
 
     def xmlText(value):

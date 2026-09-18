@@ -1,11 +1,26 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="static/images/brand/wordmark-on-dark.png">
+    <img src="static/images/brand/wordmark-on-light.png" alt="SpotifyTracker" width="420">
+  </picture>
+</p>
+
+<p align="center">
+  Self-hosted Spotify listening history and statistics — <b>no Spotify Premium required</b>.
+</p>
+
+<p align="center">
+  <a href="https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/tests.yml"><img src="https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/lint.yml"><img src="https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/lint.yml/badge.svg" alt="Lint"></a>
+  <a href="https://github.com/i7Gamer/SpotifyStatsTracker/security/code-scanning"><img src="https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/github-code-scanning/codeql/badge.svg" alt="CodeQL"></a>
+</p>
+
+If you find it useful, consider giving the [repo](https://github.com/i7Gamer/SpotifyStatsTracker) a ⭐.
+
 <img width="1438" height="2337" alt="SpotifyTrackerOverviewV3" src="https://github.com/user-attachments/assets/44009d72-edbe-4681-8d7d-3b6f4c2e3419" />
 <img width="1438" height="2265" alt="SpotifyTrackerCompareV2" src="https://github.com/user-attachments/assets/c3495dfb-268b-48b2-8f83-4388fbda3ab8" />
 <img width="1437" height="2373" alt="SpotifyTrackerGenres" src="https://github.com/user-attachments/assets/e34579e5-a397-43aa-97a0-102f4cb3974d" />
 <img width="1438" height="1744" alt="SpotifyTrackerWrappedV5" src="https://github.com/user-attachments/assets/be8526a3-efdf-4a48-8912-384c53439ee2" />
-
-## Spotify Stats Tracker - [![Tests](https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/tests.yml/badge.svg)](https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/tests.yml) [![Lint](https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/lint.yml/badge.svg)](https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/lint.yml) [![CodeQL](https://github.com/i7Gamer/SpotifyStatsTracker/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/i7Gamer/SpotifyStatsTracker/security/code-scanning)
-
-A self-hosted web application for recording and exploring your Spotify listening history and statistics — **no Spotify Premium required**. If you find it useful, consider giving the [repo](https://github.com/i7Gamer/SpotifyStatsTracker) a ⭐.
 
 ## Features
 

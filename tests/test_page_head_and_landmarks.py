@@ -4,7 +4,7 @@ Three things a route test can't see and a browser-less suite otherwise never
 checks:
 
 * Every page shipped the same fixed `<title>`, so a stack of open tabs, a
-  browser-history search and a bookmark all read "Spotify Tracker" with no way
+  browser-history search and a bookmark all read "SpotifyTracker" with no way
   to tell one page from another.
 * There was no skip link, so reaching the main content by keyboard meant
   tabbing through the whole topbar - every badge, both dropdowns, the account
@@ -34,7 +34,7 @@ _LAYOUTS = ("layout.html", "layout_public.html")
 
 # The suffix every page's title keeps, so a tab is still identifiable as this
 # app once the page-specific part is truncated by a narrow tab strip.
-_TITLE_SUFFIX = "Spotify Tracker"
+_TITLE_SUFFIX = "SpotifyTracker"
 
 _MAIN_ID = "main-content"
 _SKIP_LINK_CLASS = "skip-link"

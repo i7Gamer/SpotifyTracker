@@ -27,11 +27,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#000000" />
-    <meta name="title" content="Spotify Tracker" />
-    <meta name="description" content="Keep track of your Spotify listening habits with this Spotify Tracker." />
+    <meta name="title" content="SpotifyTracker" />
+    <meta name="description" content="Keep track of your Spotify listening habits with SpotifyTracker." />
     {#- Page-specific first, app name second: a narrow tab strip truncates from
         the right, so the part that tells two open tabs apart has to lead. -#}
-    <title>{% block title %}Spotify Tracker{% endblock %}</title>
+    <title>{% block title %}SpotifyTracker{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='images/favicon.png') }}">
     {#- Here as well as in layout.html, and for the same reason the favicon above

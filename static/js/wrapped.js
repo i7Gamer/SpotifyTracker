@@ -56,8 +56,8 @@ if (typeof document !== 'undefined') {
   var byId = function (id) { return document.getElementById(id); };
 
   //< everything after the year in the title the server already rendered
-  //  ("{{ year }} Wrapped - Spotify Tracker" - templates/wrapped.html's title
-  //  block), derived rather than hardcoding "Spotify Tracker" a second time so
+  //  ("{{ year }} Wrapped - SpotifyTracker" - templates/wrapped.html's title
+  //  block), derived rather than hardcoding "SpotifyTracker" a second time so
   //  a renamed base title (layout.html) still matches
   var WRAPPED_TITLE_SUFFIX = document.title.replace(/^\d+/, '');
 
@@ -217,7 +217,7 @@ if (typeof document !== 'undefined') {
     ctx.fillStyle = '#666666';
     ctx.font = 'italic 12px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('Generated via Spotify Stats Tracker', 300, 860);
+    ctx.fillText('Generated via SpotifyTracker', 300, 860);
 
     var link = document.createElement('a');
     link.download = btn.dataset.user + '_' + btn.dataset.year + '_wrapped_summary.png';

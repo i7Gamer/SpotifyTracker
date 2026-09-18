@@ -7,7 +7,13 @@
 
 <section class="hero">
   <div class="hero-content">
-    <h1>Spotify Stats Tracker</h1>
+    {#- The one page whose <h1> is the app's own name, so it is the wordmark
+        rather than the words. Still an <h1> with an accessible name - the alt
+        text carries it - so the page keeps its single top-level heading. -#}
+    <h1 class="hero-wordmark">
+      <img width="182" height="56" alt="SpotifyTracker"
+           src="{{ url_for('static', filename='images/brand/wordmark-on-dark.png') }}">
+    </h1>
     <p>A central system-wide overview of tracked metrics, platform features, and real-time synchronization status.</p>
   </div>
 </section>

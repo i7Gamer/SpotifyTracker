@@ -204,6 +204,47 @@ button {
   align-items: center;
 }
 
+/* The brand is a wordmark image now (layout.html). Two files rather than one
+   scaled down: below the phone breakpoint the lettering in a 104px-wide
+   wordmark is unreadable and it still crowds out the badges, so the square
+   mark takes over there. Exactly one of the pair is ever displayed - the
+   swap's two halves fire at the same width, which tests/test_brand_assets.py
+   pins, because a gap between them would show both marks or neither. */
+.brand-logo,
+.brand-mark {
+  display: block;
+  /* The attributes reserve the box; this keeps it if a theme or a user
+     stylesheet ever sizes images by width alone. */
+  height: auto;
+}
+
+.brand-mark {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .brand-logo {
+    display: none;
+  }
+
+  .brand-mark {
+    display: block;
+  }
+}
+
+/* The Overview hero's <h1> is the same wordmark at hero size. The <img> is the
+   heading's only content, so the line-height an <h1> brings would otherwise
+   add a stripe of dead space under it. */
+.hero-wordmark {
+  line-height: 0;
+  margin-bottom: 0;
+}
+
+.hero-wordmark img {
+  height: auto;
+  max-width: 100%;
+}
+
 .nav-links a {
   margin-left: 20px;
   color: var(--muted);

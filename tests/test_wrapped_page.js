@@ -99,7 +99,7 @@ function loadWrapped(options) {
   };
   global.document = {
     documentElement: { className: options.theme || 'theme-rose' },
-    title: options.title || '2026 Wrapped - Spotify Tracker',
+    title: options.title || '2026 Wrapped - SpotifyTracker',
     addEventListener(type, fn) { calls.docListeners[type] = fn; },
     //< multiple listeners for one event type, like the real DOM allows -
     //  wrapped.js registers more than one htmx listener per event, and a
@@ -306,11 +306,11 @@ run('an out-of-band region swapping does not redraw the chart again', () => {
 // attribute of anything settle will touch).
 
 run('a year switch updates document.title, keeping the server\'s suffix', () => {
-  const page = loadWrapped({ title: '2026 Wrapped - Spotify Tracker' });
+  const page = loadWrapped({ title: '2026 Wrapped - SpotifyTracker' });
 
   fireBody(page, 'htmx:afterSwap', { target: { id: 'wrappedYearField', value: '2025' } });
 
-  assert.strictEqual(global.document.title, '2025 Wrapped - Spotify Tracker');
+  assert.strictEqual(global.document.title, '2025 Wrapped - SpotifyTracker');
 });
 
 run('a self-hosted rename of the base title still tracks, nothing hardcoded', () => {
@@ -322,12 +322,12 @@ run('a self-hosted rename of the base title still tracks, nothing hardcoded', ()
 });
 
 run('the main results swap does not touch the title - it never carries the year field', () => {
-  const page = loadWrapped({ title: '2026 Wrapped - Spotify Tracker' });
+  const page = loadWrapped({ title: '2026 Wrapped - SpotifyTracker' });
 
   fireBody(page, 'htmx:afterSwap', { target: { id: 'wrappedResults' } });
   fireBody(page, 'htmx:afterSettle', { target: { id: 'wrappedResults' } });
 
-  assert.strictEqual(global.document.title, '2026 Wrapped - Spotify Tracker');
+  assert.strictEqual(global.document.title, '2026 Wrapped - SpotifyTracker');
 });
 
 run('the wrapped form prunes its empty params, and nothing else does', () => {

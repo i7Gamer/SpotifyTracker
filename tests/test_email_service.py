@@ -54,7 +54,7 @@ def test_smtp_config_save_and_get():
         user="testuser@example.com",
         password="secretpassword123",
         from_email="noreply@example.com",
-        from_name="Spotify Stats Tracker",
+        from_name="SpotifyTracker",
     )
 
     config_after = get_smtp_config(repo)
@@ -64,7 +64,7 @@ def test_smtp_config_save_and_get():
     assert config_after["encryption"] == "ssl"
     assert config_after["user"] == "testuser@example.com"
     assert config_after["from_email"] == "noreply@example.com"
-    assert config_after["from_name"] == "Spotify Stats Tracker"
+    assert config_after["from_name"] == "SpotifyTracker"
 
 
 def test_instance_public_url_save_and_get():
@@ -133,12 +133,12 @@ def test_build_email_message():
         text_body="Hello Plain Text",
         html_body="<h1>Hello HTML</h1>",
         from_email="noreply@example.com",
-        from_name="Spotify Tracker",
+        from_name="SpotifyTracker",
     )
 
     assert msg["To"] == "user@example.com"
     assert msg["Subject"] == "Test Subject"
-    assert "Spotify Tracker <noreply@example.com>" in msg["From"]
+    assert "SpotifyTracker <noreply@example.com>" in msg["From"]
 
 
 @patch("smtplib.SMTP")
@@ -175,7 +175,7 @@ def test_send_email_notification_success(mock_smtp_class):
         user="smtp_user",
         password="smtp_password",
         from_email="noreply@example.com",
-        from_name="Spotify Tracker",
+        from_name="SpotifyTracker",
     )
 
     sent = send_email_notification(repo, username, EVENT_INVALID_COOKIES, context={})
@@ -198,7 +198,7 @@ def test_send_email_notification_includes_configured_instance_link(mock_smtp_cla
 
     save_smtp_config(
         repo=repo, enabled=True, host="smtp.example.com", port=587, encryption="tls",
-        user="smtp_user", password="smtp_password", from_email="noreply@example.com", from_name="Spotify Tracker",
+        user="smtp_user", password="smtp_password", from_email="noreply@example.com", from_name="SpotifyTracker",
     )
     save_instance_public_url(repo, "https://tracker.example.com")
 
@@ -226,7 +226,7 @@ def test_send_test_email(mock_smtp_class):
         user="smtp_user",
         password="smtp_password",
         from_email="noreply@example.com",
-        from_name="Spotify Tracker",
+        from_name="SpotifyTracker",
     )
 
     result, err = send_test_email(repo, "admin@example.com")
@@ -502,7 +502,7 @@ class TestSmtpTimeout:
         save_smtp_config(
             repo=repo, enabled=True, host="smtp.example.com", port=587, encryption="tls",
             user="smtp_user", password="smtp_password",
-            from_email="noreply@example.com", from_name="Spotify Tracker",
+            from_email="noreply@example.com", from_name="SpotifyTracker",
         )
 
         result, err = send_test_email(repo, "admin@example.com")
@@ -519,7 +519,7 @@ class TestSmtpTimeout:
         save_smtp_config(
             repo=repo, enabled=True, host="smtp.example.com", port=465, encryption="ssl",
             user="smtp_user", password="smtp_password",
-            from_email="noreply@example.com", from_name="Spotify Tracker",
+            from_email="noreply@example.com", from_name="SpotifyTracker",
         )
 
         result, err = send_test_email(repo, "admin@example.com")
