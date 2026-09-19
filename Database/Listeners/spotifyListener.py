@@ -1436,10 +1436,15 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 self._pendingMissingTrackUris.pop(uri, None)
 
             if missingUris:
+                # Named, because every listener cross-checks its OWN account's
+                # queue history: an unattributed line cannot be acted on, and a
+                # live scorecard of these warnings had to settle for "some user
+                # has this play" instead of "this user does".
                 logger.warning(
-                    "Connect-state queue history shows %d track(s) that were never recorded via "
-                    "current_user_recently_played() - the websocket cache may have missed a play. "
-                    "Missing tracks: %s",
+                    "Connect-state queue history for user %s shows %d track(s) that were never "
+                    "recorded via current_user_recently_played() - the websocket cache may have "
+                    "missed a play. Missing tracks: %s",
+                    self.logUser,
                     len(missingUris),
                     ", ".join(missingUris),
                 )
