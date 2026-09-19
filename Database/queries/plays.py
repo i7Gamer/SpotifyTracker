@@ -168,20 +168,46 @@ class PlayQueries:
     def getRecentlyRecordedTrackIds(self, username: str, trackIds: list[str],
                                     sinceSeconds: float) -> set[str]:
         """Which of `trackIds` this user has any play for in the last
-        `sinceSeconds`.
+        `sinceSeconds`, counting a play on any member of the same
+        duplicate-merge group.
 
         Backs the listener's missed-play cross-check, so it answers "did we
         record this at all", not "did we record this specific play" - is_skip
         rows count, since a skip is still a play that was captured. Batched into
         one query because the caller asks about a whole connect-state queue at
-        once, on a polling loop."""
+        once, on a polling loop.
+
+        The merge group matters because Spotify hands out different ids for the
+        same recording over time (market relinking, re-releases), so the id in
+        today's connect-state queue and the id last week's play was recorded
+        under can differ - and comparing raw track_id then reports a play the
+        database demonstrably has. Live 2026-09-12..19: 49 of 285 flagged tracks
+        had a played group sibling, 30 with the flagged id as the duplicate and
+        19 as the canonical, so reading the asked track's own canonical_id is
+        not enough in either direction. Both sides are resolved to
+        COALESCE(canonical_id, id) instead, the same group key the rest of the
+        read path uses.
+
+        Driven from the play side (username + played_at, idx_plays_user_time),
+        then joined out to tracks by primary key - never from tracks, which
+        carries no canonical_id index and must not grow one for this (see
+        findRecentDuplicateCandidates). Measured on a copy of the live database,
+        20 queue ids over a 7-day window: 0.02ms -> 0.77ms per call, all index
+        searches, no scan. The caller only reaches here for candidates that
+        have already survived the grace window, and settles the answer after.
+
+        The ASKED id is returned, not the group's canonical one: the caller
+        matches the result against the queue's own uris."""
         if not trackIds:
             return set()
         conn = self._conn()
         placeholders = ",".join("?" for _ in trackIds)
         rows = conn.execute(
-            f"SELECT DISTINCT track_id FROM plays "
-            f"WHERE username=? AND played_at >= ? AND track_id IN ({placeholders})",
+            f"SELECT DISTINCT asked.id AS track_id FROM plays p "
+            f"JOIN tracks played ON played.id = p.track_id "
+            f"JOIN tracks asked ON COALESCE(asked.canonical_id, asked.id) "
+            f"                   = COALESCE(played.canonical_id, played.id) "
+            f"WHERE p.username=? AND p.played_at >= ? AND asked.id IN ({placeholders})",
             (username, time.time() - sinceSeconds, *trackIds),
         ).fetchall()
         return {row["track_id"] for row in rows}

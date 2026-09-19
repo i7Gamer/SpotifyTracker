@@ -184,6 +184,103 @@ class TestGetRecentlyRecordedTrackIds(unittest.TestCase):
         self.assertEqual(self._lookup([]), set())
 
 
+class TestGetRecentlyRecordedTrackIdsAcrossMerges(unittest.TestCase):
+    """The same lookup, for tracks that belong to a duplicate-merge group.
+
+    Spotify hands out different ids for the same recording over time (market
+    relinking, re-releases), so the id sitting in the connect-state queue today
+    and the id last week's play was recorded under can differ. Comparing raw
+    track_id then reports a play the database demonstrably has. Measured on
+    live data 2026-09-12..19: 49 of 285 flagged tracks had a played group
+    sibling, in BOTH directions - 30 where the flagged id was the duplicate and
+    19 where it was the canonical - so a one-hop canonical_id lookup is not
+    enough; group membership is the question.
+    """
+
+    HOUR = 3600
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.repo = Repository(Path(self._tmpdir.name) / "test.db")
+        self.addCleanup(self.repo.connectionManager.close)
+
+        self.repo.upsertUser("alice", "alice@example.com")
+        self.repo.upsertUser("bob", "bob@example.com")
+        for trackId in ("canon", "dupe", "sibling", "lonely",
+                        "stale-canon", "stale-dupe", "bobs-canon", "bobs-dupe"):
+            self.repo.upsertTrack(_track(trackId, ["a1"], "al1"))
+        self.repo.commit()
+        self._merge("dupe", "canon")
+        self._merge("sibling", "canon")
+        self._merge("stale-dupe", "stale-canon")
+        self._merge("bobs-dupe", "bobs-canon")
+
+        now = time.time()
+        self.repo.insertPlay("alice", "canon", now - self.HOUR, 60000)
+        self.repo.insertPlay("alice", "lonely", now - self.HOUR, 60000)
+        #< the group's only play is older than any window under test
+        self.repo.insertPlay("alice", "stale-canon", now - 30 * 24 * self.HOUR, 60000)
+        self.repo.insertPlay("bob", "bobs-canon", now - self.HOUR, 60000)
+        self.repo.commit()
+
+    def _merge(self, duplicateId, canonicalId):
+        self.repo._conn().execute(
+            "UPDATE tracks SET canonical_id=? WHERE id=?", (canonicalId, duplicateId))
+        self.repo.commit()
+
+    def _lookup(self, trackIds, sinceSeconds=7 * 24 * 3600):
+        return self.repo.getRecentlyRecordedTrackIds("alice", trackIds, sinceSeconds)
+
+    def test_duplicate_is_vouched_for_by_its_canonical(self):
+        """Direction A: queue reports the duplicate, the play is on the canonical."""
+        self.assertEqual(self._lookup(["dupe"]), {"dupe"})
+
+    def test_canonical_is_vouched_for_by_its_duplicate(self):
+        """Direction B: queue reports the canonical, the play is on a duplicate.
+        Only reachable by resolving both sides to the group, not by reading the
+        asked track's own canonical_id."""
+        self.repo.insertPlay("alice", "dupe", time.time() - self.HOUR, 60000)
+        self.repo.commit()
+        self.repo._conn().execute("DELETE FROM plays WHERE track_id='canon'")
+        self.repo.commit()
+        self.assertEqual(self._lookup(["canon"]), {"canon"})
+
+    def test_siblings_vouch_for_each_other(self):
+        """Direction C: neither asked nor played track is the other's canonical."""
+        self.repo.insertPlay("alice", "dupe", time.time() - self.HOUR, 60000)
+        self.repo.commit()
+        self.repo._conn().execute("DELETE FROM plays WHERE track_id='canon'")
+        self.repo.commit()
+        self.assertEqual(self._lookup(["sibling"]), {"sibling"})
+
+    def test_the_asked_id_is_returned_not_the_canonical_one(self):
+        """The caller matches the result against the queue's own uris, so a
+        canonical id in the result set would silence nothing."""
+        self.assertNotIn("canon", self._lookup(["dupe"]))
+
+    def test_a_group_whose_only_play_is_outside_the_window_still_warns(self):
+        """Merge-awareness widens WHICH plays count, never the time window."""
+        self.assertEqual(self._lookup(["stale-dupe"]), set())
+
+    def test_another_users_group_play_does_not_vouch(self):
+        self.assertEqual(self._lookup(["bobs-dupe"]), set())
+
+    def test_an_unmerged_track_is_unaffected(self):
+        self.assertEqual(self._lookup(["lonely"]), {"lonely"})
+
+    def test_a_merged_track_with_no_plays_anywhere_is_absent(self):
+        self.repo._conn().execute("DELETE FROM plays WHERE track_id='canon'")
+        self.repo.commit()
+        self.assertEqual(self._lookup(["dupe", "canon", "sibling"]), set())
+
+    def test_a_mixed_batch_answers_merged_and_unmerged_together(self):
+        self.assertEqual(
+            self._lookup(["dupe", "lonely", "stale-dupe", "bobs-dupe", "never-seen"]),
+            {"dupe", "lonely"},
+        )
+
+
 class TestGetPlayTimesInRange(unittest.TestCase):
     """Backs the Web API backfill's dedup: the listener's in-memory caches only
     cover the current listener object's lifetime, so after a reconnect the
