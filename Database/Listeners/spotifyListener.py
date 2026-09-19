@@ -218,11 +218,23 @@ LOCAL_PAUSE_RETRY_WAIT_SECONDS = 5
 CONNECT_STATE_MISSED_TRACK_CACHE_SIZE = 50
 
 # How far back the missed-track cross-check looks for an existing play before
-# deciding one is really missing. prev_tracks is the local queue's rolling
-# history, so anything in it was played within the current listening session;
-# a window comfortably wider than a session avoids calling a genuine miss
-# "already recorded" just because the same track was played yesterday.
-CONNECT_STATE_MISSED_TRACK_LOOKBACK_SECONDS = 6 * 60 * 60
+# deciding one is really missing.
+#
+# This was 6h on the assumption that "anything in prev_tracks was played within
+# the current listening session". Live app.log refutes that: prev_tracks is the
+# Spotify CLIENT's rolling queue history and lives as long as that client does,
+# not as long as one listening session. Over 2026-09-12..19, of 422 flagged
+# warning/track pairs, 178 (42%) had a real recorded play between 6h and 7d old
+# - in the database the whole time, just older than the window could see - and
+# another 54 were older still. Only the small warnings (<=3 tracks, playback
+# having just moved past a track) were mostly honest at 91%; the bulk
+# prev_tracks dumps a client hands over on connect were the noise.
+#
+# 7 days is where that distribution flattens out. The window deliberately keeps
+# a ceiling: "played at some point ever" is no evidence that the play now
+# sitting in the queue history was captured, and a wide enough window would
+# make the cross-check permanently silent instead of merely quiet.
+CONNECT_STATE_MISSED_TRACK_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
 
 # How long a missed-track candidate must stay unaccounted for before it is
 # worth a warning. prev_tracks shows a track the moment playback moves on,
