@@ -39,11 +39,27 @@ from Database.queries._base import (TRACK_MERGE_LAST_RUN_KEY,
 NOW = 1_800_000_000.0   #< a fixed clock: nothing here should depend on the real one
 WORKERS = 3             #< one metadata backfiller per live user
 ROUNDS = 25             #< see test_only_one_of_three_concurrent_claims_wins
+SPOTIFY_WORKER_NAME = "spotify_api"
+MATCHER_FAILURE = "database is locked"
+RELEASE_FAILURE = "still locked"
+EMPTY_MERGE_SUMMARY = {"groups": 0, "merged": 0}
 
 
 class CadenceTestCase(DatabaseTestCase):
     def _db(self):
         return self._makeDb({}, [])
+
+    def _waitDurations(self, db):
+        return [call.args[0] if call.args else None
+                for call in db.backfiller_stop_event.wait.call_args_list]
+
+    def assertReachedIdleWait(self, db):
+        self.assertIn(db.BACKFILLER_IDLE_WAIT_SECONDS, self._waitDurations(db))
+
+    def assertFailedSpotifyTelemetry(self, db, errorText):
+        telemetry = db._getWorkerTelemetry(SPOTIFY_WORKER_NAME)
+        self.assertEqual(telemetry["consecutive_failures"], 1)
+        self.assertIn(errorText, telemetry["last_error"])
 
 
 class TestTheDailySlot(CadenceTestCase):
@@ -166,16 +182,25 @@ class TestTheAdminRunOwnsTheSlotItUses(CadenceTestCase):
 
 
 class TestTheLoopIsWiredToIt(CadenceTestCase):
-    def test_the_loop_gates_the_matcher_on_the_claim(self):
-        """Same shape as the toggle's own source assertion: the cadence is
-        worth nothing if the loop stops asking."""
-        import inspect
-        from Database.workers.metadata_backfiller import MetadataBackfillMixin
-        source = inspect.getsource(MetadataBackfillMixin._metadataBackfillLoop)
+    def test_the_loop_skips_the_matcher_when_the_claim_is_refused(self):
+        """The cadence is worth nothing if a refused claim still runs."""
+        from unittest.mock import MagicMock
+        from test_metadata_backfiller import runsOneCycle
 
-        self.assertIn("isTrackMergeEnabled", source)
-        self.assertIn("claimTrackMergeRun", source)
-        self.assertIn("mergeTracksByIsrc", source)
+        db = self._db()
+        db.repo.isTrackMergeEnabled = MagicMock(return_value=True)
+        db.repo.claimTrackMergeRun = MagicMock(return_value=False)
+        db.repo.mergeTracksByIsrc = MagicMock(return_value=EMPTY_MERGE_SUMMARY)
+        db.getUserSpotifyCredentials = MagicMock(return_value=None)
+        db._backfillTrackIsrcs = MagicMock()
+        db.backfiller_stop_event = MagicMock()
+        runsOneCycle(db, db.backfiller_stop_event)
+
+        db._metadataBackfillLoop()
+
+        db.repo.isTrackMergeEnabled.assert_called_once()
+        db.repo.claimTrackMergeRun.assert_called_once()
+        db.repo.mergeTracksByIsrc.assert_not_called()
 
     def test_the_admin_enable_path_stamps_the_run(self):
         import inspect
@@ -229,8 +254,8 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
         from unittest.mock import MagicMock
 
         db = self._dbReadyForACycle()
-        db.repo.mergeTracksByIsrc = MagicMock(
-            side_effect=Exception("database is locked"))
+        db.repo.mergeTracksByIsrc = MagicMock(side_effect=Exception(MATCHER_FAILURE))
+        db.backfiller_stop_event.wait.reset_mock()
         started = time.time()
 
         self._runCycle(db)
@@ -239,6 +264,8 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
         self.assertTrue(
             db.repo.claimTrackMergeRun(now=started),
             "a pass that raised spent the day's slot without merging anything")
+        self.assertFailedSpotifyTelemetry(db, MATCHER_FAILURE)
+        self.assertReachedIdleWait(db)
 
     def test_a_raising_matcher_restores_the_PREVIOUS_run_not_never_ran(self):
         """Re-opening the slot must not also forget the pass that really did
@@ -263,6 +290,7 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
         db.repo.stampTrackMergeRun(now=previousRunAt)
         previousStamp = db.repo.getTrackMergeLastRun()
         db.repo.mergeTracksByIsrc = MagicMock(side_effect=Exception("boom"))
+        db.backfiller_stop_event.wait.reset_mock()
 
         self._runCycle(db)
 
@@ -271,6 +299,8 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
                          "the release must put back the run that really "
                          "happened - neither clear the key nor leave the "
                          "failed claim's own stamp standing")
+        self.assertFailedSpotifyTelemetry(db, "boom")
+        self.assertReachedIdleWait(db)
 
     def test_a_release_that_itself_fails_keeps_the_matchers_own_error(self):
         """Writes failing is the likeliest reason the merge failed, so the
@@ -280,10 +310,9 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
         from unittest.mock import MagicMock
 
         db = self._dbReadyForACycle()
-        db.repo.mergeTracksByIsrc = MagicMock(
-            side_effect=Exception("database is locked"))
-        db.repo.releaseTrackMergeRun = MagicMock(
-            side_effect=Exception("still locked"))
+        db.repo.mergeTracksByIsrc = MagicMock(side_effect=Exception(MATCHER_FAILURE))
+        db.repo.releaseTrackMergeRun = MagicMock(side_effect=Exception(RELEASE_FAILURE))
+        db.backfiller_stop_event.wait.reset_mock()
 
         with self.assertLogs(level="WARNING") as captured:
             self._runCycle(db)   #< the cycle's catch-all keeps the loop alive
@@ -292,6 +321,11 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
         self.assertTrue(
             any("database is locked" in line for line in captured.output),
             "the matcher's own failure must still be what the cycle reports")
+        self.assertTrue(
+            any("Could not release the ISRC merge slot" in line for line in captured.output),
+            "the release failure should still be named for diagnosis")
+        self.assertFailedSpotifyTelemetry(db, MATCHER_FAILURE)
+        self.assertReachedIdleWait(db)
 
     def test_a_succeeding_matcher_still_spends_the_slot(self):
         """The control: without it both tests above pass against a loop that
@@ -300,8 +334,7 @@ class TestAFailedPassDoesNotSpendTheDay(CadenceTestCase):
         from unittest.mock import MagicMock
 
         db = self._dbReadyForACycle()
-        db.repo.mergeTracksByIsrc = MagicMock(
-            return_value={"groups": 0, "merged": 0})
+        db.repo.mergeTracksByIsrc = MagicMock(return_value=EMPTY_MERGE_SUMMARY)
         started = time.time()
 
         self._runCycle(db)
