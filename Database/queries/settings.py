@@ -151,13 +151,18 @@ class SettingQueries:
     def setAppSetting(self, key: str, value: str) -> None:
         conn = self._conn()
         with conn:
-            conn.execute(
-                """
-                INSERT INTO app_settings (key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (key, value),
-            )
+            self._setAppSetting(conn, key, value)
+
+    @staticmethod
+    def _setAppSetting(conn, key: str, value: str) -> None:
+        """Write a setting inside the caller's transaction without committing."""
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (key, value),
+        )
 
     # ---- Typed numeric settings ------------------------------------------------
 
@@ -256,14 +261,46 @@ class SettingQueries:
         return mode, self._clampSkipValue(mode, value)
 
     def setSkipThreshold(self, mode: str, value: int) -> tuple[str, int]:
-        """Persist the skip threshold (clamped to the mode's bounds). Does NOT
-        recompute existing rows - callers pair this with recomputeSkipFlags()."""
+        """Commit the clamped threshold without reclassifying existing plays.
+
+        Kept for migrations/maintenance. Admin forms use
+        savePlaybackClassificationSettings for the complete atomic save."""
+        mode, value = self._normalizeSkipThreshold(mode, value)
+        conn = self._conn()
+        with conn:
+            self._setAppSetting(conn, SKIP_THRESHOLD_MODE_KEY, mode)
+            self._setAppSetting(conn, SKIP_THRESHOLD_VALUE_KEY, str(value))
+        return mode, value
+
+    def _normalizeSkipThreshold(self, mode: str, value: int) -> tuple[str, int]:
         if mode not in (SKIP_MODE_SECONDS, SKIP_MODE_PERCENT):
             raise ValueError(f"Unknown skip threshold mode: {mode!r}")
-        value = self._clampSkipValue(mode, int(value))
-        self.setAppSetting(SKIP_THRESHOLD_MODE_KEY, mode)
-        self.setAppSetting(SKIP_THRESHOLD_VALUE_KEY, str(value))
-        return mode, value
+        return mode, self._clampSkipValue(mode, int(value))
+
+    def savePlaybackClassificationSettings(self, mode: str, value: int,
+                                           completionPercent: int | None = None) -> int:
+        """Commit settings, all skip flags and Wrapped invalidation together.
+
+        Every Save also repairs existing drift, even for unchanged settings.
+        None leaves completion percent untouched. Returns rows reclassified.
+        Joins a caller's open transaction, committing all staged writes on
+        success and rolling them all back on failure, like other committing
+        repository verbs. Private helpers below must never commit early."""
+        mode, value = self._normalizeSkipThreshold(mode, value)
+        if completionPercent is not None:
+            completionPercent = max(COMPLETION_COMPLETE_PERCENT_MIN,
+                                    min(COMPLETION_COMPLETE_PERCENT_MAX, int(completionPercent)))
+        conn = self._conn()
+        with conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            self._setAppSetting(conn, SKIP_THRESHOLD_MODE_KEY, mode)
+            self._setAppSetting(conn, SKIP_THRESHOLD_VALUE_KEY, str(value))
+            if completionPercent is not None:
+                self._setAppSetting(conn, COMPLETION_COMPLETE_PERCENT_KEY, str(completionPercent))
+            processed = self._recomputeSkipFlags(conn)
+            self._deleteAllWrapped(conn)
+            return processed
 
     def computeIsSkip(self, timePlayed: int, durationMs: int | None = None,
                       threshold: tuple[str, int] | None = None,
@@ -307,9 +344,21 @@ class SettingQueries:
         return 1 if timePlayed < thresholdMs else 0
 
     def recomputeSkipFlags(self) -> int:
-        """Rewrite plays.is_skip for every row under the current threshold - run
-        after the admin changes it. Returns the number of rows processed.
-        Self-committing maintenance op (like setAppSetting).
+        """Commit a rewrite of plays.is_skip under the current settings.
+
+        Standalone maintenance/migration API; returns all rows processed.
+        Admin Save combines this rewrite with settings and cache invalidation.
+
+        The bulk rewrite classifies in SQL instead of calling computeIsSkip per
+        row, so the rule lives twice; tests/test_skip_settings.py pins both."""
+        conn = self._conn()
+        with conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            return self._recomputeSkipFlags(conn)
+
+    def _recomputeSkipFlags(self, conn) -> int:
+        """Reclassify inside an existing transaction without committing it.
 
         The bulk rewrite classifies in SQL instead of calling computeIsSkip per
         row, so the rule lives twice; both copies cap at the completion
@@ -317,46 +366,40 @@ class SettingQueries:
         row by row."""
         mode, value = self.getSkipThreshold()
         completionPercent = self.getCompletionCompletePercent()
-        conn = self._conn()
-        with conn:
-            if mode == SKIP_MODE_PERCENT:
-                # Per-row threshold: pct of the track's duration, or the fixed
-                # floor for tracks whose duration isn't known (<=0/missing).
-                # Capping the percent itself is enough here - both boundaries
-                # are the same fraction of the same duration.
-                cur = conn.execute(
-                    f"""
-                    UPDATE plays SET is_skip = CASE WHEN time_played < COALESCE(
-                        (SELECT CASE WHEN t.duration_ms > 0
-                                     THEN t.duration_ms * ? / {PERCENT_DIVISOR}
-                                     ELSE ? END
-                         FROM tracks t WHERE t.id = plays.track_id),
-                        ?)
-                    THEN 1 ELSE 0 END
-                    """,
-                    (min(value, completionPercent), db.SKIP_THRESHOLD_MS, db.SKIP_THRESHOLD_MS),
-                )
-            else:
-                # Same completion cap as computeIsSkip's seconds mode, per row:
-                # the threshold or the track's completion boundary, whichever
-                # comes first, so a play the completion pie calls complete is
-                # never stored as a skip. Tracks with an unknown duration
-                # (<=0/missing, or no tracks row) keep the plain threshold via
-                # COALESCE.
-                thresholdMs = value * MS_PER_SECOND
-                cur = conn.execute(
-                    f"""
-                    UPDATE plays SET is_skip = CASE WHEN time_played < COALESCE(
-                        (SELECT CASE WHEN t.duration_ms > 0
-                                     THEN MIN(?, t.duration_ms * ? / {PERCENT_DIVISOR})
-                                     ELSE ? END
-                         FROM tracks t WHERE t.id = plays.track_id),
-                        ?)
-                    THEN 1 ELSE 0 END
-                    """,
-                    (thresholdMs, completionPercent, thresholdMs, thresholdMs),
-                )
-            return cur.rowcount
+        if mode == SKIP_MODE_PERCENT:
+            # Per-row threshold: pct of the track's duration, or the fixed
+            # floor for tracks whose duration isn't known (<=0/missing).
+            # Capping the percent itself is enough here - both boundaries
+            # are the same fraction of the same duration.
+            cur = conn.execute(
+                f"""
+                UPDATE plays SET is_skip = CASE WHEN time_played < COALESCE(
+                    (SELECT CASE WHEN t.duration_ms > 0
+                                 THEN t.duration_ms * ? / {PERCENT_DIVISOR}
+                                 ELSE ? END
+                     FROM tracks t WHERE t.id = plays.track_id),
+                    ?)
+                THEN 1 ELSE 0 END
+                """,
+                (min(value, completionPercent), db.SKIP_THRESHOLD_MS, db.SKIP_THRESHOLD_MS),
+            )
+        else:
+            # Cap at completion so a play cannot be both complete and a skip.
+            # Unknown durations retain the plain seconds threshold.
+            thresholdMs = value * MS_PER_SECOND
+            cur = conn.execute(
+                f"""
+                UPDATE plays SET is_skip = CASE WHEN time_played < COALESCE(
+                    (SELECT CASE WHEN t.duration_ms > 0
+                                 THEN MIN(?, t.duration_ms * ? / {PERCENT_DIVISOR})
+                                 ELSE ? END
+                     FROM tracks t WHERE t.id = plays.track_id),
+                    ?)
+                THEN 1 ELSE 0 END
+                """,
+                (thresholdMs, completionPercent, thresholdMs, thresholdMs),
+            )
+        return cur.rowcount
 
     def isInheritedGenresEnabled(self) -> bool:
         return self.getAppSetting(INHERITED_GENRES_SETTING_KEY, APP_SETTING_TRUE) != APP_SETTING_FALSE

@@ -911,10 +911,15 @@ class TestAdminSkipSettings(AdminRouteTestBase):
 
     def test_saving_recomputes_skip_flags(self):
         dash = self._makeApp()
-        with patch.object(dash.repo, "recomputeSkipFlags") as recompute:
-            self._post(dash, "/admin/skip_settings", isAdmin=True,
-                       data={"skip_mode": "seconds", "skip_value": "30"})
-            recompute.assert_called_once()
+        from conftest import normalizeTrackForTest
+        durationMs, playedMs, thresholdSeconds = 100_000, 6_000, 30
+        dash.repo.upsertUser("alice", "alice@example.com")
+        dash.repo.upsertTrack(normalizeTrackForTest({"id": "t", "name": "Track", "duration": durationMs, "artists": []}))
+        dash.repo.insertPlay("alice", "t", timeToInt("2025-06-15"), playedMs, is_skip=0)
+        self._post(dash, "/admin/skip_settings", isAdmin=True,
+                   data={"skip_mode": "seconds", "skip_value": str(thresholdSeconds)})
+        self.assertEqual(dash.repo._conn().execute("SELECT is_skip FROM plays").fetchone()[0], 1)
+        self.assertFalse(dash.repo._conn().in_transaction)
 
     def test_saves_completion_percent(self):
         dash = self._makeApp()

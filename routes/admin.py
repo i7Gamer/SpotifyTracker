@@ -9,6 +9,7 @@ under their original endpoint names.
 """
 import logging
 import os
+import sqlite3
 import threading
 import time
 
@@ -30,7 +31,7 @@ from Database.repository import (
     DISCOVER_ARTIST_LIMIT_KEY, DISCOVER_ARTIST_LIMIT_MIN, DISCOVER_ARTIST_LIMIT_MAX,
     IMAGE_DOWNLOAD_WORKERS_KEY, ARTIST_BIO_FETCH_WORKERS_KEY, ALBUM_BIO_FETCH_WORKERS_KEY,
     WORKER_COUNT_MIN, WORKER_COUNT_MAX,
-    COMPLETION_COMPLETE_PERCENT_KEY, COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX,
+    COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX,
     BACKUP_INTERVAL_HOURS_KEY, BACKUP_INTERVAL_HOURS_MIN, BACKUP_INTERVAL_HOURS_MAX,
     BACKUP_RETENTION_COUNT_KEY, BACKUP_RETENTION_COUNT_MIN, BACKUP_RETENTION_COUNT_MAX,
     GENRE_BACKFILL_RETRY_DAYS_KEY, BIO_BACKFILL_RETRY_DAYS_KEY,
@@ -932,10 +933,10 @@ def register(app, dashboard):
 
     @requiresAdmin
     def adminSkipSettings(username, db):
-        """Admin-only: the instance-wide skip threshold (a plain seconds value
-        or a percent of each track's duration). Saving recomputes plays.is_skip
-        across every user's history via recomputeSkipFlags(), so all skip vs
-        real-play stats reflect the new boundary immediately."""
+        """Save classification settings and every user's skip flags atomically.
+
+        Every Save invalidates Wrapped for lazy rebuilding and repairs drift,
+        including when the submitted settings are unchanged."""
         mode = request.form.get("skip_mode", SKIP_MODE_SECONDS)
         if mode not in (SKIP_MODE_SECONDS, SKIP_MODE_PERCENT):
             mode = SKIP_MODE_SECONDS
@@ -943,17 +944,18 @@ def register(app, dashboard):
             value = int(request.form.get("skip_value", ""))
         except (TypeError, ValueError):
             return redirect(url_for("adminPage", tab="settings", error="Skip threshold must be a whole number."))
-        # Both settings are stored BEFORE the recompute, because both are inputs
-        # to it: computeIsSkip caps its threshold at the completion boundary
-        # (73e1a2c), so recomputing first would classify every row under the old
-        # completion percent and leave the flag on disk disagreeing with the
-        # classifier - the same "complete and abandoned at once" contradiction
-        # that cap was added to remove - until someone saved this form twice.
-        # Lenient on a blank/bad completion value, as before.
-        dashboard.repo.setSkipThreshold(mode, value)   #< clamps to the mode's bounds
-        _saveClampedIntSetting("completion_complete_percent", COMPLETION_COMPLETE_PERCENT_KEY,
-                               COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX)
-        dashboard.repo.recomputeSkipFlags()             #< self-commits; reclassifies every play
+        # Keep the existing lenient completion rule: blank/bad input leaves
+        # the stored setting alone. The repository clamps valid inputs.
+        try:
+            completionPercent = int(request.form.get("completion_complete_percent", ""))
+        except (TypeError, ValueError):
+            completionPercent = None
+        try:
+            dashboard.repo.savePlaybackClassificationSettings(mode, value, completionPercent)
+        except (sqlite3.OperationalError, sqlite3.IntegrityError):
+            logger.exception("Could not save playback classification settings")
+            return redirect(url_for("adminPage", tab="settings",
+                                    error="Could not save playback classification settings. Please try again."))
         return redirect(url_for("adminPage", tab="settings", message="Playback classification settings saved."))
     app.add_url_rule("/admin/skip_settings", "adminSkipSettings", adminSkipSettings, methods=["POST"])
 
