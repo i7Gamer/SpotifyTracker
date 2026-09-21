@@ -24,22 +24,7 @@ class SpotifyReauthBadgeTestCase(AppTestCase):
         return db
 
     def _loginAs(self, username, email):
-        self.dash.repo.upsertUser(username, email)
-        patcher_login = patch.object(self.dash, 'is_user_logged_in', return_value=True)
-        patcher_email = patch.object(self.dash, 'get_username_for_email', return_value=username)
-        patcher_db = patch.object(self.dash, 'get_user_db', return_value=self._makeDb())
-        patcher_login.start()
-        patcher_email.start()
-        patcher_db.start()
-        self.addCleanup(patcher_login.stop)
-        self.addCleanup(patcher_email.stop)
-        self.addCleanup(patcher_db.stop)
-
-        client = self.dash.app.test_client()
-        with client.session_transaction() as sess:
-            sess['email'] = email
-            sess['username'] = username
-        return client
+        return self._loginAsWithDb(username, email)
 
     def setUp(self):
         self.dash = self._makeApp()

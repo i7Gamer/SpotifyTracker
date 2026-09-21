@@ -101,6 +101,16 @@ class TestTheBackfillerKeepsMergesCurrent(ToggleTestCase):
         with patch("requests.get", return_value=response):
             db._backfillTrackIsrcs(lambda: "mock_token", stop)
 
+    def _dbReadyForLoop(self):
+        from test_metadata_backfiller import runsOneCycle
+
+        db = self._makeDb({}, [])
+        db.getUserSpotifyCredentials = MagicMock(return_value=None)
+        db._backfillTrackIsrcs = MagicMock()
+        db.backfiller_stop_event = MagicMock()
+        runsOneCycle(db, db.backfiller_stop_event)
+        return db
+
     def test_a_batch_that_completes_a_pair_merges_it(self):
         db = self._makeDb({}, [])
         conn = db.repo._conn()
@@ -121,15 +131,18 @@ class TestTheBackfillerKeepsMergesCurrent(ToggleTestCase):
 
         self.assertIsNotNone(self._canonical(db, "B" * 22) or self._canonical(db, "A" * 22))
 
-    def test_the_loop_skips_the_matcher_while_off(self):
-        """A disabled feature costs nothing - pinned by the loop gating on the
-        toggle, which the source assertion below keeps wired."""
-        import inspect
-        from Database.workers.metadata_backfiller import MetadataBackfillMixin
-        source = inspect.getsource(MetadataBackfillMixin._metadataBackfillLoop)
+    def test_the_loop_skips_the_claim_and_matcher_while_off(self):
+        """A disabled feature costs nothing: no claim, no matcher run."""
+        db = self._dbReadyForLoop()
+        db.repo.isTrackMergeEnabled = MagicMock(return_value=False)
+        db.repo.claimTrackMergeRun = MagicMock(return_value=True)
+        db.repo.mergeTracksByIsrc = MagicMock(return_value={"groups": 0, "merged": 0})
 
-        self.assertIn("isTrackMergeEnabled", source)
-        self.assertIn("mergeTracksByIsrc", source)
+        db._metadataBackfillLoop()
+
+        db.repo.isTrackMergeEnabled.assert_called_once()
+        db.repo.claimTrackMergeRun.assert_not_called()
+        db.repo.mergeTracksByIsrc.assert_not_called()
 
 
 class TestReversibilityAtTheToggle(ToggleTestCase):

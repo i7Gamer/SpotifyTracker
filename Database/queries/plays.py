@@ -3,7 +3,16 @@
 
 from __future__ import annotations
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import (
+    ALBUM_SORT_COLUMNS,
+    ARTIST_SORT_COLUMNS,
+    BEHAVIORAL_COLUMNS,
+    PERCENT_DIVISOR,
+    PLAY_BUCKET_SECONDS,
+    SKIP_RATE_PRIOR_WEIGHT,
+    SONG_SORT_COLUMNS,
+    time,
+)
 
 # The created_reason prefixes a play is stored under for a live listener catch
 # vs. a Web API backfill recovery (see appendTrackData and
@@ -467,11 +476,10 @@ class PlayQueries:
     # (see the SqlFragments docstring); the skip clause can sit anywhere only
     # because it binds nothing.
 
-    def getPlaysCount(self, username: str, startTs: float | None = None, endTs: float | None = None,
-                       trackId: str | None = None, artistId: str | None = None,
-                       albumId: str | None = None, includeSkips: bool = False,
-                       trackIds: list[str] | None = None, fullPlaysOnly: bool = False) -> int:
-        conn = self._conn()
+    def _playHistoryFilterParts(self, username: str, startTs: float | None, endTs: float | None,
+                                trackId: str | None, artistId: str | None, albumId: str | None,
+                                includeSkips: bool, trackIds: list[str] | None, fullPlaysOnly: bool
+                                ) -> tuple[str, str, list]:
         params = [username]
         rangeClause = self._dateRangeClause(params, startTs, endTs)
         extraClauses = self._itemFilterClauses(params, trackId, artistId, albumId)
@@ -481,8 +489,17 @@ class PlayQueries:
             joinClause = self._tracksJoin(playsAlias="plays", trackAlias="ft")
             extraClauses += self._fullPlaysClause(params, playsAlias="plays", trackAlias="ft")
         skipClause = "" if includeSkips else " AND is_skip=0"
+        return joinClause, f"{skipClause}{rangeClause}{extraClauses}", params
+
+    def getPlaysCount(self, username: str, startTs: float | None = None, endTs: float | None = None,
+                       trackId: str | None = None, artistId: str | None = None,
+                       albumId: str | None = None, includeSkips: bool = False,
+                       trackIds: list[str] | None = None, fullPlaysOnly: bool = False) -> int:
+        conn = self._conn()
+        joinClause, filterClause, params = self._playHistoryFilterParts(
+            username, startTs, endTs, trackId, artistId, albumId, includeSkips, trackIds, fullPlaysOnly)
         row = conn.execute(
-            f"SELECT COUNT(*) AS c FROM plays{joinClause} WHERE username=?{skipClause}{rangeClause}{extraClauses}",
+            f"SELECT COUNT(*) AS c FROM plays{joinClause} WHERE username=?{filterClause}",
             params,
         ).fetchone()
         return row["c"]
@@ -494,23 +511,16 @@ class PlayQueries:
                              trackIds: list[str] | None = None, fullPlaysOnly: bool = False) -> list[dict]:
         conn = self._conn()
         limit = -1 if count is None else count
-        params = [username]
-        rangeClause = self._dateRangeClause(params, startTs, endTs)
-        extraClauses = self._itemFilterClauses(params, trackId, artistId, albumId)
-        extraClauses += self._idSetClause(params, "track_id", trackIds)
-        joinClause = ""
-        if fullPlaysOnly:
-            joinClause = self._tracksJoin(playsAlias="plays", trackAlias="ft")
-            extraClauses += self._fullPlaysClause(params, playsAlias="plays", trackAlias="ft")
+        joinClause, filterClause, params = self._playHistoryFilterParts(
+            username, startTs, endTs, trackId, artistId, albumId, includeSkips, trackIds, fullPlaysOnly)
         params += [limit, startIndex]
-        skipClause = "" if includeSkips else " AND is_skip=0"
         #< ORDER BY is qualified whether or not the join is emitted: `plays` and
         #  `tracks` share id/created_at/created_reason, so a bare `id` is an
         #  ambiguous column under the join - and one statement shape is easier
         #  to trust than two
         rows = conn.execute(
             f"SELECT track_id, played_at, time_played, played_from, is_skip FROM plays{joinClause} "
-            f"WHERE username=?{skipClause}{rangeClause}{extraClauses} "
+            f"WHERE username=?{filterClause} "
             f"ORDER BY plays.played_at DESC, plays.id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -531,24 +541,18 @@ class PlayQueries:
         behaviour for callers that don't need the composite key."""
         conn = self._conn()
         limit = -1 if count is None else count
-        params = [username]
-        rangeClause = self._dateRangeClause(params, startTs, endTs)
-        extraClauses = self._itemFilterClauses(params, trackId, artistId, albumId)
-        extraClauses += self._idSetClause(params, "track_id", trackIds)
-        extraClauses += self._keysetAfterClause(params, afterTs, afterId,
-                                                 tsColumn="plays.played_at", idColumn="plays.id")
-        joinClause = ""
-        if fullPlaysOnly:
-            joinClause = self._tracksJoin(playsAlias="plays", trackAlias="ft")
-            extraClauses += self._fullPlaysClause(params, playsAlias="plays", trackAlias="ft")
+        joinClause, filterClause, params = self._playHistoryFilterParts(
+            username, startTs, endTs, trackId, artistId, albumId, includeSkips, trackIds,
+            fullPlaysOnly)
+        filterClause += self._keysetAfterClause(
+            params, afterTs, afterId, tsColumn="plays.played_at", idColumn="plays.id")
         params += [limit, startIndex]
         behavioralSelect = ", ".join(BEHAVIORAL_COLUMNS)
-        skipClause = "" if includeSkips else " AND is_skip=0"
         #< qualified ORDER BY: see getPlaysNewestFirst
         rows = conn.execute(
             f"SELECT plays.id AS play_id, track_id, played_at, time_played, played_from, is_skip, "
             f"{behavioralSelect} FROM plays{joinClause} "
-            f"WHERE username=?{skipClause}{rangeClause}{extraClauses} "
+            f"WHERE username=?{filterClause} "
             f"ORDER BY plays.played_at ASC, plays.id ASC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -828,6 +832,21 @@ class PlayQueries:
             entry["extras"] = extras if any(v is not None for v in extras.values()) else None
         return entry
 
+    def _searchPlayFilterParts(self, username: str, query: str, startTs: float | None, endTs: float | None,
+                               trackIds: list[str] | None, includeSkips: bool,
+                               fullPlaysOnly: bool) -> tuple[str, str, list]:
+        params = [username]
+        matchClause = self._playSearchNarrowClause(params, query)
+        rangeClause = self._dateRangeClause(params, startTs, endTs, column="p.played_at")
+        trackIdsClause = self._idSetClause(params, "p.track_id", trackIds)
+        joinClause = ""
+        fullPlaysClause = ""
+        if fullPlaysOnly:
+            joinClause = self._tracksJoin(trackAlias="ft")
+            fullPlaysClause = self._fullPlaysClause(params, trackAlias="ft")
+        skipClause = "" if includeSkips else " AND p.is_skip=0"
+        return joinClause, f"{skipClause} {matchClause}{rangeClause}{trackIdsClause}{fullPlaysClause}", params
+
     def searchPlays(self, username: str, query: str, limit: int | None = None, offset: int = 0,
                      startTs: float | None = None, endTs: float | None = None,
                      oldestFirst: bool = False, trackIds: list[str] | None = None,
@@ -845,17 +864,9 @@ class PlayQueries:
         thing that ever wanted skips in a search result."""
         conn = self._conn()
         limitValue = -1 if limit is None else limit
-        params = [username]
-        matchClause = self._playSearchNarrowClause(params, query)
-        rangeClause = self._dateRangeClause(params, startTs, endTs, column="p.played_at")
-        trackIdsClause = self._idSetClause(params, "p.track_id", trackIds)
-        joinClause = ""
-        fullPlaysClause = ""
-        if fullPlaysOnly:
-            joinClause = self._tracksJoin(trackAlias="ft")
-            fullPlaysClause = self._fullPlaysClause(params, trackAlias="ft")
+        joinClause, filterClause, params = self._searchPlayFilterParts(
+            username, query, startTs, endTs, trackIds, includeSkips, fullPlaysOnly)
         params += [limitValue, offset]
-        skipClause = "" if includeSkips else " AND p.is_skip=0"
         direction = "ASC" if oldestFirst else "DESC"
         #< p.is_skip is SELECTed so _playRowToEntry can report it: without the
         #  column it defaults every row to isSkip=False, which was harmless
@@ -866,7 +877,7 @@ class PlayQueries:
                    p.time_played AS time_played, p.played_from AS played_from,
                    p.is_skip AS is_skip
             FROM plays p{joinClause}
-            WHERE p.username = ?{skipClause} {matchClause}{rangeClause}{trackIdsClause}{fullPlaysClause}
+            WHERE p.username = ?{filterClause}
             ORDER BY p.played_at {direction}, p.id {direction}
             LIMIT ? OFFSET ?
             """,
@@ -885,21 +896,13 @@ class PlayQueries:
         separate, so a filter reaching one and not the other leaves the rows
         right and the pager reporting a total nothing can page to."""
         conn = self._conn()
-        params = [username]
-        matchClause = self._playSearchNarrowClause(params, query)
-        rangeClause = self._dateRangeClause(params, startTs, endTs, column="p.played_at")
-        trackIdsClause = self._idSetClause(params, "p.track_id", trackIds)
-        joinClause = ""
-        fullPlaysClause = ""
-        if fullPlaysOnly:
-            joinClause = self._tracksJoin(trackAlias="ft")
-            fullPlaysClause = self._fullPlaysClause(params, trackAlias="ft")
-        skipClause = "" if includeSkips else " AND p.is_skip=0"
+        joinClause, filterClause, params = self._searchPlayFilterParts(
+            username, query, startTs, endTs, trackIds, includeSkips, fullPlaysOnly)
         row = conn.execute(
             f"""
             SELECT COUNT(*) AS c
             FROM plays p{joinClause}
-            WHERE p.username = ?{skipClause} {matchClause}{rangeClause}{trackIdsClause}{fullPlaysClause}
+            WHERE p.username = ?{filterClause}
             """,
             params,
         ).fetchone()

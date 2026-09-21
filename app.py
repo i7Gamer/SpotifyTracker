@@ -60,6 +60,7 @@ from services.milestones import (
 from routes.media import register as registerMediaRoutes
 from routes.admin import register as registerAdminRoutes
 from routes.charts import register as registerChartsRoutes
+from routes.details import register as registerDetailsRoutes
 from routes.genres import register as registerGenresRoutes
 from routes.compare import register as registerCompareRoutes
 from routes.wrapped import register as registerWrappedRoutes
@@ -947,6 +948,8 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
         registerAuthRoutes(self.app, self)
 
         registerChartsRoutes(self.app, self)
+
+        registerDetailsRoutes(self.app, self)
 
         registerGenresRoutes(self.app, self)
 

@@ -28,7 +28,8 @@ select = [
              # catches for static/js (see eslint.config.js: two files shipped a
              # ReferenceError to production because nothing checked). Ruff skips
              # this rule inside a module with a star import rather than guessing,
-             # so Database/queries/_base.py's re-export pattern costs nothing.
+             # so query implementations use explicit imports from _base;
+             # compatibility facades retain their deliberate re-exports.
     "F811",  # a name redefined before it was ever used - usually a lost edit
     "F841",  # a local assigned and never read
     "B006",  # mutable default argument, shared across every call

@@ -83,3 +83,28 @@ class AppTestCase(unittest.TestCase):
             sess['email'] = f"{username}@example.com"
             sess['username'] = username
         return client
+
+    def _loginAsWithDb(self, username, email):
+        """Return a signed-in client backed by this test case's ``_makeDb``.
+
+        The route suites using this shape need an explicit email and a user
+        row before the request, while the regular ``_loginAs`` helper uses the
+        ``self.dbs`` mapping instead. Keep those two setup contracts separate
+        and stop each patcher independently so one test cannot clear unrelated
+        patches installed by its caller.
+        """
+        self.dash.repo.upsertUser(username, email)
+        patchers = (
+            patch.object(self.dash, 'is_user_logged_in', return_value=True),
+            patch.object(self.dash, 'get_username_for_email', return_value=username),
+            patch.object(self.dash, 'get_user_db', return_value=self._makeDb()),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        client = self.dash.app.test_client()
+        with client.session_transaction() as sess:
+            sess['email'] = email
+            sess['username'] = username
+        return client

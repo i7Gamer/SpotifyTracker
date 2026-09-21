@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import GENRE_BACKFILL_MAX_ARTIST_POSITION, PLAY_BUCKET_SECONDS, time
 
 try:
     from Database.lastfm import foldStylizedArtistName

@@ -601,6 +601,183 @@ class MetadataBackfillMixin:
                 _dbmod.logger.warning("[Backfiller-%s] Failed to release %d in-flight track ids: %s",
                                        self.user, len(target_ids), cleanupError)
 
+    def _runTrackMergeIfDue(self) -> None:
+        """Run the ISRC matcher when the feature toggle and daily claim allow it."""
+        # New ISRCs can complete a pair, so the matcher keeps running while the
+        # toggle is on. Once a DAY, not once a cycle: a run that merges
+        # something drops the cached Wrapped years its groups touch, and at
+        # cycle cadence that was 147 full rebuilds a day on the live instance.
+        if not self.repo.isTrackMergeEnabled():
+            return
+
+        # Read before the claim overwrites it. The claim makes the slot safe
+        # against three workers, but it also stamps a run that has not happened
+        # yet, so a matcher that raises must give the previous stamp back.
+        previousStamp = self.repo.getTrackMergeLastRun()
+        if not self.repo.claimTrackMergeRun():
+            return
+
+        try:
+            mergeSummary = self.repo.mergeTracksByIsrc()
+        except Exception:
+            try:
+                self.repo.releaseTrackMergeRun(previousStamp)
+            except Exception:
+                _dbmod.logger.warning(
+                    "[Backfiller-%s] Could not release the ISRC merge slot; "
+                    "the matcher waits out the interval", self.user,
+                    exc_info=True)
+            raise
+
+        if mergeSummary["merged"]:
+            _dbmod.logger.info(
+                "[Backfiller-%s] ISRC merge: %d track(s) newly merged",
+                self.user, mergeSummary["merged"])
+
+    def _runAlbumMetadataBatch(self, getAccessToken, hasWebApiCreds: bool,
+                               stop_event: threading.Event) -> bool:
+        """Process one album metadata batch.
+
+        Returns False when no album work was claimed; the caller owns the idle
+        wait so extraction does not change loop cadence.
+        """
+        target_ids = []
+        try:
+            missing_ids = self.repo.getAlbumsMissingMetadata(limit=self.BACKFILLER_ALBUM_QUEUE_SIZE)
+            if len(missing_ids) < self.BACKFILLER_ALBUM_QUEUE_SIZE:
+                known_ids = set(missing_ids)
+                missing_ids.extend(
+                    albumId for albumId in self.repo.getAlbumsWithArtistlessTracks(
+                        self.BACKFILLER_ALBUM_QUEUE_SIZE - len(missing_ids))
+                    if albumId not in known_ids)
+            if not missing_ids:
+                return False
+
+            with _dbmod.Database._backfill_lock:
+                for album_id in missing_ids:
+                    if album_id not in _dbmod.Database._active_backfills:
+                        target_ids.append(album_id)
+                        _dbmod.Database._active_backfills.add(album_id)
+                        if len(target_ids) >= ALBUM_BATCH_SIZE:
+                            break
+            if not target_ids:
+                return False
+
+            _dbmod.logger.info("[Backfiller-%s] Fetching metadata for %d albums",
+                               self.user, len(target_ids))
+            fetched_albums = []
+            attempted_ids = []
+            fullyWalkedIds = []
+            use_fallback = True
+
+            quotaWalled = _dbmod.time.time() < self._catalogBackoffUntil
+            access_token = None if quotaWalled else getAccessToken()
+            self._noteTokenHealth(getAccessToken, hasWebApiCreds)
+            if isinstance(access_token, str) and access_token:
+                headers = {"Authorization": f"Bearer {access_token}"}
+
+                def onAlbum(album_id, resp, headers=headers):
+                    albumRaw = resp.json()
+                    if self._walkRemainingAlbumTracks(albumRaw, headers, stop_event):
+                        fullyWalkedIds.append(album_id)
+                    fetched_albums.append(albumRaw)
+
+                batch = self._spendCatalogBatch(
+                    "albums", target_ids, headers, stop_event, onAlbum)
+                attempted_ids.extend(batch.attempted)
+                use_fallback = not attempted_ids
+
+                if batch.firstFailure is not None and flaskDebugEnabled():
+                    _dbmod.logger.warning(
+                        "[Backfiller-%s] Spotify Web API returned %s for %d of %d album(s).",
+                        self.user, batch.firstFailure, batch.failures, len(target_ids)
+                    )
+            elif hasWebApiCreds and not quotaWalled:
+                _dbmod.logger.warning(
+                    "[Backfiller-%s] Failed to refresh access token. Falling back to the cookie client.",
+                    self.user)
+
+            if use_fallback:
+                import Database.Spotify
+                sp = Database.Spotify.Spotify()
+                for album_id in target_ids:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        album_raw = sp.album(album_id)
+                        if album_raw:
+                            fetched_albums.append(album_raw)
+                        attempted_ids.append(album_id)
+                    except Exception as fe:
+                        _dbmod.logger.warning(
+                            "[Backfiller-%s] Cookie client failed for album %s: %s",
+                            self.user, album_id, fe)
+                    stop_event.wait(1.0)
+
+                if fetched_albums:
+                    _dbmod.logger.info("[Backfiller-%s] Cookie client fetched %d album(s)",
+                                       self.user, len(fetched_albums))
+                else:
+                    _dbmod.logger.warning(
+                        "[Backfiller-%s] Cookie-client fallback failed to fetch any albums",
+                        self.user)
+
+            from Database.utils import convertToDatetime
+            updated_count = 0
+            for album_raw in fetched_albums:
+                album_id = album_raw.get("id")
+                release_date_str = album_raw.get("release_date")
+                total_tracks = album_raw.get("total_tracks", 0)
+                album_name = album_raw.get("name")
+
+                if release_date_str == "0000-00-00" or not release_date_str:
+                    release_date = 0.0
+                else:
+                    try:
+                        dt = convertToDatetime(release_date_str)
+                        release_date = dt.timestamp() if dt else 0.0
+                    except Exception:
+                        release_date = 0.0
+
+                self.repo.updateAlbumMetadata(album_id, release_date, total_tracks,
+                                              name=album_name if album_name else None)
+
+                tracks_data = album_raw.get("tracks", {}).get("items") or []
+                for track_raw in tracks_data:
+                    track_id = track_raw.get("id") or track_raw.get("track_id")
+                    if not track_id:
+                        continue
+                    track_name = track_raw.get("name")
+                    if track_name:
+                        duration_ms = track_raw.get("duration_ms") or 0
+                        self.repo.updateTrackName(
+                            track_id, track_name,
+                            duration_ms=duration_ms if duration_ms > 0 else None)
+                    repair_artists = self._normalizeBackfillArtists(track_raw.get("artists") or [])
+                    if repair_artists:
+                        self.repo.addMissingTrackArtists(track_id, repair_artists)
+
+                updated_count += 1
+
+            if attempted_ids:
+                self.repo.markAlbumsBackfillAttempted(attempted_ids)
+            self.repo.markAlbumsArtistRepairDone(fullyWalkedIds)
+
+            if updated_count > 0:
+                _dbmod.logger.info(
+                    "[Backfiller-%s] Updated metadata for %d album(s)",
+                    self.user, updated_count
+                )
+            return True
+        finally:
+            try:
+                with _dbmod.Database._backfill_lock:
+                    for album_id in target_ids:
+                        _dbmod.Database._active_backfills.discard(album_id)
+            except Exception as cleanupError:  # noqa: BLE001 - must not mask the in-flight error
+                _dbmod.logger.warning("[Backfiller-%s] Failed to release %d in-flight album ids: %s",
+                                      self.user, len(target_ids), cleanupError)
+
     def _metadataBackfillLoop(self, stop_event: threading.Event | None = None) -> None:
         """Periodically queries Spotify for missing album release dates and tracks.
 
@@ -619,7 +796,6 @@ class MetadataBackfillMixin:
                 return
 
             while not stop_event.is_set():
-                target_ids = []
                 try:
                     if not self.repo.isSpotifyApiBackfillEnabled():
                         if stop_event.wait(self.BACKFILLER_IDLE_WAIT_SECONDS):
@@ -660,53 +836,7 @@ class MetadataBackfillMixin:
                     # ordering is also why it swallows its own failures.
                     self._backfillTrackIsrcs(getAccessToken, stop_event)
 
-                    # New ISRCs can complete a pair, so the matcher keeps
-                    # running while the toggle is on - this is what "new tracks
-                    # after the checkbox" means: merges stay current without
-                    # anyone pressing anything. Once a DAY, not once a cycle:
-                    # a run that merges something drops the cached Wrapped
-                    # years its groups touch, and at cycle cadence that was 147
-                    # full rebuilds a day on the live instance. The merges pile
-                    # into one pass instead; see TRACK_MERGE_MIN_INTERVAL_SECONDS.
-                    # The claim is instance-wide, so all three per-user workers
-                    # share the one slot and whichever gets there first spends
-                    # it - it does not matter which, because the matcher is
-                    # global and picks up every worker's batches either way.
-                    # Asked only while ON, so a disabled feature costs nothing
-                    # and cannot burn the slot.
-                    if self.repo.isTrackMergeEnabled():
-                        #< read before the claim overwrites it: the claim is
-                        #  what makes the slot safe against three workers, but
-                        #  it also stamps a run that has not happened yet, so a
-                        #  matcher that raises would turn the feature off until
-                        #  tomorrow. The cycle's catch-all below would log that
-                        #  and move on. Giving the stamp back on the way out
-                        #  keeps the claim's concurrency and drops its cost.
-                        previousStamp = self.repo.getTrackMergeLastRun()
-                        if self.repo.claimTrackMergeRun():
-                            try:
-                                mergeSummary = self.repo.mergeTracksByIsrc()
-                            except Exception:
-                                try:
-                                    self.repo.releaseTrackMergeRun(previousStamp)
-                                except Exception:
-                                    #< the give-back is a write, and the most
-                                    #  likely reason the merge failed is that
-                                    #  writes are failing - so it can fail too.
-                                    #  Swallowed and named rather than allowed
-                                    #  to replace the merge's own traceback,
-                                    #  which is the one worth reading. The slot
-                                    #  then simply stays spent, as it did
-                                    #  before this remedy existed.
-                                    _dbmod.logger.warning(
-                                        "[Backfiller-%s] Could not release the ISRC merge slot; "
-                                        "the matcher waits out the interval", self.user,
-                                        exc_info=True)
-                                raise
-                            if mergeSummary["merged"]:
-                                _dbmod.logger.info(
-                                    "[Backfiller-%s] ISRC merge: %d track(s) newly merged",
-                                    self.user, mergeSummary["merged"])
+                    self._runTrackMergeIfDue()
 
                     #< here AND after the album branch's own use below, because
                     #  either step can be the one that asks for the token first
@@ -715,227 +845,17 @@ class MetadataBackfillMixin:
                     #  cycle is counted once either way
                     self._noteTokenHealth(getAccessToken, hasWebApiCreds)
 
-                    # 3. Query up to N missing album IDs. Albums whose tracks
-                    # lack artist links piggyback on the same fetch: the album
-                    # payload carries per-track artists, repairing tracks that
-                    # were saved from degraded payloads without artist data.
-                    missing_ids = self.repo.getAlbumsMissingMetadata(limit=self.BACKFILLER_ALBUM_QUEUE_SIZE)
-                    if len(missing_ids) < self.BACKFILLER_ALBUM_QUEUE_SIZE:
-                        known_ids = set(missing_ids)
-                        missing_ids.extend(
-                            albumId for albumId in self.repo.getAlbumsWithArtistlessTracks(
-                                self.BACKFILLER_ALBUM_QUEUE_SIZE - len(missing_ids))
-                            if albumId not in known_ids)
-                    if not missing_ids:
+                    if not self._runAlbumMetadataBatch(
+                            getAccessToken, hasWebApiCreds, stop_event):
                         if stop_event.wait(self.BACKFILLER_IDLE_WAIT_SECONDS):
                             break
                         continue
-
-                    # 4. Process-wide deduplication: filter out already active backfills
-                    with _dbmod.Database._backfill_lock:
-                        for album_id in missing_ids:
-                            if album_id not in _dbmod.Database._active_backfills:
-                                target_ids.append(album_id)
-                                _dbmod.Database._active_backfills.add(album_id)
-                                if len(target_ids) >= ALBUM_BATCH_SIZE:
-                                    break
-
-                    # 5. If nothing eligible remains, wait and try next iteration
-                    if not target_ids:
-                        if stop_event.wait(self.BACKFILLER_IDLE_WAIT_SECONDS):
-                            break
-                        continue
-
-                    # 6. Fetch detailed metadata
-                    _dbmod.logger.info("[Backfiller-%s] Fetching metadata for %d albums", self.user, len(target_ids))
-                    fetched_albums = []
-                    attempted_ids = []  #< albums that got a definitive response (incl. "gone") - rate-limits their next retry
-                    #< albums whose COMPLETE track list this cycle read, so a
-                    #  track still uncredited afterwards is one Spotify does
-                    #  not credit. Only the Web-API path can populate it: the
-                    #  cookie client's album() stops at its wrapper's first
-                    #  page and exposes no cursor to continue from.
-                    fullyWalkedIds = []
-                    use_fallback = True
-
-                    #< the cycle's shared token, minted here only if the ISRC
-                    #  step above did not already need it (step 2). Asked for
-                    #  behind the early-out above, so a drained album queue
-                    #  costs nothing - and not asked for at all while the
-                    #  catalog stand-down is armed: these lookups spend the
-                    #  same per-app quota the 429 was about (see the gate in
-                    #  _backfillTrackIsrcs), so a walled cycle skips straight
-                    #  to the cookie client instead of buying one refused
-                    #  request and a token round-trip to rediscover the wall.
-                    #  Read fresh each cycle, so a wall the ISRC step raised
-                    #  moments ago already covers this step's turn
-                    quotaWalled = _dbmod.time.time() < self._catalogBackoffUntil
-                    access_token = None if quotaWalled else getAccessToken()
-                    self._noteTokenHealth(getAccessToken, hasWebApiCreds)
-                    if isinstance(access_token, str) and access_token:
-                        # One request per album: the bulk `?ids=` form this used
-                        # to call was withdrawn on 2026-07-31 and has answered
-                        # 403 Forbidden ever since, which is why every cycle
-                        # between then and now degraded to the cookie client.
-                        #
-                        # The same policy the ISRC step spends its half of the
-                        # quota under - one refusal rule, one stand-down, one
-                        # abort - see _spendCatalogBatch. A 404 counts as
-                        # attempted here for the reason it does there: an album
-                        # Spotify has no data for is ANSWERED, and would
-                        # otherwise be re-queued every cycle forever.
-                        headers = {"Authorization": f"Bearer {access_token}"}
-
-                        def onAlbum(album_id, resp, headers=headers):
-                            #< the embedded track list is one page; walk the
-                            #  rest before handing the payload on, so the
-                            #  repair below sees every track and completeness
-                            #  is known for the stamp (see fullyWalkedIds)
-                            albumRaw = resp.json()
-                            if self._walkRemainingAlbumTracks(albumRaw, headers, stop_event):
-                                fullyWalkedIds.append(album_id)
-                            fetched_albums.append(albumRaw)
-
-                        batch = self._spendCatalogBatch(
-                            "albums", target_ids, headers, stop_event, onAlbum)
-                        #< extend, not assign: the cookie-client fallback below
-                        #  stamps into this same list
-                        attempted_ids.extend(batch.attempted)
-
-                        # Only when the Web API answered NOTHING. Falling back
-                        # after a partial success would hand the cookie client
-                        # the whole target list again, re-fetching albums that
-                        # were just answered; the ones that failed are unstamped
-                        # and come back next cycle either way.
-                        use_fallback = not attempted_ids
-
-                        if batch.firstFailure is not None:
-                            #< still behind the gate, and one line for the batch
-                            #  rather than one per album: this path degrades to
-                            #  the cookie client and logs that it did, so the
-                            #  status is colour on a story the log already tells.
-                            #  It carries the body for the same reason its twin
-                            #  above does - when it IS asked for, the number on
-                            #  its own answers nothing
-                            if flaskDebugEnabled():
-                                _dbmod.logger.warning(
-                                    "[Backfiller-%s] Spotify Web API returned %s for %d of %d album(s).",
-                                    self.user, batch.firstFailure, batch.failures, len(target_ids)
-                                )
-                    elif hasWebApiCreds and not quotaWalled:
-                        #< not while walled: the token was deliberately never
-                        #  asked for, and this line's diagnosis - a refresh
-                        #  failure - would send the reader to debug credentials
-                        #  that are fine. The stand-down already said why
-                        _dbmod.logger.warning("[Backfiller-%s] Failed to refresh access token. Falling back to the cookie client.", self.user)
-
-                    if use_fallback:
-                        import Database.Spotify
-                        # No cookiesFile on purpose: album() is a public lookup
-                        # through spotapi's pooled client and never touches the
-                        # login. Constructing with cookies ran a full login()
-                        # whose TLSClient atexit-pinned one live curl session
-                        # per backfill cycle (every 5 minutes, for every user
-                        # without Web-API credentials) - the same leak
-                        # _pooledPublicClient was built to close.
-                        sp = Database.Spotify.Spotify()
-                        for album_id in target_ids:
-                            if stop_event.is_set():
-                                break
-                            try:
-                                album_raw = sp.album(album_id)
-                                if album_raw:
-                                    fetched_albums.append(album_raw)
-                                attempted_ids.append(album_id)  #< a clean "no data" reply is definitive; exceptions stay unmarked for a next-cycle retry
-                            except Exception as fe:
-                                _dbmod.logger.warning("[Backfiller-%s] Cookie client failed for album %s: %s", self.user, album_id, fe)
-                            stop_event.wait(1.0)
-
-                        if fetched_albums:
-                            _dbmod.logger.info("[Backfiller-%s] Cookie client fetched %d album(s)", self.user, len(fetched_albums))
-                        else:
-                            _dbmod.logger.warning("[Backfiller-%s] Cookie-client fallback failed to fetch any albums", self.user)
-
-                    from Database.utils import convertToDatetime
-                    updated_count = 0
-                    for album_raw in fetched_albums:
-                        album_id = album_raw.get("id")
-                        release_date_str = album_raw.get("release_date")
-                        total_tracks = album_raw.get("total_tracks", 0)
-                        album_name = album_raw.get("name")
-
-                        if release_date_str == "0000-00-00" or not release_date_str:
-                            release_date = 0.0
-                        else:
-                            try:
-                                dt = convertToDatetime(release_date_str)
-                                release_date = dt.timestamp() if dt else 0.0
-                            except Exception:
-                                release_date = 0.0
-
-                        # A blank name isn't data - passing None skips the name update
-                        # so a blanked response can't overwrite a name the importer
-                        # already filled from the user's export.
-                        self.repo.updateAlbumMetadata(album_id, release_date, total_tracks,
-                                                      name=album_name if album_name else None)
-
-                        # Update names (and durations, when provided) for the tracks
-                        # in this album if returned - the album response is the only
-                        # duration source for tracks whose own lookup came back blanked.
-                        tracks_data = album_raw.get("tracks", {}).get("items") or []
-                        for track_raw in tracks_data:
-                            track_id = track_raw.get("id") or track_raw.get("track_id")
-                            if not track_id:
-                                continue
-                            track_name = track_raw.get("name")
-                            if track_name:
-                                duration_ms = track_raw.get("duration_ms") or 0
-                                self.repo.updateTrackName(track_id, track_name,
-                                                          duration_ms=duration_ms if duration_ms > 0 else None)
-                            # Repair path: link artists for tracks that have none
-                            # (addMissingTrackArtists never touches existing links).
-                            repair_artists = self._normalizeBackfillArtists(track_raw.get("artists") or [])
-                            if repair_artists:
-                                self.repo.addMissingTrackArtists(track_id, repair_artists)
-
-                        updated_count += 1
-
-                    if attempted_ids:
-                        self.repo.markAlbumsBackfillAttempted(attempted_ids)
-                    #< the artistless queue's terminating condition: without it
-                    #  an album Spotify credits nobody on is re-selected every
-                    #  ALBUM_BACKFILL_RETRY_SECONDS forever, repairing nothing
-                    self.repo.markAlbumsArtistRepairDone(fullyWalkedIds)
-
-                    if updated_count > 0:
-                        _dbmod.logger.info(
-                            "[Backfiller-%s] Updated metadata for %d album(s)",
-                            self.user, updated_count
-                        )
 
                 except Exception as e:
                     self._recordWorkerCycle("spotify_api", success=False, error=_dbmod.parseError(e))
                     _dbmod.logger.error("[Backfiller-%s] Error in metadata backfiller loop: %s", self.user, e)
                 else:
                     self._recordWorkerCycle("spotify_api", success=True)
-                finally:
-                    # 7. Release the claimed ids on EVERY exit - success, an
-                    # Exception, and the BaseExceptions nothing above catches
-                    # (a SystemExit tearing the thread down). This used to live
-                    # on the success and except paths only, as two copies. A
-                    # leaked id makes every later cycle skip that album as
-                    # "already in flight" for the life of the process - a
-                    # backfill that quietly stops making progress on it.
-                    # target_ids is bound (empty) before the try, so this can
-                    # always run; guarded so a failing release cannot REPLACE
-                    # an in-flight exception (the masking rule).
-                    try:
-                        with _dbmod.Database._backfill_lock:
-                            for album_id in target_ids:
-                                _dbmod.Database._active_backfills.discard(album_id)
-                    except Exception as cleanupError:  # noqa: BLE001 - must not mask the in-flight error
-                        _dbmod.logger.warning("[Backfiller-%s] Failed to release %d in-flight album ids: %s",
-                                               self.user, len(target_ids), cleanupError)
 
                 if stop_event.wait(self.BACKFILLER_IDLE_WAIT_SECONDS):
                     break

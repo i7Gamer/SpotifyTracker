@@ -56,10 +56,7 @@ if (typeof document !== 'undefined') {
   // hx-swap / hx-sync, and a jump during an in-flight filter change is
   // serialised like every other swap into it.
   var goToTopListPage = function (page) {
-    var params = new URLSearchParams(window.location.search);
-    params.set('page', page);
-    var url = window.location.pathname + '?' + params.toString();
-    htmx.ajax('GET', url, { source: document.getElementById(TOP_LIST_RESULTS_ID), replace: url });
+    HtmxFilters.requestPage(page, TOP_LIST_RESULTS_ID);
   };
   window.__paginationAjaxHandler = goToTopListPage;
 
@@ -68,14 +65,7 @@ if (typeof document !== 'undefined') {
   // working even while the Time Period select sits on a half-entered custom
   // range, which is exactly the state that blocks a form request.
   document.body.addEventListener('htmx:configRequest', function (evt) {
-    if (!evt.detail.elt || evt.detail.elt.id !== TOP_LIST_FORM_ID) return;
-    var problem = HtmxFilters.rangeProblemFromDom();
-    HtmxFilters.showRangeError(problem);
-    if (problem !== HtmxFilters.RANGE_OK) {
-      evt.preventDefault();
-      return;
-    }
-    HtmxFilters.pruneEmptyParams(evt.detail.parameters);
+    HtmxFilters.validateFormRequest(evt, TOP_LIST_FORM_ID);
   });
 
   //< cover-art fade-ins are handled once for the whole app in
@@ -98,9 +88,7 @@ if (typeof document !== 'undefined') {
   // whatever path it is handed. A failed boosted page link is retried as page
   // one of the current filters - the form is what the user can see.
   HtmxFilters.onSwapFailure(TOP_LIST_RESULTS_ID, function () {
-    var form = document.getElementById(TOP_LIST_FORM_ID);
-    htmx.ajax('GET', form.getAttribute('hx-get'),
-              { source: form, target: '#' + TOP_LIST_RESULTS_ID, swap: 'innerHTML' });
+    HtmxFilters.retryForm(TOP_LIST_FORM_ID, TOP_LIST_RESULTS_ID);
   });
 }
 //< no module.exports: everything pure moved to static/js/htmx-filters.js, which

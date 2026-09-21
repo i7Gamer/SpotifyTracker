@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import WRAPPED_INVALIDATION_GENERATION_KEY, WRAPPED_YEAR_TZ_SLACK_SECONDS, json
 
 
 class WrappedQueries:
@@ -155,8 +155,11 @@ class WrappedQueries:
             return self._deleteAllWrapped(conn)
 
     def _deleteAllWrapped(self, conn) -> int:
-        """Invalidate within the caller's transaction, without committing it."""
-        # The generation and delete must commit with the catalog change: a
+        """Invalidate within a catalog or classification Save transaction.
+
+        Never commits. Classification Save deliberately calls this even for
+        unchanged settings/empty caches, so it can repair existing drift."""
+        # The generation and delete must commit with the underlying change: a
         # recalculation already in flight must not resurrect its old snapshot.
         # Its save re-checks this stamp inside its own transaction.
         self._bumpWrappedGeneration(conn)

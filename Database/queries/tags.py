@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 import time
-from Database.queries._base import *  # noqa: F401,F403
 
 
 def normalizeTag(tag: str | None) -> str:

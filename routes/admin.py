@@ -9,6 +9,7 @@ under their original endpoint names.
 """
 import logging
 import os
+import sqlite3
 import threading
 import time
 
@@ -30,7 +31,7 @@ from Database.repository import (
     DISCOVER_ARTIST_LIMIT_KEY, DISCOVER_ARTIST_LIMIT_MIN, DISCOVER_ARTIST_LIMIT_MAX,
     IMAGE_DOWNLOAD_WORKERS_KEY, ARTIST_BIO_FETCH_WORKERS_KEY, ALBUM_BIO_FETCH_WORKERS_KEY,
     WORKER_COUNT_MIN, WORKER_COUNT_MAX,
-    COMPLETION_COMPLETE_PERCENT_KEY, COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX,
+    COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX,
     BACKUP_INTERVAL_HOURS_KEY, BACKUP_INTERVAL_HOURS_MIN, BACKUP_INTERVAL_HOURS_MAX,
     BACKUP_RETENTION_COUNT_KEY, BACKUP_RETENTION_COUNT_MIN, BACKUP_RETENTION_COUNT_MAX,
     GENRE_BACKFILL_RETRY_DAYS_KEY, BIO_BACKFILL_RETRY_DAYS_KEY,
@@ -145,6 +146,28 @@ def _listenerSessionLedger(health: dict, tz) -> dict | None:
     return {"builds": builds, "last_rebuild": " - ".join(parts) or None}
 
 
+def _periodicWorkerStatus(status, configured: bool) -> dict:
+    """Normalize one periodic worker, preserving telemetry and legacy defaults."""
+    if not isinstance(status, dict):
+        status = {"configured": configured}
+    return {"configured": bool(status.get("configured")), "running": bool(status.get("running")),
+            "consecutive_failures": status.get("consecutive_failures", 0),
+            "failure_rate": status.get("failure_rate", 0.0), "last_error": status.get("last_error")}
+
+
+def _readPeriodicWorkerStatus(db, accessor: str, configured: bool, label: str, username: str) -> dict:
+    """Read an already-active worker without letting one failure hide siblings."""
+    status = None
+    if db is not None:
+        try:
+            read = getattr(db, accessor, None)
+            if read is not None:
+                status = read()
+        except Exception as error:
+            logger.warning("%s worker status lookup failed for %s: %s", label, username, error)
+    return _periodicWorkerStatus(status, configured)
+
+
 def register(app, dashboard):
     # The pre-bound admin flavour (see routes/_auth.py): logged-in + isAdmin,
     # or 403; anonymous redirects to login with next=/admin. This replaced 13
@@ -231,59 +254,19 @@ def register(app, dashboard):
             # for the 5 periodic workers with cycle telemetry (see
             # Database/workers/telemetry.py) - auto_importer's watchdog loop
             # lives outside Database/workers/ and has no equivalent counters.
-            _telemetryDefaults = {"consecutive_failures": 0, "failure_rate": 0.0, "last_error": None}
-            spotify_api_worker = {"configured": has_api, "running": False, **_telemetryDefaults}
-            genre_worker = {"configured": has_lastfm_key, "running": False, **_telemetryDefaults}
-            album_bio_worker = {"configured": has_lastfm_key, "running": False, **_telemetryDefaults}
-            artist_bio_worker = {"configured": has_lastfm_key, "running": False, **_telemetryDefaults}
+            spotify_api_worker = _readPeriodicWorkerStatus(
+                u_db, "getSpotifyApiWorkerStatus", has_api, "Spotify API", u_username)
+            lastfmDb = u_db if has_lastfm_key else None
+            genre_worker = _readPeriodicWorkerStatus(
+                lastfmDb, "getLastfmWorkerStatus", has_lastfm_key, "Last.fm", u_username)
+            album_bio_worker = _readPeriodicWorkerStatus(
+                lastfmDb, "getLastfmAlbumBiographyWorkerStatus", has_lastfm_key, "Last.fm album bio", u_username)
+            artist_bio_worker = _readPeriodicWorkerStatus(
+                lastfmDb, "getLastfmBiographyWorkerStatus", has_lastfm_key, "Last.fm artist bio", u_username)
+            wrapped_worker = _readPeriodicWorkerStatus(
+                u_db, "getWrappedWorkerStatus", True, "Wrapped", u_username)
             auto_importer_worker = {"configured": True, "running": False}
-            wrapped_worker = {"configured": True, "running": False, **_telemetryDefaults}
-
             if u_db is not None:
-                try:
-                    if hasattr(u_db, "getSpotifyApiWorkerStatus"):
-                        st = u_db.getSpotifyApiWorkerStatus()
-                        if isinstance(st, dict):
-                            spotify_api_worker = {"configured": bool(st.get("configured")), "running": bool(st.get("running")),
-                                                   "consecutive_failures": st.get("consecutive_failures", 0),
-                                                   "failure_rate": st.get("failure_rate", 0.0),
-                                                   "last_error": st.get("last_error")}
-                except Exception as e:
-                    logger.warning("Spotify API worker status lookup failed for %s: %s", u_username, e)
-
-                if has_lastfm_key:
-                    try:
-                        workerStatus = u_db.getLastfmWorkerStatus()
-                        if isinstance(workerStatus, dict):
-                            genre_worker = {"configured": bool(workerStatus.get("configured")), "running": bool(workerStatus.get("running")),
-                                             "consecutive_failures": workerStatus.get("consecutive_failures", 0),
-                                             "failure_rate": workerStatus.get("failure_rate", 0.0),
-                                             "last_error": workerStatus.get("last_error")}
-                    except Exception as e:
-                        logger.warning("Last.fm worker status lookup failed for %s: %s", u_username, e)
-
-                    try:
-                        if hasattr(u_db, "getLastfmAlbumBiographyWorkerStatus"):
-                            st = u_db.getLastfmAlbumBiographyWorkerStatus()
-                            if isinstance(st, dict):
-                                album_bio_worker = {"configured": bool(st.get("configured")), "running": bool(st.get("running")),
-                                                     "consecutive_failures": st.get("consecutive_failures", 0),
-                                                     "failure_rate": st.get("failure_rate", 0.0),
-                                                     "last_error": st.get("last_error")}
-                    except Exception as e:
-                        logger.warning("Last.fm album bio worker status lookup failed for %s: %s", u_username, e)
-
-                    try:
-                        if hasattr(u_db, "getLastfmBiographyWorkerStatus"):
-                            st = u_db.getLastfmBiographyWorkerStatus()
-                            if isinstance(st, dict):
-                                artist_bio_worker = {"configured": bool(st.get("configured")), "running": bool(st.get("running")),
-                                                      "consecutive_failures": st.get("consecutive_failures", 0),
-                                                      "failure_rate": st.get("failure_rate", 0.0),
-                                                      "last_error": st.get("last_error")}
-                    except Exception as e:
-                        logger.warning("Last.fm artist bio worker status lookup failed for %s: %s", u_username, e)
-
                 try:
                     if hasattr(u_db, "getAutoImporterWorkerStatus"):
                         st = u_db.getAutoImporterWorkerStatus()
@@ -291,17 +274,6 @@ def register(app, dashboard):
                             auto_importer_worker = {"configured": bool(st.get("configured")), "running": bool(st.get("running"))}
                 except Exception as e:
                     logger.warning("AutoImporter worker status lookup failed for %s: %s", u_username, e)
-
-                try:
-                    if hasattr(u_db, "getWrappedWorkerStatus"):
-                        st = u_db.getWrappedWorkerStatus()
-                        if isinstance(st, dict):
-                            wrapped_worker = {"configured": bool(st.get("configured")), "running": bool(st.get("running")),
-                                               "consecutive_failures": st.get("consecutive_failures", 0),
-                                               "failure_rate": st.get("failure_rate", 0.0),
-                                               "last_error": st.get("last_error")}
-                except Exception as e:
-                    logger.warning("Wrapped worker status lookup failed for %s: %s", u_username, e)
 
             created_at_val = u.get("created_at")
             created_date_str = ""
@@ -932,10 +904,10 @@ def register(app, dashboard):
 
     @requiresAdmin
     def adminSkipSettings(username, db):
-        """Admin-only: the instance-wide skip threshold (a plain seconds value
-        or a percent of each track's duration). Saving recomputes plays.is_skip
-        across every user's history via recomputeSkipFlags(), so all skip vs
-        real-play stats reflect the new boundary immediately."""
+        """Save classification settings and every user's skip flags atomically.
+
+        Every Save invalidates Wrapped for lazy rebuilding and repairs drift,
+        including when the submitted settings are unchanged."""
         mode = request.form.get("skip_mode", SKIP_MODE_SECONDS)
         if mode not in (SKIP_MODE_SECONDS, SKIP_MODE_PERCENT):
             mode = SKIP_MODE_SECONDS
@@ -943,17 +915,18 @@ def register(app, dashboard):
             value = int(request.form.get("skip_value", ""))
         except (TypeError, ValueError):
             return redirect(url_for("adminPage", tab="settings", error="Skip threshold must be a whole number."))
-        # Both settings are stored BEFORE the recompute, because both are inputs
-        # to it: computeIsSkip caps its threshold at the completion boundary
-        # (73e1a2c), so recomputing first would classify every row under the old
-        # completion percent and leave the flag on disk disagreeing with the
-        # classifier - the same "complete and abandoned at once" contradiction
-        # that cap was added to remove - until someone saved this form twice.
-        # Lenient on a blank/bad completion value, as before.
-        dashboard.repo.setSkipThreshold(mode, value)   #< clamps to the mode's bounds
-        _saveClampedIntSetting("completion_complete_percent", COMPLETION_COMPLETE_PERCENT_KEY,
-                               COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX)
-        dashboard.repo.recomputeSkipFlags()             #< self-commits; reclassifies every play
+        # Keep the existing lenient completion rule: blank/bad input leaves
+        # the stored setting alone. The repository clamps valid inputs.
+        try:
+            completionPercent = int(request.form.get("completion_complete_percent", ""))
+        except (TypeError, ValueError):
+            completionPercent = None
+        try:
+            dashboard.repo.savePlaybackClassificationSettings(mode, value, completionPercent)
+        except (sqlite3.OperationalError, sqlite3.IntegrityError):
+            logger.exception("Could not save playback classification settings")
+            return redirect(url_for("adminPage", tab="settings",
+                                    error="Could not save playback classification settings. Please try again."))
         return redirect(url_for("adminPage", tab="settings", message="Playback classification settings saved."))
     app.add_url_rule("/admin/skip_settings", "adminSkipSettings", adminSkipSettings, methods=["POST"])
 

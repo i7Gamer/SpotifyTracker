@@ -6,7 +6,13 @@ from __future__ import annotations
 import json
 import re
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import (
+    APP_SETTING_FALSE,
+    APP_SETTING_TRUE,
+    TRACK_MERGE_LAST_RUN_KEY,
+    TRACK_MERGE_SETTING_KEY,
+    time,
+)
 
 # The manual review tier's duration gate, measured on a live copy
 # (2026-08-07): most same-recording pairs agree within 1s, and the pairs

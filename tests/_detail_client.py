@@ -1,7 +1,7 @@
 """Client helper for the song/artist/album detail pages' two-phase load.
 
 Those routes serve a shell on the plain GET and everything below the toolbar
-from a second request htmx makes on first paint (see routes/charts.py's
+from a second request htmx makes on first paint (see routes/details.py's
 DETAIL_BODY_TARGET and static/js/detail-page.js). A test asserting on the
 page's markup wants what the browser ends up showing, so ``_getPath`` performs
 both requests and returns the shell response with the deferred body appended to
@@ -28,11 +28,11 @@ on sys.path with no package __init__.
 """
 from unittest.mock import patch
 
-from routes.charts import (DETAIL_BODY_TARGET, DETAIL_HISTORY_TARGET,
+from routes.details import (DETAIL_BODY_TARGET, DETAIL_HISTORY_TARGET,
                            DETAIL_MORE_TARGET)
 
 #< what htmx puts on every request it makes, plus the id of the element it is
-#  about to fill - see routes/charts.py's _detailSwapTarget
+#  about to fill - see routes/details.py's _detailSwapTarget
 HX_BODY_HEADERS = {"HX-Request": "true", "HX-Target": DETAIL_BODY_TARGET}
 HX_LIST_HEADERS = {"HX-Request": "true", "HX-Target": DETAIL_HISTORY_TARGET}
 HX_MORE_HEADERS = {"HX-Request": "true", "HX-Target": DETAIL_MORE_TARGET}

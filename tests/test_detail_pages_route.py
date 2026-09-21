@@ -17,6 +17,28 @@ import routes.charts as chartsRoutes
 import app as appmod
 
 
+class TestDetailRouteRegistration(AppTestCase):
+    def test_detail_routes_keep_their_public_rules_methods_and_legacy_constants(self):
+        dash = self._makeApp()
+
+        rules = {
+            rule.endpoint: rule
+            for rule in dash.app.url_map.iter_rules()
+            if rule.endpoint in {"songDetailPage", "artistDetailPage", "albumDetailPage"}
+        }
+
+        self.assertEqual(set(rules), {"songDetailPage", "artistDetailPage", "albumDetailPage"})
+        self.assertEqual(rules["songDetailPage"].rule, "/song/<track_id>")
+        self.assertEqual(rules["artistDetailPage"].rule, "/artist/<artist_id>")
+        self.assertEqual(rules["albumDetailPage"].rule, "/album/<album_id>")
+        for rule in rules.values():
+            self.assertEqual(rule.methods & {"GET", "POST", "PUT", "DELETE", "PATCH"}, {"GET"})
+        self.assertEqual(chartsRoutes.DETAIL_BODY_TARGET, "detailBody")
+        self.assertEqual(chartsRoutes.DETAIL_HISTORY_TARGET, "detailHistoryResults")
+        self.assertEqual(chartsRoutes.DETAIL_MORE_TARGET, "timelineActions")
+        self.assertEqual(chartsRoutes.MAX_DETAIL_HISTORY_PAGES, 10)
+
+
 def _byId(entityId, genres):
     """Return value shape of the batched genre lookups (getGenresForTracks and
     friends): {id: [genre, ...]} for every requested id."""
@@ -1882,7 +1904,7 @@ class TestArtistTimelineShowsAlbumName(_DetailRouteTestBase):
 class TestDetailPageDeferredBody(_DetailRouteTestBase):
     """The two-phase split itself: the plain GET is a shell and everything
     below the toolbar arrives in a second request htmx makes on first paint
-    (see DETAIL_BODY_TARGET in routes/charts.py and static/js/detail-page.js).
+    (see DETAIL_BODY_TARGET in routes/details.py and static/js/detail-page.js).
     These drive the two requests through _getRaw rather than the composing
     _getPath the markup tests use.
 
