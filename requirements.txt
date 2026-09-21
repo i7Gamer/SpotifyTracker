@@ -63,7 +63,7 @@ requests==2.34.2
 # thing to suspect and 17.0.1 is the rollback.
 websockets==17.1
 waitress==3.0.2
-tzdata==2026.3
+tzdata==2026.4
 # Neither of these is used anywhere in this codebase - spotapi/utils/saver.py
 # does an unconditional `import redis` and `import pymongo` for its optional
 # Redis/Mongo-backed session savers, even though this app only ever uses
