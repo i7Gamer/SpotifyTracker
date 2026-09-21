@@ -11,13 +11,46 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from conftest import DatabaseTestCase, normalizeTrackForTest
-from Database.database import Database
+from Database.database import Database, _LastfmInvalidKeyError
 from Database.lastfm import FetchOutcome, OUTCOME_OK, OUTCOME_NOT_FOUND, OUTCOME_TRANSIENT, OUTCOME_INVALID_KEY
 
 OK_EMPTY = FetchOutcome(OUTCOME_OK, [])
 ROCK_TAGS = FetchOutcome(OUTCOME_OK, [{"name": "rock", "count": 100},
                                       {"name": "seen live", "count": 90},
                                       {"name": "indie rock", "count": 80}])
+OLD_API_KEY = "key-old"
+ROTATED_API_KEY = "key-new"
+STARTUP_DELAY_SECONDS = 17
+
+LASTFM_LOOP_CONTRACTS = (
+    {
+        "name": "genre",
+        "loop": "_lastfmGenreBackfillLoop",
+        "event": "lastfm_stop_event",
+        "enabled": "isLastfmGenreBackfillEnabled",
+        "work": "_runLastfmCycle",
+        "idle": "LASTFM_IDLE_WAIT_SECONDS",
+        "telemetry": "lastfm_genre",
+    },
+    {
+        "name": "artist_bio",
+        "loop": "_lastfmBiographyBackfillLoop",
+        "event": "lastfm_biography_stop_event",
+        "enabled": "isArtistBioEnabled",
+        "work": "_processLastfmBiographyBatch",
+        "idle": "LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS",
+        "telemetry": "lastfm_artist_bio",
+    },
+    {
+        "name": "album_bio",
+        "loop": "_lastfmAlbumBiographyBackfillLoop",
+        "event": "lastfm_album_biography_stop_event",
+        "enabled": "isAlbumBioEnabled",
+        "work": "_processLastfmAlbumBiographyBatch",
+        "idle": "LASTFM_ALBUM_BIOGRAPHY_IDLE_WAIT_SECONDS",
+        "telemetry": "lastfm_album_bio",
+    },
+)
 
 
 def _album(albumId, name=None):
@@ -380,6 +413,158 @@ class WorkerLoopTestCase(LastfmWorkerBase):
         stamp = db.repo._conn().execute(
             "SELECT lastfm_attempted_at FROM artists WHERE id='aX'").fetchone()[0]
         self.assertIsNone(stamp)   #< nothing marked - a fixed key retries everything
+
+
+class LastfmLoopPolicyContractTestCase(LastfmWorkerBase):
+    """Loop policy shared by the three Last.fm workers.
+
+    Entity processors stay separate; this pins only the orchestration the
+    runner is allowed to share.
+    """
+
+    def _dbWithKey(self):
+        db = self._makeDbWithPlays()
+        db.repo.updateUserLastfmApiKey("user1", OLD_API_KEY)
+        return db
+
+    def _event(self, *, waits, isSet=False):
+        event = MagicMock()
+        event.wait.side_effect = list(waits)
+        event.is_set.return_value = isSet
+        return event
+
+    def _loop(self, db, contract, event):
+        getattr(db, contract["loop"])(event)
+
+    def _patchWork(self, db, contract, side_effect):
+        return patch.object(db, contract["work"], side_effect=side_effect)
+
+    def _waitDurations(self, event):
+        return [call.args[0] if call.args else None for call in event.wait.call_args_list]
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_stops_during_startup_before_reading_the_key(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                db.repo.getUserLastfmApiKey = MagicMock(return_value=OLD_API_KEY)
+                event = self._event(waits=[True])
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=AssertionError("work must not run")):
+                    self._loop(db, contract, event)
+
+                db.repo.getUserLastfmApiKey.assert_not_called()
+                mockClientClass.assert_not_called()
+                self.assertEqual(self._waitDurations(event), [STARTUP_DELAY_SECONDS])
+                mockClientClass.reset_mock()
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_idles_when_disabled_without_reading_the_key(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                getattr(db.repo, contract["enabled"])
+                setattr(db.repo, contract["enabled"], MagicMock(return_value=False))
+                db.repo.getUserLastfmApiKey = MagicMock(return_value=OLD_API_KEY)
+                event = self._event(waits=[False, True])
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=AssertionError("work must not run")):
+                    self._loop(db, contract, event)
+
+                db.repo.getUserLastfmApiKey.assert_not_called()
+                mockClientClass.assert_not_called()
+                self.assertIn(getattr(db, contract["idle"]), self._waitDurations(event))
+                mockClientClass.reset_mock()
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_exits_when_the_key_has_been_removed(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                db.repo.getUserLastfmApiKey = MagicMock(return_value=None)
+                event = self._event(waits=[False])
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=AssertionError("work must not run")):
+                    self._loop(db, contract, event)
+
+                db.repo.getUserLastfmApiKey.assert_called_once_with(db.user)
+                mockClientClass.assert_not_called()
+                self.assertEqual(self._waitDurations(event), [STARTUP_DELAY_SECONDS])
+                mockClientClass.reset_mock()
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_rereads_a_rotated_key_each_cycle(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                db.repo.getUserLastfmApiKey = MagicMock(side_effect=[OLD_API_KEY, ROTATED_API_KEY])
+                event = self._event(waits=[False, False, True])
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=[False, False, False, False]):
+                    self._loop(db, contract, event)
+
+                self.assertEqual([call.args[0] for call in mockClientClass.call_args_list],
+                                 [OLD_API_KEY, ROTATED_API_KEY])
+                self.assertEqual(db.repo.getUserLastfmApiKey.call_count, 2)
+                mockClientClass.reset_mock()
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_tries_own_scope_before_global_scope(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                event = self._event(waits=[False])
+                event.is_set.side_effect = [False, False, True]
+                scopes = []
+
+                def work(client, scopeUsername, stop_event=None):
+                    scopes.append(scopeUsername)
+                    return scopeUsername is None
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=work):
+                    self._loop(db, contract, event)
+
+                self.assertEqual(scopes, [db.user, None])
+                mockClientClass.reset_mock()
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_records_invalid_key_on_its_own_telemetry_and_waits(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                event = self._event(waits=[False, True])
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=_LastfmInvalidKeyError):
+                    self._loop(db, contract, event)
+
+                telemetry = db._getWorkerTelemetry(contract["telemetry"])
+                self.assertEqual(telemetry["consecutive_failures"], 1)
+                self.assertEqual(telemetry["last_error"], "Invalid Last.fm API key")
+                self.assertIn(getattr(db, contract["idle"]), self._waitDurations(event))
+                mockClientClass.reset_mock()
+
+    @patch("Database.database.LastfmClient")
+    def test_every_loop_records_empty_cycles_as_success_and_waits(self, mockClientClass):
+        for contract in LASTFM_LOOP_CONTRACTS:
+            with self.subTest(worker=contract["name"]):
+                db = self._dbWithKey()
+                event = self._event(waits=[False, True])
+
+                with patch("random.randint", return_value=STARTUP_DELAY_SECONDS), \
+                        self._patchWork(db, contract, side_effect=[False, False]):
+                    self._loop(db, contract, event)
+
+                telemetry = db._getWorkerTelemetry(contract["telemetry"])
+                self.assertEqual(telemetry["consecutive_failures"], 0)
+                self.assertIsNone(telemetry["last_error"])
+                self.assertIn(getattr(db, contract["idle"]), self._waitDurations(event))
+                mockClientClass.reset_mock()
 
 
 class WorkerBatchTestCase(LastfmWorkerBase):

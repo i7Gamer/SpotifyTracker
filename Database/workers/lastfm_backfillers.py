@@ -86,6 +86,66 @@ class LastfmBackfillMixin:
         """Signal and wait for the background genre backfiller to stop."""
         self._stopLastfmWorker("lastfm_thread", "lastfm_stop_event")
 
+    def _runLastfmLoop(self, *, stop_event: threading.Event | None, eventAttr: str,
+                       minStartDelay: int, maxStartDelay: int, idleWaitSeconds: int,
+                       enabled, runWork, logPrefix: str, errorLabel: str,
+                       telemetryKey: str) -> None:
+        """Shared loop policy for the three Last.fm workers.
+
+        The workers keep their own entrypoints, timings, telemetry names and
+        entity processors; only the repeated loop shell lives here.
+        """
+        import random
+        if stop_event is None:
+            stop_event = getattr(self, eventAttr)
+        try:
+            startup_delay = random.randint(minStartDelay, maxStartDelay)
+            _dbmod.logger.info("[%s-%s] Starting with initial delay of %d seconds",
+                               logPrefix, self.user, startup_delay)
+            if stop_event.wait(startup_delay):
+                _dbmod.logger.info("[%s-%s] Stopped during startup delay", logPrefix, self.user)
+                return
+
+            while not stop_event.is_set():
+                try:
+                    if not enabled():
+                        if stop_event.wait(idleWaitSeconds):
+                            break
+                        continue
+
+                    apiKey = self.repo.getUserLastfmApiKey(self.user)
+                    if not apiKey:
+                        _dbmod.logger.info("[%s-%s] No API key stored anymore - exiting",
+                                           logPrefix, self.user)
+                        return
+                    client = _dbmod.LastfmClient(apiKey)
+
+                    processedAny = runWork(client, self.user, stop_event=stop_event)
+                    if not processedAny and not stop_event.is_set():
+                        processedAny = runWork(client, None, stop_event=stop_event)
+                    if not processedAny:
+                        if stop_event.wait(idleWaitSeconds):
+                            break
+                except _dbmod._LastfmInvalidKeyError:
+                    self._recordWorkerCycle(
+                        telemetryKey, success=False, error="Invalid Last.fm API key")
+                    _dbmod.logger.warning(
+                        "[%s-%s] Last.fm rejected the API key (invalid/suspended) - "
+                        "idling; fix the key on the profile page", logPrefix, self.user)
+                    if stop_event.wait(idleWaitSeconds):
+                        break
+                except Exception as e:
+                    error = _dbmod.parseError(e)
+                    self._recordWorkerCycle(telemetryKey, success=False, error=error)
+                    _dbmod.logger.error("[%s-%s] Error in %s backfill loop: %s",
+                                        logPrefix, self.user, errorLabel, error)
+                    if stop_event.wait(idleWaitSeconds):
+                        break
+                else:
+                    self._recordWorkerCycle(telemetryKey, success=True)
+        finally:
+            _dbmod.logger.info("[%s-%s] Exited gracefully", logPrefix, self.user)
+
     def _lastfmGenreBackfillLoop(self, stop_event: threading.Event | None = None) -> None:
         """Fetches Last.fm genre tags for this user's played artists, albums
         and tracks (most-played first), then - once the own queue is drained -
@@ -96,57 +156,14 @@ class LastfmBackfillMixin:
         `stop_event` is THIS run's private event (see the fresh-event note in
         startLastfmGenreBackfiller); the loop's own lifecycle checks use it
         exclusively so a later restart can never revive this thread."""
-        import random
-        if stop_event is None:
-            stop_event = self.lastfm_stop_event
-        try:
-            # Random startup offset so per-user threads don't stampede after a restart.
-            startup_delay = random.randint(self.LASTFM_BACKFILLER_MIN_START_DELAY,
-                                           self.LASTFM_BACKFILLER_MAX_START_DELAY)
-            _dbmod.logger.info("[LastfmWorker-%s] Starting with initial delay of %d seconds", self.user, startup_delay)
-            if stop_event.wait(startup_delay):
-                _dbmod.logger.info("[LastfmWorker-%s] Stopped during startup delay", self.user)
-                return
-
-            while not stop_event.is_set():
-                try:
-                    # Fresh read each cycle, like the API key below: an admin
-                    # flip is picked up without restarting the thread, and
-                    # idling (not exiting) means re-enabling resumes on its own.
-                    if not self.repo.isLastfmGenreBackfillEnabled():
-                        if stop_event.wait(self.LASTFM_IDLE_WAIT_SECONDS):
-                            break
-                        continue
-
-                    # Fresh read each cycle: a rotated key is picked up here, a
-                    # removed key ends the thread (the save handler restarts it).
-                    apiKey = self.repo.getUserLastfmApiKey(self.user)
-                    if not apiKey:
-                        _dbmod.logger.info("[LastfmWorker-%s] No API key stored anymore - exiting", self.user)
-                        return
-                    client = _dbmod.LastfmClient(apiKey)
-
-                    processedAny = self._runLastfmCycle(client, self.user, stop_event=stop_event)
-                    if not processedAny and not stop_event.is_set():
-                        processedAny = self._runLastfmCycle(client, None, stop_event=stop_event)   #< global queue
-                    if not processedAny:
-                        if stop_event.wait(self.LASTFM_IDLE_WAIT_SECONDS):
-                            break
-                except _dbmod._LastfmInvalidKeyError:
-                    self._recordWorkerCycle("lastfm_genre", success=False, error="Invalid Last.fm API key")
-                    _dbmod.logger.warning("[LastfmWorker-%s] Last.fm rejected the API key (invalid/suspended) - "
-                                   "idling; fix the key on the profile page", self.user)
-                    if stop_event.wait(self.LASTFM_IDLE_WAIT_SECONDS):
-                        break
-                except Exception as e:
-                    self._recordWorkerCycle("lastfm_genre", success=False, error=_dbmod.parseError(e))
-                    _dbmod.logger.error("[LastfmWorker-%s] Error in genre backfill loop: %s", self.user, _dbmod.parseError(e))
-                    if stop_event.wait(self.LASTFM_IDLE_WAIT_SECONDS):
-                        break
-                else:
-                    self._recordWorkerCycle("lastfm_genre", success=True)
-        finally:
-            _dbmod.logger.info("[LastfmWorker-%s] Exited gracefully", self.user)
+        self._runLastfmLoop(
+            stop_event=stop_event, eventAttr="lastfm_stop_event",
+            minStartDelay=self.LASTFM_BACKFILLER_MIN_START_DELAY,
+            maxStartDelay=self.LASTFM_BACKFILLER_MAX_START_DELAY,
+            idleWaitSeconds=self.LASTFM_IDLE_WAIT_SECONDS,
+            enabled=self.repo.isLastfmGenreBackfillEnabled,
+            runWork=self._runLastfmCycle, logPrefix="LastfmWorker",
+            errorLabel="genre", telemetryKey="lastfm_genre")
 
     def _runLastfmCycle(self, client: LastfmClient, scopeUsername: str | None,
                         stop_event: threading.Event | None = None) -> bool:
@@ -208,56 +225,14 @@ class LastfmBackfillMixin:
         `stop_event` is THIS run's private event (see the fresh-event note in
         startLastfmGenreBackfiller); the loop's own lifecycle checks use it
         exclusively so a later restart can never revive this thread."""
-        import random
-        if stop_event is None:
-            stop_event = self.lastfm_biography_stop_event
-        try:
-            startup_delay = random.randint(self.LASTFM_BIOGRAPHY_BACKFILLER_MIN_START_DELAY,
-                                           self.LASTFM_BIOGRAPHY_BACKFILLER_MAX_START_DELAY)
-            _dbmod.logger.info("[LastfmBioWorker-%s] Starting with initial delay of %d seconds", self.user, startup_delay)
-            if stop_event.wait(startup_delay):
-                _dbmod.logger.info("[LastfmBioWorker-%s] Stopped during startup delay", self.user)
-                return
-
-            while not stop_event.is_set():
-                try:
-                    # Fresh read each cycle, like the API key below: an admin
-                    # flip is picked up without restarting the thread, and
-                    # idling (not exiting) means re-enabling resumes on its own.
-                    if not self.repo.isArtistBioEnabled():
-                        if stop_event.wait(self.LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                            break
-                        continue
-
-                    # Fresh read each cycle: a rotated key is picked up here, a
-                    # removed key ends the thread (the save handler restarts it).
-                    apiKey = self.repo.getUserLastfmApiKey(self.user)
-                    if not apiKey:
-                        _dbmod.logger.info("[LastfmBioWorker-%s] No API key stored anymore - exiting", self.user)
-                        return
-                    client = _dbmod.LastfmClient(apiKey)
-
-                    processedAny = self._processLastfmBiographyBatch(client, self.user, stop_event=stop_event)
-                    if not processedAny and not stop_event.is_set():
-                        processedAny = self._processLastfmBiographyBatch(client, None, stop_event=stop_event)   #< global queue
-                    if not processedAny:
-                        if stop_event.wait(self.LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                            break
-                except _dbmod._LastfmInvalidKeyError:
-                    self._recordWorkerCycle("lastfm_artist_bio", success=False, error="Invalid Last.fm API key")
-                    _dbmod.logger.warning("[LastfmBioWorker-%s] Last.fm rejected the API key (invalid/suspended) - "
-                                   "idling; fix the key on the profile page", self.user)
-                    if stop_event.wait(self.LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                        break
-                except Exception as e:
-                    self._recordWorkerCycle("lastfm_artist_bio", success=False, error=_dbmod.parseError(e))
-                    _dbmod.logger.error("[LastfmBioWorker-%s] Error in biography backfill loop: %s", self.user, _dbmod.parseError(e))
-                    if stop_event.wait(self.LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                        break
-                else:
-                    self._recordWorkerCycle("lastfm_artist_bio", success=True)
-        finally:
-            _dbmod.logger.info("[LastfmBioWorker-%s] Exited gracefully", self.user)
+        self._runLastfmLoop(
+            stop_event=stop_event, eventAttr="lastfm_biography_stop_event",
+            minStartDelay=self.LASTFM_BIOGRAPHY_BACKFILLER_MIN_START_DELAY,
+            maxStartDelay=self.LASTFM_BIOGRAPHY_BACKFILLER_MAX_START_DELAY,
+            idleWaitSeconds=self.LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS,
+            enabled=self.repo.isArtistBioEnabled,
+            runWork=self._processLastfmBiographyBatch, logPrefix="LastfmBioWorker",
+            errorLabel="biography", telemetryKey="lastfm_artist_bio")
 
     def _processLastfmBiographyBatch(self, client: LastfmClient, scopeUsername: str | None,
                                      stop_event: threading.Event | None = None) -> bool:
@@ -318,57 +293,15 @@ class LastfmBackfillMixin:
         `stop_event` is THIS run's private event (see the fresh-event note in
         startLastfmGenreBackfiller); the loop's own lifecycle checks use it
         exclusively so a later restart can never revive this thread."""
-        import random
-        if stop_event is None:
-            stop_event = self.lastfm_album_biography_stop_event
-        try:
-            startup_delay = random.randint(self.LASTFM_ALBUM_BIOGRAPHY_BACKFILLER_MIN_START_DELAY,
-                                           self.LASTFM_ALBUM_BIOGRAPHY_BACKFILLER_MAX_START_DELAY)
-            _dbmod.logger.info("[LastfmAlbumBioWorker-%s] Starting with initial delay of %d seconds", self.user, startup_delay)
-            if stop_event.wait(startup_delay):
-                _dbmod.logger.info("[LastfmAlbumBioWorker-%s] Stopped during startup delay", self.user)
-                return
-
-            while not stop_event.is_set():
-                try:
-                    # Fresh read each cycle, like the API key below: an admin
-                    # flip is picked up without restarting the thread, and
-                    # idling (not exiting) means re-enabling resumes on its own.
-                    if not self.repo.isAlbumBioEnabled():
-                        if stop_event.wait(self.LASTFM_ALBUM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                            break
-                        continue
-
-                    # Fresh read each cycle: a rotated key is picked up here, a
-                    # removed key ends the thread (the save handler restarts it).
-                    apiKey = self.repo.getUserLastfmApiKey(self.user)
-                    if not apiKey:
-                        _dbmod.logger.info("[LastfmAlbumBioWorker-%s] No API key stored anymore - exiting", self.user)
-                        return
-                    client = _dbmod.LastfmClient(apiKey)
-
-                    processedAny = self._processLastfmAlbumBiographyBatch(client, self.user, stop_event=stop_event)
-                    if not processedAny and not stop_event.is_set():
-                        processedAny = self._processLastfmAlbumBiographyBatch(client, None, stop_event=stop_event)   #< global queue
-                    if not processedAny:
-                        if stop_event.wait(self.LASTFM_ALBUM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                            break
-                except _dbmod._LastfmInvalidKeyError:
-                    self._recordWorkerCycle("lastfm_album_bio", success=False, error="Invalid Last.fm API key")
-                    _dbmod.logger.warning("[LastfmAlbumBioWorker-%s] Last.fm rejected the API key (invalid/suspended) - "
-                                   "idling; fix the key on the profile page", self.user)
-                    if stop_event.wait(self.LASTFM_ALBUM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                        break
-                except Exception as e:
-                    self._recordWorkerCycle("lastfm_album_bio", success=False, error=_dbmod.parseError(e))
-                    _dbmod.logger.error("[LastfmAlbumBioWorker-%s] Error in album biography backfill loop: %s",
-                                self.user, _dbmod.parseError(e))
-                    if stop_event.wait(self.LASTFM_ALBUM_BIOGRAPHY_IDLE_WAIT_SECONDS):
-                        break
-                else:
-                    self._recordWorkerCycle("lastfm_album_bio", success=True)
-        finally:
-            _dbmod.logger.info("[LastfmAlbumBioWorker-%s] Exited gracefully", self.user)
+        self._runLastfmLoop(
+            stop_event=stop_event, eventAttr="lastfm_album_biography_stop_event",
+            minStartDelay=self.LASTFM_ALBUM_BIOGRAPHY_BACKFILLER_MIN_START_DELAY,
+            maxStartDelay=self.LASTFM_ALBUM_BIOGRAPHY_BACKFILLER_MAX_START_DELAY,
+            idleWaitSeconds=self.LASTFM_ALBUM_BIOGRAPHY_IDLE_WAIT_SECONDS,
+            enabled=self.repo.isAlbumBioEnabled,
+            runWork=self._processLastfmAlbumBiographyBatch,
+            logPrefix="LastfmAlbumBioWorker", errorLabel="album biography",
+            telemetryKey="lastfm_album_bio")
 
     def _processLastfmAlbumBiographyBatch(self, client: LastfmClient, scopeUsername: str | None,
                                           stop_event: threading.Event | None = None) -> bool:
