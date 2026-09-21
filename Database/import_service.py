@@ -77,21 +77,30 @@ def _minTimestamp(current, *candidates):
 # have always been importable.
 UNREADABLE_DROP_STAT_KEYS = ("droppedMalformed",)
 
+
+class ImportFailureCategory(ValueError):
+    """Base for expected import-file failures with fixed public categories."""
+
+
+class UnsupportedImportFormatError(ImportFailureCategory):
+    """The upload is not a supported Spotify JSON or Musicolet CSV export."""
+
+
+class UnreadableImportEntriesError(ImportFailureCategory):
+    """The upload matched a format but none of its entries could be parsed."""
+
+
+class AmbiguousImportMatchError(ImportFailureCategory):
+    """An overwrite entry matched several existing rows and must abort."""
+
+
 # Raised when an overwrite batch reaches an entry whose near-time lookup finds
-# several candidate rows (see _applyImportData). Static text on purpose: import
-# failures are classified by substring, and this message reaches the user's
-# progress line, so an interpolated track id or title would both leak into the
-# UI and change how the failure classifies.
+# several candidate rows (see _applyImportData). Keep this diagnostic static
+# because the direct import progress path can display it. Batch summaries use
+# the exception type, never this wording or interpolated upload contents.
 AMBIGUOUS_MATCH_ABORT_MESSAGE = (
     "an uploaded entry matches several existing plays of the same track, so there is no single "
     "row it can safely correct and the play it describes cannot be restored")
-
-# The stable substring of _stageImportData's "None of the N entries..." raise
-# (the N interpolates the file's own entry count, not user-supplied content,
-# but _classifyImportFailureReason still matches on this fixed fragment
-# rather than str(e) as a whole - keeping the classifier's rule uniform: it
-# never depends on interpolated text, even text as harmless as a count).
-_UNREADABLE_ENTRIES_MARKER = "entries in this file could be read"
 
 
 def _classifyImportFailureReason(e: Exception) -> str:
@@ -104,19 +113,16 @@ def _classifyImportFailureReason(e: Exception) -> str:
     keeps the full parseError(e) diagnostic unchanged, so nothing is lost for
     debugging, only kept out of the browser.
 
-    Keyed on exception shape and on a STABLE marker substring of the (also
-    fixed) message each raise site uses - never on the message as a whole,
-    since two of the three raise sites interpolate a count. Only the shapes
-    reachable from _stageImportData/_applyImportData via the batch loop's
-    except (Database/import_service.py) are named here; anything else -
-    including MusicoletExpansionTooLargeError and any other Exception
-    subtype - falls to the generic default."""
-    if isinstance(e, ValueError):
-        message = str(e)
-        if message == AMBIGUOUS_MATCH_ABORT_MESSAGE:
-            return "an ambiguous match aborted this file"
-        if _UNREADABLE_ENTRIES_MARKER in message:
-            return "the file could not be read"
+    Keyed on local exception types raised by the service boundary, never on
+    diagnostic wording. Only expected file-level failures reachable from
+    _stageImportData/_applyImportData via the batch loop's except are named
+    here; anything else - including unrelated ValueError, MusicoletExpansionTooLargeError,
+    and any other Exception subtype - falls to the generic default."""
+    if isinstance(e, AmbiguousImportMatchError):
+        return "an ambiguous match aborted this file"
+    if isinstance(e, UnreadableImportEntriesError):
+        return "the file could not be read"
+    if isinstance(e, UnsupportedImportFormatError):
         return "unrecognised export format"
     return "an unexpected error"
 
@@ -307,7 +313,8 @@ class ImportMixin:
             # used to make AutoImporter move never-imported files to DONE/ as
             # successes and the web UI report the import as complete. The caller
             # (orchestrator / overwrite batch) reports the failure progress.
-            raise ValueError("Unrecognized or corrupt export file - expected a Spotify JSON export or Musicolet CSV backup")
+            raise UnsupportedImportFormatError(
+                "Unrecognized or corrupt export file - expected a Spotify JSON export or Musicolet CSV backup")
         if not parsedHistory:
             return None
 
@@ -375,7 +382,7 @@ class ImportMixin:
         # advice about a Spotify export it does not have.
         entriesSeen = importStats.get("entriesSeen", 0)
         if entriesSeen and importStats.get("droppedMalformed", 0) == entriesSeen:
-            raise ValueError(
+            raise UnreadableImportEntriesError(
                 f"None of the {entriesSeen} entries in this file could be read - it matches a known "
                 "export format but carries none of the expected fields. Re-export it and upload the "
                 "streaming-history file itself, not another one."
@@ -666,7 +673,7 @@ class ImportMixin:
                                 "entry for track %s - aborting rather than dropping it",
                                 self.user, len(matches), track_id,
                             )
-                            raise ValueError(AMBIGUOUS_MATCH_ABORT_MESSAGE)
+                            raise AmbiguousImportMatchError(AMBIGUOUS_MATCH_ABORT_MESSAGE)
                         if flaskDebugEnabled():
                             _dbmod.logger.info(
                                 "Skipping import play for track %s: %d plays found within tolerance - ambiguous, "

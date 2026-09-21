@@ -6,6 +6,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from conftest import DatabaseTestCase, normalizeTrackForTest, rawSpotifyTrackForTest
 import Database.Importers.StreamingHistoryImporter as importerModule
+import Database.import_service as importService
+
+
+MALFORMED_JSON_EXPORT = "{not valid json"
+MALFORMED_DATE = "not-a-date"
+MALFORMED_MUSICOLET_CSV = "\n".join([
+    "FILE_PATH,TITLE,ARTIST,ALBUM,ALBUM_ARTIST,COMPOSER,GENRE,YEAR,DURATION_MS,PLAY_COUNT",
+    "/music/bad.mp3,Shifted",
+])
 
 
 def _meta(trackId, playedAt):
@@ -227,6 +236,30 @@ class TestImportHistoryCommit(DatabaseTestCase):
         self.assertEqual(self.db.readProgress()["status"], "complete")
         self.assertEqual(len(self._playedAts()), 3)   #< the two seeded plus the readable one
 
+    def test_a_malformed_date_entry_is_dropped_without_failing_the_file(self):
+        """Malformed dates stay at the parser/drop boundary: they must not turn
+        into an unsupported-format service failure or block readable rows."""
+        import json
+        mixed = json.dumps([
+            {"ts": MALFORMED_DATE, "ms_played": 150000,
+             "master_metadata_track_name": "Bad Date",
+             "master_metadata_album_artist_name": "Artist One",
+             "spotify_track_uri": "spotify:track:badDate"},
+            {"ts": "2023-05-01T10:00:00Z", "ms_played": 150000,
+             "master_metadata_track_name": "Song One",
+             "master_metadata_album_artist_name": "Artist One",
+             "spotify_track_uri": "spotify:track:track123"},
+        ])
+
+        with patch.object(importerModule, "Spotify",
+                          return_value=self._stubSpotifyClient("badDate", "track123")):
+            self.db.importHistory(mixed)
+
+        progress = self.db.readProgress()
+        self.assertEqual(progress["status"], "complete")
+        self.assertNotIn("unrecognised export format", progress["message"])
+        self.assertEqual(len(self._playedAts()), 3)
+
     def test_recognized_but_empty_export_is_a_noop(self):
         """An empty-but-valid export (e.g. a JSON []) has nothing to import,
         which is not an error."""
@@ -385,6 +418,52 @@ class TestImportHistoryBatch(DatabaseTestCase):
         self.assertIn("unrecognised export format", midBatchMessage)
         self.assertNotIn("Unrecognized or corrupt export file", midBatchMessage)
 
+    def test_malformed_json_stays_an_unsupported_format_failure(self):
+        capturedMessages = []
+        originalWriteProgress = self.db.writeProgress
+
+        def captureWriteProgress(status, current=0, total=0, message="", error=False):
+            capturedMessages.append(message)
+            originalWriteProgress(status, current, total, message, error)
+
+        self.db.writeProgress = captureWriteProgress
+
+        def gen2():
+            yield _meta("f2i1", 200)
+
+        with patch.object(importerModule, "Spotify", return_value=MagicMock()), \
+             patch("Database.database.Importer",
+                   side_effect=[importerModule.Importer(), self._mockImporter(gen2)]):
+            self.db.importHistoryBatch([MALFORMED_JSON_EXPORT, "good export"])
+
+        midBatchMessage = next(m for m in capturedMessages if "continuing" in m)
+        self.assertIn("unrecognised export format", midBatchMessage)
+        self.assertNotIn(MALFORMED_JSON_EXPORT, midBatchMessage)
+        self.assertEqual(self._ids(), ["f2i1"])
+
+    def test_malformed_musicolet_csv_stays_an_unreadable_file_failure(self):
+        capturedMessages = []
+        originalWriteProgress = self.db.writeProgress
+
+        def captureWriteProgress(status, current=0, total=0, message="", error=False):
+            capturedMessages.append(message)
+            originalWriteProgress(status, current, total, message, error)
+
+        self.db.writeProgress = captureWriteProgress
+
+        def gen2():
+            yield _meta("f2i1", 200)
+
+        with patch.object(importerModule, "Spotify", return_value=MagicMock()), \
+             patch("Database.database.Importer",
+                   side_effect=[importerModule.Importer(), self._mockImporter(gen2)]):
+            self.db.importHistoryBatch([MALFORMED_MUSICOLET_CSV, "good export"])
+
+        midBatchMessage = next(m for m in capturedMessages if "continuing" in m)
+        self.assertIn("the file could not be read", midBatchMessage)
+        self.assertNotIn("/music/bad.mp3", midBatchMessage)
+        self.assertEqual(self._ids(), ["f2i1"])
+
     def test_generic_failure_names_an_unexpected_error_and_hides_its_text(self):
         """A failure that isn't one of the classifier's known ValueError
         shapes must still name a FIXED class - and must never leak the raw
@@ -413,6 +492,46 @@ class TestImportHistoryBatch(DatabaseTestCase):
         midBatchMessage = next(m for m in capturedMessages if "continuing" in m)
         self.assertIn("an unexpected error", midBatchMessage)
         self.assertNotIn("some internal detail nobody should see", midBatchMessage)
+
+    def test_unrelated_value_error_names_an_unexpected_error_and_hides_its_text(self):
+        def failing():
+            raise ValueError("some internal detail nobody should see")
+            yield  #< unreachable - keeps this a generator function
+
+        capturedMessages = []
+        originalWriteProgress = self.db.writeProgress
+
+        def captureWriteProgress(status, current=0, total=0, message="", error=False):
+            capturedMessages.append(message)
+            originalWriteProgress(status, current, total, message, error)
+
+        self.db.writeProgress = captureWriteProgress
+
+        def gen2():
+            yield _meta("f2i1", 200)
+
+        with patch("Database.database.Importer",
+                    side_effect=[self._mockImporter(failing), self._mockImporter(gen2)]):
+            self.db.importHistoryBatch(["bad export", "good export"])
+
+        midBatchMessage = next(m for m in capturedMessages if "continuing" in m)
+        self.assertIn("an unexpected error", midBatchMessage)
+        self.assertNotIn("unrecognised export format", midBatchMessage)
+        self.assertNotIn("some internal detail nobody should see", midBatchMessage)
+
+    def test_import_failure_categories_do_not_depend_on_diagnostic_wording(self):
+        cases = (
+            (importService.UnsupportedImportFormatError("diagnostic changed"),
+             "unrecognised export format"),
+            (importService.UnreadableImportEntriesError("diagnostic changed"),
+             "the file could not be read"),
+            (importService.AmbiguousImportMatchError("diagnostic changed"),
+             "an ambiguous match aborted this file"),
+        )
+
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                self.assertEqual(importService._classifyImportFailureReason(error), expected)
 
     def test_all_files_failing_summary_lists_failure_classes_with_counts(self):
         badImporter1 = MagicMock()
