@@ -173,9 +173,11 @@ def _decodeInto(raw, label, result):
 
 
 def _isHistoryEntry(name):
-    """Whether an archive entry is a file the importer should be handed."""
-    if name.endswith("/"):          #< a directory entry, not a file
-        return False
+    """Whether an archive entry is a file the importer should be handed.
+
+    Directory entries need no case of their own, and an explicit one here was
+    dead code: a ZIP spells a directory with a trailing slash, which leaves an
+    empty basename that matches no suffix. The test still pins the outcome."""
     segments = name.split("/")      #< ZIP names always use forward slashes
     if MACOS_METADATA_DIR in segments[:-1]:
         return False

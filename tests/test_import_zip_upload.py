@@ -134,6 +134,34 @@ class TestExpandUploads(unittest.TestCase):
         self.assertEqual(result.contents, [_PLAY_JSON])
         self.assertEqual(result.unreadableCount, 0)
 
+    def test_anything_under_the_macos_metadata_folder_is_skipped(self):
+        """That folder is metadata by definition, and the rule does not lean
+        on the ._ convention that usually accompanies it - without a case of
+        its own this branch would be masked by the basename check below."""
+        archive = _zipBytes({
+            "Streaming_History_Audio.json": _PLAY_JSON,
+            "__MACOSX/Streaming_History_Audio.json": '{"ms_played": 999}',
+        })
+
+        result = expandUploads([_upload("export.zip", archive)], _GENEROUS_CAP)
+
+        self.assertEqual(result.contents, [_PLAY_JSON])
+
+    def test_a_resource_fork_beside_its_file_is_skipped_too(self):
+        """Not every AppleDouble shadow sits under __MACOSX/ - a folder zipped
+        on macOS carries them next to the files they shadow, where only the
+        basename check can catch them. (Their bytes are all under 0x80, so
+        they decode cleanly and would land in contents as garbage history.)"""
+        archive = _zipBytes({
+            "Streaming_History_Audio.json": _PLAY_JSON,
+            "._Streaming_History_Audio.json": "\x00\x05\x16\x07",
+        })
+
+        result = expandUploads([_upload("export.zip", archive)], _GENEROUS_CAP)
+
+        self.assertEqual(result.contents, [_PLAY_JSON])
+        self.assertEqual(result.unreadableCount, 0)
+
     def test_directory_entries_are_skipped(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -215,6 +243,48 @@ class TestExpandUploads(unittest.TestCase):
         self.assertLess(len(archive), 100 * 1024, "the fixture stopped being a bomb")
 
         result = expandUploads([_upload("bomb.zip", archive)], 64 * 1024)
+
+        self.assertTrue(result.exceededCap)
+        self.assertEqual(result.contents, [])
+
+    def test_a_bomb_is_never_inflated_past_the_cap(self):
+        """Refusing it is only half the guard.
+
+        A cap enforced AFTER inflating 10 GB has already spent the memory it
+        exists to save, and no assertion on the returned result can tell the
+        two apart - both just say "refused". So pin the read itself: nothing
+        may ask the decompressing stream for more than the budget. This is the
+        assertion that fails if `read(remaining + 1)` ever becomes `read()`,
+        or starts trusting the archive's own declared size."""
+        cap = 64 * 1024
+        archive = _zipBytes({"Streaming_History.json": "\0" * (8 * 1024 * 1024)},
+                            compressionLevel=9)
+        requested = []
+        realRead = zipfile.ZipExtFile.read
+
+        def recordingRead(entry, size=-1):
+            requested.append(size)
+            return realRead(entry, size)
+
+        with patch.object(zipfile.ZipExtFile, "read", recordingRead):
+            result = expandUploads([_upload("bomb.zip", archive)], cap)
+
+        self.assertTrue(result.exceededCap)
+        self.assertTrue(requested, "the entry was never read through ZipExtFile.read")
+        self.assertTrue(
+            all(size is not None and 0 <= size <= cap + 1 for size in requested),
+            f"asked the decompressor for {requested} bytes on a {cap}-byte budget")
+
+    def test_nothing_decoded_before_the_cap_tripped_survives(self):
+        """All or nothing. A partial import is indistinguishable from a
+        complete one downstream, and in overwrite mode the covered-range
+        delete would then span data that never arrived."""
+        archive = _zipBytes({
+            "a_Streaming_History.json": "x" * 400,   #< fits, and is decoded
+            "b_Streaming_History.json": "y" * 900,   #< then the budget runs out
+        })
+
+        result = expandUploads([_upload("export.zip", archive)], 1000)
 
         self.assertTrue(result.exceededCap)
         self.assertEqual(result.contents, [])
