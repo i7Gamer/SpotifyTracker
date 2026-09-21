@@ -24,14 +24,11 @@ const assert = require('assert');
 const path = require('path');
 
 const SCRIPT = path.join(__dirname, '..', 'static', 'js', 'top-list.js');
-const RANGE_OK = null;
-const RANGE_INVERTED = 'inverted';
-
 function loadTopList(options) {
   options = options || {};
   const calls = {
-    replaced: [], pushed: [], ajax: [], syncedRanges: [], shownErrors: [],
-    pruned: [], swapFailure: null, bodyListeners: {},
+    replaced: [], pushed: [], ajax: [], requests: [], validations: [], retries: [],
+    syncedRanges: [], swapFailure: null, bodyListeners: {},
   };
   const elements = options.elements || {};
 
@@ -48,11 +45,13 @@ function loadTopList(options) {
   };
   global.htmx = { ajax(method, url, opts) { calls.ajax.push({ method, url, opts }); } };
   global.HtmxFilters = {
-    RANGE_OK,
     syncCustomRange(containerId) { calls.syncedRanges.push(containerId); },
-    rangeProblemFromDom() { return options.rangeProblem === undefined ? RANGE_OK : options.rangeProblem; },
-    showRangeError(problem) { calls.shownErrors.push(problem); },
-    pruneEmptyParams(parameters) { calls.pruned.push(parameters); },
+    requestPage(page, targetId) { calls.requests.push({ page, targetId }); },
+    validateFormRequest(evt, formId) {
+      if (!evt.detail.elt || evt.detail.elt.id !== formId) return;
+      calls.validations.push({ evt, formId });
+    },
+    retryForm(formId, targetId) { calls.retries.push({ formId, targetId }); },
     onSwapFailure(targetId, retry) { calls.swapFailure = { targetId, retry }; },
   };
 
@@ -86,66 +85,50 @@ run('a page jump lets htmx replace the URL on success and never pushes one', () 
 
   page.window.__paginationAjaxHandler(4);
 
-  assert.deepStrictEqual(page.replaced, [], 'rewritten before the request = a failed jump lies');
-  assert.deepStrictEqual(page.pushed, []);
-  assert.strictEqual(page.ajax[0].opts.replace, page.ajax[0].url);
-  assert.strictEqual(page.ajax[0].opts.push, undefined, 'a push would make Back walk page numbers');
+  assert.deepStrictEqual(page.requests, [{ page: 4, targetId: 'topListResults' }]);
 });
 
 run('a page jump keeps the other filters in both the URL and the request', () => {
-  const container = { id: 'topListResults' };
-  const page = loadTopList({ search: '?q=mf+doom&sortBy=plays&page=2', elements: { topListResults: container } });
+  const page = loadTopList({ search: '?q=mf+doom&sortBy=plays&page=2' });
 
   page.window.__paginationAjaxHandler(5);
 
-  const url = new URL(page.ajax[0].url, 'http://localhost');
-  assert.strictEqual(url.pathname, '/top-songs');
-  assert.strictEqual(url.searchParams.get('page'), '5', 'the old page is overwritten, not appended');
-  assert.strictEqual(url.searchParams.get('q'), 'mf doom');
-  assert.strictEqual(url.searchParams.get('sortBy'), 'plays');
-  //< the container's hx-target/hx-swap/hx-sync are inherited from it, so a
-  //  jump during an in-flight filter change is serialised like every swap
-  assert.strictEqual(page.ajax[0].opts.source, container);
+  assert.deepStrictEqual(page.requests, [{ page: 5, targetId: 'topListResults' }]);
 });
 
 // -------------------------------------------------------- the request veto
 
-run('a half-typed custom range stops the form request and says why', () => {
-  const page = loadTopList({ rangeProblem: RANGE_INVERTED });
+run('Top lists delegate form validation to the shared helper', () => {
+  const page = loadTopList();
 
   const evt = configRequest(page, 'topListFilters');
 
-  assert.strictEqual(evt.prevented, 1);
-  assert.deepStrictEqual(page.shownErrors, [RANGE_INVERTED]);
-  assert.deepStrictEqual(page.pruned, [], 'a vetoed request is never serialized');
+  assert.deepStrictEqual(page.validations, [{ evt, formId: 'topListFilters' }]);
 });
 
-run('a valid range lets the request through and prunes its empty params', () => {
-  const page = loadTopList({ rangeProblem: RANGE_OK });
+run('Top lists delegate valid form serialization to the shared helper', () => {
+  const page = loadTopList();
   const parameters = { q: '', sortBy: 'plays' };
 
   const evt = configRequest(page, 'topListFilters', parameters);
 
-  assert.strictEqual(evt.prevented, 0);
-  assert.deepStrictEqual(page.shownErrors, [RANGE_OK], 'a stale error is cleared, not left up');
-  assert.deepStrictEqual(page.pruned, [parameters]);
+  assert.deepStrictEqual(page.validations, [{ evt, formId: 'topListFilters' }]);
 });
 
-run('a boosted pagination link is never vetoed, even mid-typo', () => {
-  const page = loadTopList({ rangeProblem: RANGE_INVERTED });
+run('a boosted pagination link is delegated without form validation', () => {
+  const page = loadTopList();
 
-  const evt = configRequest(page, 'somePaginationLink');
+  configRequest(page, 'somePaginationLink');
 
-  assert.strictEqual(evt.prevented, 0, 'its whole query is in its href; the form state is irrelevant');
-  assert.deepStrictEqual(page.shownErrors, [], 'and it must not paint an error for a form it is not');
+  assert.deepStrictEqual(page.validations, []);
 });
 
-run('a request from an element with no id at all is left alone', () => {
-  const page = loadTopList({ rangeProblem: RANGE_INVERTED });
+run('a request from an element with no id is delegated without form validation', () => {
+  const page = loadTopList();
 
-  const evt = configRequest(page, null);
+  configRequest(page, null);
 
-  assert.strictEqual(evt.prevented, 0);
+  assert.deepStrictEqual(page.validations, []);
 });
 
 // ------------------------------------------------------- interval + retry
@@ -170,10 +153,7 @@ run('a failed swap offers a retry that re-serialises the form, not the stale URL
 
   page.swapFailure.retry();
 
-  assert.strictEqual(page.ajax[0].url, '/top-songs', 'the bare hx-get path: htmx appends the form values itself');
-  assert.strictEqual(page.ajax[0].opts.source, form);
-  assert.strictEqual(page.ajax[0].opts.target, '#topListResults');
-  assert.strictEqual(page.ajax[0].opts.swap, 'innerHTML');
+  assert.deepStrictEqual(page.retries, [{ formId: 'topListFilters', targetId: 'topListResults' }]);
 });
 
 (async () => {

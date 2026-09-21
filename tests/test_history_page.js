@@ -15,9 +15,7 @@ const assert = require('assert');
 const path = require('path');
 
 const SCRIPT = path.join(__dirname, '..', 'static', 'js', 'history-page.js');
-const RANGE_OK = null;                //< see tests/test_top_list_page.js - null, not a string
-const RANGE_INCOMPLETE = 'incomplete';
-const RANGE_INVERTED = 'inverted';
+const FILTERS_SCRIPT = path.join(__dirname, '..', 'static', 'js', 'htmx-filters.js');
 
 function makeField(value) {
   return { value: value === undefined ? '' : value, textContent: '' };
@@ -40,6 +38,7 @@ function makeDateField(value) {
   const attrs = {};
   return {
     value: value === undefined ? '' : value,
+    style: {},
     setAttribute(name, val) { attrs[name] = val; },
     removeAttribute(name) { delete attrs[name]; },
     getAttribute(name) { return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null; },
@@ -54,8 +53,9 @@ function makeForm() {
 function loadHistory(options) {
   options = options || {};
   const calls = {
-    replaced: [], pushed: [], ajax: [], syncedRanges: [], shownErrors: [],
-    pruned: [], swapFailure: null, bodyListeners: {},
+    replaced: [], pushed: [], ajax: [], requests: [], validations: [],
+    retries: [], syncedRanges: [],
+    swapFailure: null, bodyListeners: {},
   };
   const elements = options.elements || {};
 
@@ -72,18 +72,64 @@ function loadHistory(options) {
   };
   global.htmx = { ajax(method, url, opts) { calls.ajax.push({ method, url, opts }); } };
   global.HtmxFilters = {
-    RANGE_OK,
-    RANGE_INVERTED,
     syncCustomRange(containerId) { calls.syncedRanges.push(containerId); },
-    rangeProblemFromDom() { return options.rangeProblem === undefined ? RANGE_OK : options.rangeProblem; },
-    showRangeError(problem) { calls.shownErrors.push(problem); },
-    pruneEmptyParams(parameters) { calls.pruned.push(parameters); },
+    requestPage(page, targetId) { calls.requests.push({ page, targetId }); },
+    validateFormRequest(evt, formId) {
+      if (!evt.detail.elt || evt.detail.elt.id !== formId) return;
+      calls.validations.push({ evt, formId });
+    },
+    retryForm(formId, targetId) { calls.retries.push({ formId, targetId }); },
     onSwapFailure(targetId, retry) { calls.swapFailure = { targetId, retry }; },
   };
 
   delete require.cache[require.resolve(SCRIPT)];
   require(SCRIPT);
   calls.window = global.window;
+  return calls;
+}
+
+function loadHistoryWithRealFilters(options) {
+  options = options || {};
+  const calls = {
+    ajax: [], replaced: [], pushed: [], bodyListeners: {}, documentListeners: {},
+    swapFailure: null,
+  };
+  const form = options.form || {
+    id: 'historyFilters',
+    getAttribute(name) { return name === 'hx-get' ? '/history' : null; },
+  };
+  const elements = {
+    interval: { value: options.interval || 'custom' },
+    startDate: makeDateField(options.startDate || ''),
+    endDate: makeDateField(options.endDate || ''),
+    dateError: { textContent: '', style: {} },
+    customDates: { style: {} },
+    historyFilters: form,
+    historyResults: { id: 'historyResults', dataset: {} },
+  };
+  global.window = {
+    location: { pathname: '/history', search: options.search || '' },
+    history: {
+      replaceState(state, title, url) { calls.replaced.push(url); },
+      pushState(state, title, url) { calls.pushed.push(url); },
+    },
+    AjaxStatus: {
+      showBanner() {},
+      renderInto(target, retry) { retry(); },
+    },
+  };
+  global.document = {
+    getElementById(id) { return elements[id] || null; },
+    addEventListener(type, fn) { calls.documentListeners[type] = fn; },
+    body: { addEventListener(type, fn) { calls.bodyListeners[type] = fn; } },
+  };
+  global.htmx = { ajax(method, url, opts) { calls.ajax.push({ method, url, opts }); } };
+  delete require.cache[require.resolve(FILTERS_SCRIPT)];
+  global.HtmxFilters = require(FILTERS_SCRIPT);
+  delete require.cache[require.resolve(SCRIPT)];
+  require(SCRIPT);
+  calls.window = global.window;
+  calls.elements = elements;
   return calls;
 }
 
@@ -180,30 +226,21 @@ run('a page jump lets htmx replace the URL on success and never pushes one', () 
 
   page.window.__paginationAjaxHandler(3);
 
-  assert.deepStrictEqual(page.replaced, [], 'rewritten before the request = a failed jump lies');
-  assert.deepStrictEqual(page.pushed, []);
-  assert.strictEqual(page.ajax[0].opts.replace, page.ajax[0].url);
-  assert.strictEqual(page.ajax[0].opts.push, undefined, 'a push would make Back walk page numbers');
+  assert.deepStrictEqual(page.requests, [{ page: 3, targetId: 'historyResults' }]);
 });
 
 run('a page jump keeps the other filters and is issued off the history list', () => {
-  const container = { id: 'historyResults' };
-  const page = loadHistory({ search: '?q=liquid&page=9', elements: { historyResults: container } });
+  const page = loadHistory({ search: '?q=liquid&page=9' });
 
   page.window.__paginationAjaxHandler(2);
 
-  const url = new URL(page.ajax[0].url, 'http://localhost');
-  assert.strictEqual(url.searchParams.get('page'), '2');
-  assert.strictEqual(url.searchParams.get('q'), 'liquid');
-  //< the container's hx-target/hx-swap/hx-sync are inherited from it, so a
-  //  jump during an in-flight filter change is serialised like every swap
-  assert.strictEqual(page.ajax[0].opts.source, container);
+  assert.deepStrictEqual(page.requests, [{ page: 2, targetId: 'historyResults' }]);
 });
 
 // -------------------------------------------------------- the request veto
 
-run('an incomplete custom range stops the form request and says why', () => {
-  const page = loadHistory({ rangeProblem: RANGE_INCOMPLETE });
+run('History delegates form validation to the shared helper', () => {
+  const page = loadHistory();
 
   const evt = {
     detail: { elt: { id: 'historyFilters' }, parameters: {} },
@@ -212,13 +249,11 @@ run('an incomplete custom range stops the form request and says why', () => {
   };
   page.bodyListeners['htmx:configRequest'](evt);
 
-  assert.strictEqual(evt.prevented, 1);
-  assert.deepStrictEqual(page.shownErrors, [RANGE_INCOMPLETE]);
-  assert.deepStrictEqual(page.pruned, []);
+  assert.deepStrictEqual(page.validations, [{ evt, formId: 'historyFilters' }]);
 });
 
-run('a valid range lets the request through and prunes its empty params', () => {
-  const page = loadHistory({ rangeProblem: RANGE_OK });
+run('History delegates valid form serialization to the shared helper', () => {
+  const page = loadHistory();
   const parameters = { q: '', interval: '' };
 
   const evt = {
@@ -228,12 +263,11 @@ run('a valid range lets the request through and prunes its empty params', () => 
   };
   page.bodyListeners['htmx:configRequest'](evt);
 
-  assert.strictEqual(evt.prevented, 0);
-  assert.deepStrictEqual(page.pruned, [parameters]);
+  assert.deepStrictEqual(page.validations, [{ evt, formId: 'historyFilters' }]);
 });
 
-run('a boosted pagination link is never vetoed, even mid-typo', () => {
-  const page = loadHistory({ rangeProblem: RANGE_INCOMPLETE });
+run('a boosted pagination link is delegated without form validation', () => {
+  const page = loadHistory();
 
   const evt = {
     detail: { elt: { id: 'paginationLink' }, parameters: {} },
@@ -242,57 +276,7 @@ run('a boosted pagination link is never vetoed, even mid-typo', () => {
   };
   page.bodyListeners['htmx:configRequest'](evt);
 
-  assert.strictEqual(evt.prevented, 0);
-  assert.deepStrictEqual(page.shownErrors, []);
-});
-
-// ------------------------------------------------- date-range accessibility
-
-// aria-invalid follows the same `problem` value showRangeError paints
-// #dateError from (UT-4, 2026-09-02 review) - both date inputs, since either
-// one could be "the" wrong end of an inverted range.
-run('an inverted range marks both date inputs aria-invalid', () => {
-  const startDate = makeDateField('2026-05-01');
-  const endDate = makeDateField('2026-01-01');
-  const page = loadHistory({ rangeProblem: RANGE_INVERTED, elements: { startDate, endDate } });
-
-  page.bodyListeners['htmx:configRequest']({
-    detail: { elt: { id: 'historyFilters' }, parameters: {} },
-    preventDefault() {},
-  });
-
-  assert.strictEqual(startDate.getAttribute('aria-invalid'), 'true');
-  assert.strictEqual(endDate.getAttribute('aria-invalid'), 'true');
-});
-
-run('a valid range clears aria-invalid rather than setting it false', () => {
-  const startDate = makeDateField('2026-01-01');
-  const endDate = makeDateField('2026-05-01');
-  startDate.setAttribute('aria-invalid', 'true');
-  endDate.setAttribute('aria-invalid', 'true');
-  const page = loadHistory({ rangeProblem: RANGE_OK, elements: { startDate, endDate } });
-
-  page.bodyListeners['htmx:configRequest']({
-    detail: { elt: { id: 'historyFilters' }, parameters: {} },
-    preventDefault() {},
-  });
-
-  assert.strictEqual(startDate.getAttribute('aria-invalid'), null);
-  assert.strictEqual(endDate.getAttribute('aria-invalid'), null);
-});
-
-run('an incomplete range (still typing) is not marked invalid', () => {
-  const startDate = makeDateField('2026-05-01');
-  const endDate = makeDateField('');
-  const page = loadHistory({ rangeProblem: RANGE_INCOMPLETE, elements: { startDate, endDate } });
-
-  page.bodyListeners['htmx:configRequest']({
-    detail: { elt: { id: 'historyFilters' }, parameters: {} },
-    preventDefault() {},
-  });
-
-  assert.strictEqual(startDate.getAttribute('aria-invalid'), null);
-  assert.strictEqual(endDate.getAttribute('aria-invalid'), null);
+  assert.deepStrictEqual(page.validations, []);
 });
 
 // ------------------------------------------------------- interval + retry
@@ -306,36 +290,84 @@ run('the Time Period select syncs the history custom-range container', () => {
                          'the container id differs from the Top pages - a copy-paste would swap them');
 });
 
-run('switching back to a named interval also clears aria-invalid', () => {
-  const startDate = makeDateField('2026-05-01');
-  const endDate = makeDateField('2026-01-01');
-  startDate.setAttribute('aria-invalid', 'true');
-  endDate.setAttribute('aria-invalid', 'true');
-  //< RANGE_OK: a named interval is never a bad range, whatever the leftover
-  //  disabled dates say
-  const page = loadHistory({ rangeProblem: RANGE_OK, elements: { startDate, endDate } });
-
-  page.window.updateHistoryInterval();
-
-  assert.strictEqual(startDate.getAttribute('aria-invalid'), null);
-  assert.strictEqual(endDate.getAttribute('aria-invalid'), null);
-});
-
 // Off the form, not the address bar: a 4xx/5xx never touches the URL (htmx
 // updates history only inside its successful-swap branch), so after a failed
 // filter change the controls show the new choice while the URL still says the
 // old one - and a retry of the URL rendered the old list under the new
 // selection.
 run('a failed swap offers a retry that re-serialises the form, not the stale URL', () => {
-  const form = { id: 'historyFilters', getAttribute(name) { return name === 'hx-get' ? '/history' : null; } };
-  const page = loadHistory({ search: '?q=liquid', elements: { historyFilters: form } });
+  const page = loadHistory({ search: '?q=liquid' });
   assert.strictEqual(page.swapFailure.targetId, 'historyResults');
 
   page.swapFailure.retry();
 
-  assert.strictEqual(page.ajax[0].url, '/history', 'the bare hx-get path: htmx appends the form values itself');
-  assert.strictEqual(page.ajax[0].opts.source, form);
-  assert.strictEqual(page.ajax[0].opts.target, '#historyResults');
+  assert.deepStrictEqual(page.retries, [{ formId: 'historyFilters', targetId: 'historyResults' }]);
+});
+
+// ------------------------------------------------ real shared helper integration
+
+function realConfigRequest(page, eltId, parameters) {
+  const evt = {
+    detail: { elt: { id: eltId }, parameters: parameters || {} },
+    prevented: 0,
+    preventDefault() { this.prevented += 1; },
+  };
+  page.bodyListeners['htmx:configRequest'](evt);
+  return evt;
+}
+
+run('History uses the real shared range validation and ARIA state transitions', () => {
+  const page = loadHistoryWithRealFilters({
+    startDate: '2026-05-01',
+    endDate: '2026-01-01',
+  });
+  const inverted = realConfigRequest(page, 'historyFilters', { q: '' });
+
+  assert.strictEqual(inverted.prevented, 1);
+  assert.strictEqual(page.elements.startDate.getAttribute('aria-invalid'), 'true');
+  assert.strictEqual(page.elements.endDate.getAttribute('aria-invalid'), 'true');
+
+  page.elements.endDate.value = '2026-06-01';
+  const validParameters = { q: '' };
+  const valid = realConfigRequest(page, 'historyFilters', validParameters);
+  assert.strictEqual(valid.prevented, 0);
+  assert.strictEqual(page.elements.startDate.getAttribute('aria-invalid'), null);
+  assert.strictEqual(page.elements.endDate.getAttribute('aria-invalid'), null);
+  assert.deepStrictEqual(validParameters, {});
+
+  page.elements.endDate.value = '';
+  const incomplete = realConfigRequest(page, 'historyFilters', {});
+  assert.strictEqual(incomplete.prevented, 1);
+  assert.strictEqual(page.elements.startDate.getAttribute('aria-invalid'), null);
+  assert.strictEqual(page.elements.endDate.getAttribute('aria-invalid'), null);
+});
+
+run('History leaves unrelated requests alone with the real shared helper', () => {
+  const page = loadHistoryWithRealFilters({
+    startDate: '2026-05-01',
+    endDate: '2026-01-01',
+  });
+  const evt = realConfigRequest(page, 'paginationLink');
+  assert.strictEqual(evt.prevented, 0);
+  assert.strictEqual(page.elements.startDate.getAttribute('aria-invalid'), null);
+});
+
+run('History retries the current form and replaces its URL only through htmx', () => {
+  const page = loadHistoryWithRealFilters({ search: '?q=liquid&page=9' });
+  page.window.__paginationAjaxHandler(2);
+
+  assert.strictEqual(page.ajax.length, 1);
+  assert.strictEqual(page.ajax[0].opts.replace, page.ajax[0].url);
+  assert.deepStrictEqual(page.replaced, []);
+  assert.deepStrictEqual(page.pushed, []);
+
+  page.documentListeners['htmx:responseError']({
+    detail: { target: page.elements.historyResults },
+  });
+  assert.strictEqual(page.ajax.length, 2);
+  assert.strictEqual(page.ajax[1].url, '/history');
+  assert.strictEqual(page.ajax[1].opts.source, page.elements.historyFilters);
+  assert.strictEqual(page.ajax[1].opts.target, '#historyResults');
 });
 
 (async () => {

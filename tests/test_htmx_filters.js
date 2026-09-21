@@ -22,10 +22,26 @@ const {
   onSwapFailure,
   rememberFocusBeforeSwap,
   restoreFocusAfterSwap,
+  requestPage,
+  validateFormRequest,
+  retryForm,
   RANGE_OK,
   RANGE_INCOMPLETE,
   RANGE_INVERTED,
 } = require('../static/js/htmx-filters.js');
+
+const RESULTS_ID = 'results';
+const FORM_ID = 'filters';
+
+function makeFilterDate(value) {
+  const attrs = {};
+  return {
+    value,
+    style: {},
+    setAttribute(name, val) { attrs[name] = val; },
+    removeAttribute(name) { delete attrs[name]; },
+  };
+}
 
 function run(name, fn) {
   try {
@@ -137,6 +153,99 @@ run('an already-clean object is left alone', () => {
   assert.deepStrictEqual(result, { interval: 'week' });
 });
 
+// --- shared page wiring ------------------------------------------------------
+
+run('requestPage preserves filters and delegates URL replacement to htmx', () => {
+  const results = { id: RESULTS_ID };
+  const calls = [];
+  global.window = { location: { pathname: '/history', search: '?q=liquid&page=9' } };
+  global.document = { getElementById(id) { return id === RESULTS_ID ? results : null; } };
+  global.htmx = { ajax(method, url, options) { calls.push({ method, url, options }); } };
+
+  requestPage(2, RESULTS_ID);
+
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].method, 'GET');
+  const url = new URL(calls[0].url, 'http://localhost');
+  assert.strictEqual(url.pathname, '/history');
+  assert.strictEqual(url.searchParams.get('q'), 'liquid');
+  assert.strictEqual(url.searchParams.get('page'), '2');
+  assert.strictEqual(calls[0].options.source, results);
+  assert.strictEqual(calls[0].options.replace, calls[0].url);
+});
+
+run('validateFormRequest ignores requests from unrelated elements', () => {
+  const evt = {
+    detail: { elt: { id: 'paginationLink' }, parameters: {} },
+    prevented: 0,
+    preventDefault() { this.prevented += 1; },
+  };
+  validateFormRequest(evt, FORM_ID);
+  assert.strictEqual(evt.prevented, 0);
+});
+
+run('validateFormRequest vetoes incomplete ranges before pruning', () => {
+  const parameters = { q: '' };
+  const evt = {
+    detail: { elt: { id: FORM_ID }, parameters },
+    prevented: 0,
+    preventDefault() { this.prevented += 1; },
+  };
+  global.document = {
+    getElementById(id) {
+      return {
+        interval: { value: 'custom' },
+        startDate: makeFilterDate('2026-01-01'),
+        endDate: makeFilterDate(''),
+        dateError: { textContent: '', style: {} },
+      }[id] || null;
+    },
+  };
+  validateFormRequest(evt, FORM_ID);
+  assert.strictEqual(evt.prevented, 1);
+  assert.deepStrictEqual(parameters, { q: '' });
+});
+
+run('validateFormRequest prunes a valid form request', () => {
+  const parameters = { q: '', tag: 'chill' };
+  const evt = {
+    detail: { elt: { id: FORM_ID }, parameters },
+    prevented: 0,
+    preventDefault() { this.prevented += 1; },
+  };
+  global.document = {
+    getElementById(id) {
+      return {
+        interval: { value: 'week' },
+        startDate: makeFilterDate(''),
+        endDate: makeFilterDate(''),
+        dateError: { textContent: '', style: {} },
+      }[id] || null;
+    },
+  };
+  validateFormRequest(evt, FORM_ID);
+  assert.strictEqual(evt.prevented, 0);
+  assert.deepStrictEqual(parameters, { tag: 'chill' });
+});
+
+run('retryForm serializes the current form against its target', () => {
+  const form = {
+    id: FORM_ID,
+    getAttribute(name) { return name === 'hx-get' ? '/history' : null; },
+  };
+  const calls = [];
+  global.document = { getElementById(id) { return id === FORM_ID ? form : null; } };
+  global.htmx = { ajax(method, url, options) { calls.push({ method, url, options }); } };
+
+  retryForm(FORM_ID, RESULTS_ID);
+
+  assert.deepStrictEqual(calls, [{
+    method: 'GET',
+    url: '/history',
+    options: { source: form, target: '#' + RESULTS_ID, swap: 'innerHTML' },
+  }]);
+});
+
 // --- syncFullPlaysFilter -----------------------------------------------------
 // The "Full plays only" checkbox cannot be a plain form field: an unchecked box
 // is not serialized at all, and an ABSENT fullOnly means the DEFAULT, which is
@@ -218,14 +327,10 @@ run('every multi-day interval keeps it', () => {
 
 // --- showRangeError / syncCustomRange's aria-invalid half --------------------
 // FOLLOW-UP (2026-09-02 review): /history got role="alert" + aria-describedby
-// (templates/history.html) + aria-invalid (history-page.js's own
-// syncDateAriaInvalid, c40dbc6) for its #dateError. The three Top pages share
-// this file's showRangeError/syncCustomRange and templates/_page_card.html's
-// markup, so folding aria-invalid in HERE - rather than copying
-// syncDateAriaInvalid a second time - is what makes /top-songs, /top-artists
-// and /top-albums announce an inverted range too. history-page.js keeps its
-// own syncDateAriaInvalid call (unchanged): redundant now, not wrong - both
-// write the same value from the same `problem`, so they cannot disagree.
+// (templates/history.html) + aria-invalid from this shared helper for its
+// #dateError. The three Top pages share this file's showRangeError/
+// syncCustomRange and templates/_page_card.html's markup, so one implementation
+// gives every list page the same inverted-range accessibility state.
 
 function makeDateInput() {
   const attrs = {};

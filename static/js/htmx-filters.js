@@ -55,6 +55,19 @@ function pruneEmptyParams(parameters) {
   return parameters;
 }
 
+// The History and Top-list pages use the same htmx request shape for their
+// pagination input. Keep URL construction and successful-swap replacement in
+// one place so the two pages cannot drift apart again.
+function requestPage(page, resultsId) {
+  var params = new URLSearchParams(window.location.search);
+  params.set('page', page);
+  var url = window.location.pathname + '?' + params.toString();
+  htmx.ajax('GET', url, {
+    source: document.getElementById(resultsId),
+    replace: url,
+  });
+}
+
 // A click the BROWSER should handle rather than htmx, because the modifier the
 // user held means "open this somewhere else".
 //
@@ -105,13 +118,10 @@ function rangeProblemFromDom() {
 // every other field on the page that was never marked invalid at all.
 //
 // FOLLOW-UP (2026-09-02 review): /history got this treatment first
-// (history-page.js's syncDateAriaInvalid, c40dbc6, alongside #dateError's
-// role="alert" + aria-describedby in templates/history.html). Folded in here
-// instead of copied a second time, so /top-songs, /top-artists and
-// /top-albums - which share this file and templates/_page_card.html - report
-// an inverted range too. history-page.js keeps calling its own copy after
-// this one runs; both write the same value off the same `problem`, so the
-// redundancy is harmless, not a second source of truth.
+// (alongside #dateError's role="alert" + aria-describedby in
+// templates/history.html). Folded in here instead of copied a second time, so
+// /top-songs, /top-artists and /top-albums - which share this file and
+// templates/_page_card.html - report an inverted range too.
 function syncDateAriaInvalid(problem) {
   var invalid = problem === RANGE_INVERTED;
   var startField = document.getElementById('startDate');
@@ -155,6 +165,31 @@ function syncCustomRange(containerId) {
   document.getElementById('startDate').disabled = !custom;
   document.getElementById('endDate').disabled = !custom;
   showRangeError(rangeProblemFromDom());
+}
+
+// Both list pages veto only their own form requests. Boosted pagination links
+// carry their complete query in the href and must remain usable while a custom
+// range is incomplete, so callers pass the form id explicitly.
+function validateFormRequest(evt, formId) {
+  if (!evt.detail.elt || evt.detail.elt.id !== formId) return;
+  var problem = rangeProblemFromDom();
+  showRangeError(problem);
+  if (problem !== RANGE_OK) {
+    evt.preventDefault();
+    return;
+  }
+  pruneEmptyParams(evt.detail.parameters);
+}
+
+// Retry the values currently visible in the form. A failed request never
+// updates the address bar, so retrying its old URL could render stale filters.
+function retryForm(formId, targetId) {
+  var form = document.getElementById(formId);
+  htmx.ajax('GET', form.getAttribute('hx-get'), {
+    source: form,
+    target: '#' + targetId,
+    swap: 'innerHTML',
+  });
 }
 
 // --- the shared "Full plays only" checkbox -----------------------------------
@@ -304,6 +339,9 @@ var HtmxFilters = {
   isNativeModifierClick: isNativeModifierClick,
   hidesTrendBuckets: hidesTrendBuckets,
   rangeProblemFromDom: rangeProblemFromDom,
+  requestPage: requestPage,
+  validateFormRequest: validateFormRequest,
+  retryForm: retryForm,
   showRangeError: showRangeError,
   syncDateAriaInvalid: syncDateAriaInvalid,
   syncCustomRange: syncCustomRange,

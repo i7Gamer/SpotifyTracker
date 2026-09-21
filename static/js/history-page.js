@@ -37,30 +37,8 @@ var HISTORY_RESULTS_ID = 'historyResults';
 // four other filter pages - they carry the same control set, and five copies of
 // "is this range worth a request" would eventually disagree. Loaded before this
 // file (see templates/history.html).
-var RANGE_OK = HtmxFilters.RANGE_OK;
-var RANGE_INVERTED = HtmxFilters.RANGE_INVERTED;
-
 if (typeof document !== 'undefined') {
   var byId = function (id) { return document.getElementById(id); };
-
-  // #dateError's role="alert" and aria-describedby (templates/history.html)
-  // only cover "announce this text when it appears" - they say nothing about
-  // WHICH fields are wrong. aria-invalid on the two date inputs is that half,
-  // and it is driven from the same `problem` value showRangeError reads
-  // rather than by re-reading #dateError's text back off the DOM, so the two
-  // can never disagree about what "invalid" means. Removed rather than set to
-  // "false" when clear: an absent attribute is what a screen reader treats as
-  // "no opinion", matching every other field on the page that was never
-  // marked invalid at all.
-  var syncDateAriaInvalid = function (problem) {
-    var invalid = problem === RANGE_INVERTED;
-    ['startDate', 'endDate'].forEach(function (id) {
-      var field = byId(id);
-      if (!field) return;
-      if (invalid) field.setAttribute('aria-invalid', 'true');
-      else field.removeAttribute('aria-invalid');
-    });
-  };
 
   // Called from the Time Period select's onchange. Runs before htmx's own
   // listener does (an inline on*= handler fires at the target, htmx's is on the
@@ -72,7 +50,6 @@ if (typeof document !== 'undefined') {
   // of the URL - after switching back to a named interval.
   window.updateHistoryInterval = function () {
     HtmxFilters.syncCustomRange('historyCustomDates');
-    syncDateAriaInvalid(HtmxFilters.rangeProblemFromDom());
   };
 
   // The Date sort toggle: flips newest-first (default) <-> oldest-first. The
@@ -114,10 +91,7 @@ if (typeof document !== 'undefined') {
   // hx-swap / hx-sync, and a jump during an in-flight filter change is
   // serialised like every other swap into it.
   var goToHistoryPage = function (page) {
-    var params = new URLSearchParams(window.location.search);
-    params.set('page', page);
-    var url = window.location.pathname + '?' + params.toString();
-    htmx.ajax('GET', url, { source: byId(HISTORY_RESULTS_ID), replace: url });
+    HtmxFilters.requestPage(page, HISTORY_RESULTS_ID);
   };
   window.__paginationAjaxHandler = goToHistoryPage;
 
@@ -126,15 +100,7 @@ if (typeof document !== 'undefined') {
   // working even while the Time Period select sits on a half-entered custom
   // range, which is exactly the state that blocks a form request.
   document.body.addEventListener('htmx:configRequest', function (evt) {
-    if (!evt.detail.elt || evt.detail.elt.id !== HISTORY_FORM_ID) return;
-    var problem = HtmxFilters.rangeProblemFromDom();
-    HtmxFilters.showRangeError(problem);
-    syncDateAriaInvalid(problem);
-    if (problem !== RANGE_OK) {
-      evt.preventDefault();
-      return;
-    }
-    HtmxFilters.pruneEmptyParams(evt.detail.parameters);
+    HtmxFilters.validateFormRequest(evt, HISTORY_FORM_ID);
   });
 
   //< cover-art fade-ins are handled once for the whole app in
@@ -157,9 +123,7 @@ if (typeof document !== 'undefined') {
   // whatever path it is handed. A failed boosted page link is retried as page
   // one of the current filters - the form is what the user can see.
   HtmxFilters.onSwapFailure(HISTORY_RESULTS_ID, function () {
-    var form = byId(HISTORY_FORM_ID);
-    htmx.ajax('GET', form.getAttribute('hx-get'),
-              { source: form, target: '#' + HISTORY_RESULTS_ID, swap: 'innerHTML' });
+    HtmxFilters.retryForm(HISTORY_FORM_ID, HISTORY_RESULTS_ID);
   });
 }
 //< no module.exports: everything pure moved to static/js/htmx-filters.js, which
