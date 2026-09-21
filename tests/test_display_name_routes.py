@@ -312,16 +312,7 @@ class TestNamesAreShownNotAddressedBy(AppTestCase):
                     "carol": self._makeStubDb()}
 
     def _loginAs(self, username):
-        patch.object(self.dash, 'is_user_logged_in', return_value=True).start()
-        patch.object(self.dash, 'get_username_for_email', return_value=username).start()
-        patch.object(self.dash, 'get_user_db', side_effect=lambda u, e: self.dbs[u]).start()
-        self.addCleanup(patch.stopall)
-
-        client = self.dash.app.test_client()
-        with client.session_transaction() as sess:
-            sess['email'] = f"{username}@example.com"
-            sess['username'] = username
-        return client
+        return super()._loginAs(username)
 
     def _payload(self, client):
         _, data = fetchComparison(client, "/compare?with=bob")
