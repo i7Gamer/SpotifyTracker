@@ -26,7 +26,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -39,6 +39,9 @@ from Database.repository import Repository
 HOUR_SECONDS = 3600
 DAY_SECONDS = 24 * HOUR_SECONDS
 PLAY_DURATION_MS = 60000
+EXPECTED_LOOKBACK_SECONDS = 7 * DAY_SECONDS
+FIXED_NOW_TIMESTAMP = 1_700_000_000.0
+BOUNDARY_STEP_SECONDS = 1
 
 
 def _track(trackId):
@@ -98,6 +101,26 @@ class TestMissedTrackLookbackWindow(unittest.TestCase):
     def test_a_six_day_old_play_is_found(self):
         """The far edge of what the window is meant to reach."""
         self.assertEqual(self.db.getRecentlyRecordedTrackIds(["six-days"]), {"six-days"})
+
+    def test_the_seven_day_cutoff_is_inclusive(self):
+        """Pin both the wrapper's window and the repository's inclusive bound."""
+        cutoff = FIXED_NOW_TIMESTAMP - EXPECTED_LOOKBACK_SECONDS
+        boundaryPlays = (
+            ("just-inside", cutoff + BOUNDARY_STEP_SECONDS),
+            ("at-cutoff", cutoff),
+            ("just-outside", cutoff - BOUNDARY_STEP_SECONDS),
+        )
+        for trackId, playedAt in boundaryPlays:
+            self.repo.upsertTrack(_track(trackId))
+            self.repo.insertPlay("alice", trackId, playedAt, PLAY_DURATION_MS)
+        self.repo.commit()
+
+        with patch("Database.queries.plays.time") as mockTime:
+            mockTime.time.return_value = FIXED_NOW_TIMESTAMP
+            recordedIds = self.db.getRecentlyRecordedTrackIds(
+                [trackId for trackId, _playedAt in boundaryPlays])
+
+        self.assertEqual(recordedIds, {"just-inside", "at-cutoff"})
 
     def test_a_month_old_play_is_not_treated_as_evidence(self):
         """The ceiling: without one the cross-check could never report anything."""
