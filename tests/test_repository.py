@@ -1567,6 +1567,148 @@ def makeSearchableTrack(trackId, name, artistName, albumName):
     }
 
 
+class TestHistoryFilterEquivalence(RepositoryTestCase):
+    START_BOUND = 1500.0
+    END_BOUND = 3500.0
+    TIED_TIMESTAMP = 2000.0
+    FIRST_TIMESTAMP = 1000.0
+    SKIP_TIMESTAMP = 3000.0
+    LAST_TIMESTAMP = 4000.0
+    FULL_LISTEN_MS = 180000
+    PARTIAL_LISTEN_MS = 5000
+    SKIP_LISTEN_MS = 1000
+    ALICE_PLAY_COUNT = 5
+    BOB_PLAY_COUNT = 1
+    PAGE_LIMIT = 2
+    PAGE_OFFSET = 1
+
+    MERGE_METADATA_STATES = (False, True)
+    INCLUDE_SKIP_STATES = (False, True)
+    FULL_PLAY_STATES = (False, True)
+    BOUND_CASES = (
+        ("all", {}),
+        ("bounded", {"startTs": START_BOUND, "endTs": END_BOUND}),
+    )
+    HISTORY_FILTER_CASES = (
+        ("none", {}),
+        ("trackId", {"trackId": "t1"}),
+        ("artistId", {"artistId": "art1"}),
+        ("albumId", {"albumId": "alb1"}),
+        ("trackIds", {"trackIds": ["t1", "t3"]}),
+        ("emptyTrackIds", {"trackIds": []}),
+    )
+    SEARCH_TRACK_ID_CASES = (
+        ("none", None),
+        ("some", ["t1", "t3"]),
+        ("empty", []),
+    )
+
+    def _makeSeededRepo(self, mergeMetadata=False):
+        tmpdir = tempfile.TemporaryDirectory()
+        repo = Repository(Path(tmpdir.name) / "filter_equivalence.db")
+        self.addCleanup(tmpdir.cleanup)
+        self.addCleanup(repo.connectionManager.close)
+
+        repo.upsertUser("alice", "alice@example.com")
+        repo.upsertUser("bob", "bob@example.com")
+        repo.upsertTrack(makeSearchableTrack("t1", "Needle Alpha", "Artist One", "Album One"))
+        repo.upsertTrack(makeSearchableTrack("t2", "Needle Beta", "Artist One", "Album One"))
+        repo.upsertTrack(makeSearchableTrack("t3", "Needle Gamma", "Artist Two", "Album Two"))
+        repo.upsertTrack(makeSearchableTrack("t4", "Needle Skip", "Artist Three", "Album Three"))
+        if mergeMetadata:
+            with repo.connection():
+                repo.connection().execute("UPDATE tracks SET canonical_id='t1' WHERE id='t2'")
+
+        repo.insertPlay("alice", "t1", self.FIRST_TIMESTAMP, self.FULL_LISTEN_MS, is_skip=0)
+        repo.insertPlay("alice", "t2", self.TIED_TIMESTAMP, self.PARTIAL_LISTEN_MS, is_skip=0)
+        repo.insertPlay("alice", "t3", self.TIED_TIMESTAMP, self.FULL_LISTEN_MS, is_skip=0)
+        repo.insertPlay("alice", "t4", self.SKIP_TIMESTAMP, self.SKIP_LISTEN_MS, is_skip=1)
+        repo.insertPlay("alice", "t1", self.LAST_TIMESTAMP, self.FULL_LISTEN_MS, is_skip=0)
+        repo.insertPlay("bob", "t1", self.TIED_TIMESTAMP, self.FULL_LISTEN_MS, is_skip=0)
+        return repo
+
+    def _entryKey(self, entry):
+        return (entry["id"], entry["playedAt"], entry["timePlayed"], entry["isSkip"])
+
+    def _entryKeys(self, entries):
+        return [self._entryKey(entry) for entry in entries]
+
+    def test_history_rows_and_count_stay_equivalent_across_filter_matrix(self):
+        """96 cases: merge metadata x skip toggle x full-play toggle x six id/entity filters x bounds."""
+        for mergeMetadata in self.MERGE_METADATA_STATES:
+            repo = self._makeSeededRepo(mergeMetadata)
+            self.assertEqual(repo.getPlaysCount("alice", includeSkips=True), self.ALICE_PLAY_COUNT)
+            self.assertEqual(repo.getPlaysCount("bob", includeSkips=True), self.BOB_PLAY_COUNT)
+            for includeSkips in self.INCLUDE_SKIP_STATES:
+                for fullPlaysOnly in self.FULL_PLAY_STATES:
+                    for _filterName, filterKwargs in self.HISTORY_FILTER_CASES:
+                        for _boundName, boundKwargs in self.BOUND_CASES:
+                            kwargs = {
+                                **filterKwargs,
+                                **boundKwargs,
+                                "includeSkips": includeSkips,
+                                "fullPlaysOnly": fullPlaysOnly,
+                            }
+                            with self.subTest(merge=mergeMetadata, kwargs=kwargs):
+                                newest = repo.getPlaysNewestFirst("alice", **kwargs)
+                                oldest = repo.getPlaysOldestFirst("alice", **kwargs)
+                                total = repo.getPlaysCount("alice", **kwargs)
+
+                                self.assertEqual(total, len(newest))
+                                self.assertEqual(total, len(oldest))
+                                self.assertEqual(self._entryKeys(newest), list(reversed(self._entryKeys(oldest))))
+                                self.assertEqual(repo.getPlaysNewestFirst(
+                                    "alice", count=0, **kwargs), [])
+                                self.assertEqual(
+                                    self._entryKeys(repo.getPlaysNewestFirst(
+                                        "alice", count=self.PAGE_LIMIT, startIndex=self.PAGE_OFFSET, **kwargs)),
+                                    self._entryKeys(newest)[self.PAGE_OFFSET:self.PAGE_OFFSET + self.PAGE_LIMIT],
+                                )
+
+    def test_search_rows_and_count_stay_equivalent_across_filter_matrix(self):
+        """48 cases: merge metadata x skip toggle x full-play toggle x three tag-id states x bounds."""
+        searchQuery = "Needle"
+        for mergeMetadata in self.MERGE_METADATA_STATES:
+            repo = self._makeSeededRepo(mergeMetadata)
+            for includeSkips in self.INCLUDE_SKIP_STATES:
+                for fullPlaysOnly in self.FULL_PLAY_STATES:
+                    for _trackIdsName, trackIds in self.SEARCH_TRACK_ID_CASES:
+                        for _boundName, boundKwargs in self.BOUND_CASES:
+                            kwargs = {
+                                **boundKwargs,
+                                "trackIds": trackIds,
+                                "includeSkips": includeSkips,
+                                "fullPlaysOnly": fullPlaysOnly,
+                            }
+                            with self.subTest(merge=mergeMetadata, kwargs=kwargs):
+                                newest = repo.searchPlays("alice", searchQuery, **kwargs)
+                                oldest = repo.searchPlays("alice", searchQuery, oldestFirst=True, **kwargs)
+                                total = repo.searchPlaysCount("alice", searchQuery, **kwargs)
+
+                                self.assertEqual(total, len(newest))
+                                self.assertEqual(total, len(oldest))
+                                self.assertEqual(self._entryKeys(newest), list(reversed(self._entryKeys(oldest))))
+                                self.assertEqual(repo.searchPlays(
+                                    "alice", searchQuery, limit=0, **kwargs), [])
+                                self.assertEqual(
+                                    self._entryKeys(repo.searchPlays(
+                                        "alice", searchQuery, limit=self.PAGE_LIMIT,
+                                        offset=self.PAGE_OFFSET, **kwargs)),
+                                    self._entryKeys(newest)[self.PAGE_OFFSET:self.PAGE_OFFSET + self.PAGE_LIMIT],
+                                )
+
+    def test_history_export_cursor_pages_through_equal_timestamps(self):
+        repo = self._makeSeededRepo()
+        oldest = repo.getPlaysOldestFirst("alice", includeSkips=True)
+        tied = [entry for entry in oldest if entry["playedAt"] == self.TIED_TIMESTAMP]
+
+        pageAfterFirstTie = repo.getPlaysOldestFirst(
+            "alice", includeSkips=True, afterTs=tied[0]["playedAt"], afterId=tied[0]["playId"])
+
+        self.assertEqual(len(tied), 2)
+        self.assertEqual(self._entryKeys(pageAfterFirstTie), self._entryKeys(oldest[2:]))
+
+
 class TestSearchPlays(RepositoryTestCase):
     """searchPlays()/searchPlaysCount() match a play's track name, artist(s),
     album, or source playlist - pushed down into SQL (with LIMIT/OFFSET)
