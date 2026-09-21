@@ -96,6 +96,14 @@ PLACEHOLDER_IMG_DATA_URI = (
     "<path d='M62 24v34.8a12 12 0 1 0 6 10.4V36l10-3v-9l-16 4z' fill='%23555'/></svg>"
 )
 MAX_UPLOAD_MB = 500              #< cap on a single import-history request's total upload size
+# A ZIP upload is bounded by MAX_UPLOAD_MB like any other request body, but
+# what it UNPACKS to is not - that is what this caps (services/import_upload.py).
+# The same number on purpose: the ceiling means "how much history one request
+# may hand the importer", and unpacking server-side should not quietly raise
+# it. Without this, a 25 MB archive of 10 GB of zeroes passes every size check
+# the request layer has. Raise this one, not MAX_UPLOAD_MB, if a genuinely
+# larger export ever has to fit.
+MAX_UNCOMPRESSED_IMPORT_MB = MAX_UPLOAD_MB
 # Unit conversions, named so the ladders that format a byte count or split
 # an hour total into days read as units rather than as bare powers of two.
 # Binary (1024), not decimal: what they format is an on-disk size, which is

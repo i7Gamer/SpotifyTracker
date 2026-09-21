@@ -22,18 +22,29 @@
          upload is reported in the import's own summary line instead. #}
       <p class="error">None of those files could be read as text (they are not valid UTF-8). Re-export them, or re-save them as UTF-8, and try again.</p>
     {% endif %}
+    {% if expandedTooLarge %}
+      {# Deliberately not the uploadTooLarge message: the request itself was
+         within the limit, so "upload fewer files" reads as nonsense to
+         someone who just sent one 25 MB ZIP. #}
+      <p class="error">That archive unpacks to more than {{ maxUncompressedImportMb }} MB of data, so nothing was imported. Unzip it yourself and upload the history files in a few smaller batches.</p>
+    {% endif %}
+    {% if emptyArchive %}
+      <p class="error">That archive contained no .json or .csv files. Upload the ZIP Spotify sent you - the history files live in a folder inside it, and re-zipping just that folder works too.</p>
+    {% endif %}
     <form id="import-form" action="{{ url_for('importHistory') }}" method="post" enctype="multipart/form-data">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
       <h2 class="import-card-heading">Import your history</h2>
       <div class="import-input-wrapper">
         {# The heading replaced the field's <label>, so the input carries the
            name that label used to give it. #}
-        <input id="history_file" name="history_file" type="file" accept=".json, .csv" multiple required
-               aria-label="Spotify history JSON file(s)" />
+        <input id="history_file" name="history_file" type="file" accept=".json, .csv, .zip" multiple required
+               aria-label="Spotify history ZIP or JSON file(s)" />
         <p id="import-hint" class="import-hint">Drag and drop your files here or click to browse (max {{ maxUploadMb }} MB total)</p>
       </div>
-      <p class="import-note">Upload both the <code>Streaming_History_Audio_*.json</code> and
-        <code>Streaming_History_Video_*.json</code> files - music-video streams are real plays too.</p>
+      <p class="import-note">Upload the <code>.zip</code> Spotify sent you as-is - it unpacks here, and it is a fraction of
+        the size unzipped, which matters if anything sits between you and this app. Loose files work too: upload both the
+        <code>Streaming_History_Audio_*.json</code> and <code>Streaming_History_Video_*.json</code> files - music-video
+        streams are real plays too.</p>
       <label class="import-overwrite-option">
         <input id="overwrite-range" type="checkbox" name="overwrite_range" />
         Replace existing data in the time covered by these files
