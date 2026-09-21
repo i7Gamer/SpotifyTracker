@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import WRAPPED_INVALIDATION_GENERATION_KEY, WRAPPED_YEAR_TZ_SLACK_SECONDS, json
 
 
 class WrappedQueries:

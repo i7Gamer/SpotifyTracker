@@ -4,7 +4,7 @@
 from __future__ import annotations
 import time
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import FULL_PLAY_PREDICATE, PERCENT_DIVISOR, SECONDS_PER_DAY
 from config import (
     TREND_OBSESSION_DAYS,
     TREND_OBSESSION_MIN_PLAYS,

@@ -3,7 +3,21 @@
 
 from __future__ import annotations
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import (
+    ALBUM_ARTIST_REPAIR_RETRY_SECONDS,
+    ALBUM_BACKFILL_RETRY_SECONDS,
+    IMAGE_KIND_ARTIST,
+    IMAGE_KIND_TRACK,
+    IMAGE_STATUS_FAILED,
+    IMAGE_STATUS_OK,
+    IMAGE_STATUS_PENDING,
+    RESTRICTED_FALLBACK_REASON,
+    SPOTIFY_TRACK_ID_LENGTH,
+    SYNTHETIC_FALLBACK_REASON,
+    TRACK_ISRC_RETRY_SECONDS,
+    UNKNOWN_ALBUM_NAME,
+    time,
+)
 
 class TrackQueries:
     """TrackQueries: tracks data-access methods, mixed into Repository."""

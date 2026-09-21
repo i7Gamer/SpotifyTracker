@@ -5,7 +5,15 @@ from __future__ import annotations
 
 import logging
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import (
+    decryptSecret,
+    encryptSecret,
+    isEncrypted,
+    isForeignKeyed,
+    json,
+    keyFingerprint,
+    time,
+)
 from config import TOP_LIST_DEFAULT_WINDOW
 
 logger = logging.getLogger(__name__)

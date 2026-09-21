@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
-from Database.queries._base import *  # noqa: F401,F403 - shared constants/db helpers
+from Database.queries._base import BEHAVIORAL_COLUMNS, db
 
 logger = logging.getLogger(__name__)
 
