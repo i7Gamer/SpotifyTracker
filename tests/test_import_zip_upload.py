@@ -14,6 +14,7 @@ REQUEST, and a 25 MB archive of 10 GB of zeroes sails straight through it.
 import io
 import threading
 import unittest
+import warnings
 import zipfile
 from unittest.mock import MagicMock, patch
 
@@ -21,8 +22,9 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import routes.system as systemRoutes
 from _app_factory import AppTestCase
-from services.import_upload import expandUploads
+from services.import_upload import expandUploads, UploadExpansion
 
 # Matches test_import_history_route's deadline: a failure deadline, not a pace.
 _IMPORT_THREAD_DEADLINE_SECONDS = 5
@@ -223,7 +225,78 @@ class TestExpandUploads(unittest.TestCase):
         self.assertEqual(result.contents, ['{"ms_played": 1}', '{"ms_played": 2}'])
         self.assertFalse(result.emptyArchive)
 
+    def test_duplicate_entry_names_each_keep_their_own_content(self):
+        """Opening entries BY NAME loses one of them, silently.
+
+        zipfile resolves archive.open("x") through NameToInfo, which keeps
+        only the LAST central-directory record for a repeated name - so a
+        two-entry loop opened the same entry twice, dropped the first one's
+        content, and left unreadableCount at 0. That is the one counter
+        importHistoryBatch's overwrite path has to tell it plays went
+        missing before it deletes the range the survivors span. Opening the
+        ZipInfo records themselves is what makes each entry its own file."""
+        buffer = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   #< zipfile warns about the duplicate
+            with zipfile.ZipFile(buffer, "w") as archive:
+                archive.writestr("Streaming_History.json", '{"ms_played": 1}')
+                archive.writestr("Streaming_History.json", '{"ms_played": 2}')
+
+        result = expandUploads([_upload("dup.zip", buffer.getvalue())], _GENEROUS_CAP)
+
+        # Equal names, so the sort is stable and archive order decides.
+        self.assertEqual(result.contents, ['{"ms_played": 1}', '{"ms_played": 2}'])
+        self.assertEqual(result.unreadableCount, 0)
+
     # --- the guard ------------------------------------------------------
+
+    def test_an_archive_with_more_entries_than_allowed_is_refused(self):
+        """The byte budget meters content, and empty entries have none - so
+        an archive of 50,000 zero-byte .json files spent 0% of a 10 MB budget
+        while taking seconds of a waitress worker thread (measured). Entry
+        count needs its own ceiling."""
+        archive = _zipBytes({f"h{index}.json": "" for index in range(6)})
+
+        result = expandUploads([_upload("many.zip", archive)], _GENEROUS_CAP,
+                               maxArchiveEntries=5)
+
+        self.assertTrue(result.tooManyEntries)
+        self.assertEqual(result.contents, [])
+
+    def test_the_entry_ceiling_counts_entries_the_importer_would_skip(self):
+        """The cost is in parsing and opening them, which happens before
+        anything asks whether an entry is history - so a cap applied only to
+        matching entries would not bound the work at all."""
+        archive = _zipBytes({f"junk{index}.pdf": "" for index in range(6)})
+
+        result = expandUploads([_upload("many.zip", archive)], _GENEROUS_CAP,
+                               maxArchiveEntries=5)
+
+        self.assertTrue(result.tooManyEntries)
+
+    def test_nothing_decoded_before_the_entry_ceiling_survives(self):
+        """Same all-or-nothing rule as the byte budget.
+
+        This one only bites across uploads: within a single archive the count
+        is checked before anything is read, so it takes a second archive to
+        make the cleanup observable at all."""
+        good = _zipBytes({"Streaming_History.json": _PLAY_JSON})
+        many = _zipBytes({f"h{index}.json": "" for index in range(6)})
+
+        result = expandUploads([_upload("good.zip", good), _upload("many.zip", many)],
+                               _GENEROUS_CAP, maxArchiveEntries=5)
+
+        self.assertTrue(result.tooManyEntries)
+        self.assertEqual(result.contents, [])
+
+    def test_an_archive_at_the_entry_ceiling_is_allowed(self):
+        archive = _zipBytes({f"h{index}.json": _PLAY_JSON for index in range(5)})
+
+        result = expandUploads([_upload("many.zip", archive)], _GENEROUS_CAP,
+                               maxArchiveEntries=5)
+
+        self.assertFalse(result.tooManyEntries)
+        self.assertEqual(len(result.contents), 5)
 
     def test_expanding_past_the_cap_is_refused(self):
         payload = "x" * 5000
@@ -416,6 +489,53 @@ class TestZipUploadRoute(AppTestCase):
         db.importHistoryBatch.assert_not_called()
         self.assertIn("no .json or .csv files", self._getImportPage(dash, db, "?error=empty_archive"))
 
+    def test_an_archive_with_too_many_entries_is_refused_by_the_route(self):
+        dash = self._makeApp()
+        db = self._makeDb()
+        archive = _zipBytes({f"h{index}.json": _PLAY_JSON for index in range(6)})
+
+        with patch("routes.system.MAX_IMPORT_ARCHIVE_ENTRIES", 5):
+            resp = self._postImport(dash, db, {'history_file': (io.BytesIO(archive), 'many.zip')})
+
+        self.assertIn("error=too_many_entries", resp.headers["Location"])
+        db.importHistoryBatch.assert_not_called()
+        self.assertIn("too many files", self._getImportPage(dash, db, "?error=too_many_entries"))
+
+    def test_the_route_passes_the_configured_entry_ceiling(self):
+        """The cap is policy, so config owns the number and the route hands it
+        over - a service-side default would be a second place to change."""
+        dash = self._makeApp()
+        db = self._makeDb()
+        archive = _zipBytes({"Streaming_History.json": _PLAY_JSON})
+
+        with patch("routes.system.expandUploads") as expand:
+            expand.return_value = UploadExpansion(contents=[_PLAY_JSON])
+            self._postImport(dash, db, {'history_file': (io.BytesIO(archive), 'export.zip')})
+
+        self.assertEqual(expand.call_args.kwargs.get("maxArchiveEntries"),
+                         systemRoutes.MAX_IMPORT_ARCHIVE_ENTRIES)
+
+    def test_a_wrong_archive_is_reported_even_when_another_upload_succeeded(self):
+        """emptyArchive used to be consulted only when NOTHING was importable,
+        so uploading the account-data ZIP alongside the history one discarded
+        it with no trace at all - the batch only reports on what it received."""
+        dash = self._makeApp()
+        db = self._makeDb()
+        started = self._importStarted(db)
+        good = _zipBytes({"Streaming_History.json": _PLAY_JSON})
+        wrong = _zipBytes({"ReadMeFirst.pdf": b"%PDF-1.4"})
+
+        resp = self._postImport(dash, db, {'history_file': [
+            (io.BytesIO(good), 'history.zip'),
+            (io.BytesIO(wrong), 'account.zip'),
+        ]})
+
+        self.assertIn("error=empty_archive", resp.headers["Location"])
+        # ...and the good half still imports; saying so must not cost the run.
+        self.assertTrue(started.wait(_IMPORT_THREAD_DEADLINE_SECONDS),
+                        "the background import thread never called importHistoryBatch")
+        self.assertEqual(db.importHistoryBatch.call_args.args[0], [_PLAY_JSON])
+
     def test_the_import_page_is_quiet_without_those_markers(self):
         dash = self._makeApp()
         db = self._makeDb()
@@ -424,6 +544,7 @@ class TestZipUploadRoute(AppTestCase):
 
         self.assertNotIn("unpacks to more than", page)
         self.assertNotIn("no .json or .csv files", page)
+        self.assertNotIn("too many files", page)
 
     def test_the_form_accepts_zip_files(self):
         dash = self._makeApp()

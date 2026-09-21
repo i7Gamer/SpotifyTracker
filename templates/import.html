@@ -28,6 +28,9 @@
          someone who just sent one 25 MB ZIP. #}
       <p class="error">That archive unpacks to more than {{ maxUncompressedImportMb }} MB of data, so nothing was imported. Unzip it yourself and upload the history files in a few smaller batches.</p>
     {% endif %}
+    {% if tooManyEntries %}
+      <p class="error">That archive holds too many files ({{ maxImportArchiveEntries }} is the limit), so nothing was imported. A Spotify export holds a few dozen - if this is one, unzip it and upload the history files directly.</p>
+    {% endif %}
     {% if emptyArchive %}
       <p class="error">That archive contained no .json or .csv files. Upload the ZIP Spotify sent you - the history files live in a folder inside it, and re-zipping just that folder works too.</p>
     {% endif %}

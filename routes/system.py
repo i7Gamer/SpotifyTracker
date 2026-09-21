@@ -15,7 +15,10 @@ from flask import (
     render_template, redirect, request, url_for, jsonify, Response, stream_with_context,
 )
 
-from config import MAX_UPLOAD_MB, MAX_UNCOMPRESSED_IMPORT_MB, BYTES_PER_MB, EXPORT_FORMATS
+from config import (
+    MAX_UPLOAD_MB, MAX_UNCOMPRESSED_IMPORT_MB, MAX_IMPORT_ARCHIVE_ENTRIES,
+    BYTES_PER_MB, EXPORT_FORMATS,
+)
 from Database.Spotify.formatting import openSpotifyUrl
 from Database.utils import versionTuple, now
 from routes._auth import makeRequiresUser
@@ -121,9 +124,16 @@ def register(app, dashboard):
         # covered range of the survivors, which can bracket the dropped file's
         # plays, with nothing left to re-insert them (see importHistoryBatch's
         # unreadableFileCount).
-        expansion = expandUploads(uploads, MAX_UNCOMPRESSED_IMPORT_BYTES)
+        expansion = expandUploads(uploads, MAX_UNCOMPRESSED_IMPORT_BYTES,
+                                  maxArchiveEntries=MAX_IMPORT_ARCHIVE_ENTRIES)
         contents = expansion.contents
         unreadableCount = expansion.unreadableCount
+        if expansion.tooManyEntries:
+            #< the byte budget is blind to this one: empty entries are free to
+            #  store and costly to open, so the count needs its own ceiling
+            logger.warning("Refusing import for user %s: an archive holds more than %d entries",
+                           username, MAX_IMPORT_ARCHIVE_ENTRIES)
+            return redirect(url_for("importPage", error="too_many_entries"))
         if expansion.exceededCap:
             #< NOT upload_too_large: the request itself passed
             #  MAX_CONTENT_LENGTH, so "try uploading fewer files at once" is
@@ -191,6 +201,12 @@ def register(app, dashboard):
 
         thread = threading.Thread(target=_runImportBatch, daemon=True)
         thread.start()
+        if expansion.emptyArchive:
+            #< worth saying even though the import is under way: the batch only
+            #  reports on what it RECEIVED, so an archive holding no history at
+            #  all (the account-data export, uploaded alongside the right one)
+            #  would otherwise be dropped with no trace anywhere
+            return redirect(url_for("importPage", error="empty_archive"))
         return redirect(url_for("importPage"))
     app.add_url_rule("/import-history", "importHistory", importHistory, methods=["POST"])
 
@@ -207,6 +223,8 @@ def register(app, dashboard):
             unreadableUpload=request.args.get("error") == "unreadable_upload",
             expandedTooLarge=request.args.get("error") == "expanded_too_large",
             emptyArchive=request.args.get("error") == "empty_archive",
+            tooManyEntries=request.args.get("error") == "too_many_entries",
+            maxImportArchiveEntries=MAX_IMPORT_ARCHIVE_ENTRIES,
             section="import",
         )
     app.add_url_rule("/import", "importPage", importPage, methods=["GET"])

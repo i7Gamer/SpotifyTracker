@@ -53,15 +53,23 @@ class UploadExpansion:
     exceededCap     the budget ran out; nothing is safe to import
     emptyArchive    an archive held no history at all (the wrong ZIP), which
                     is a different mistake from one that failed to decode
+    tooManyEntries  an archive held more entries than the caller allows; the
+                    byte budget cannot see this, because empty entries cost
+                    nothing to store and plenty to parse
     """
     contents: list = field(default_factory=list)
     unreadableCount: int = 0
     exceededCap: bool = False
     emptyArchive: bool = False
+    tooManyEntries: bool = False
 
 
 class _CapExceeded(Exception):
     """A read would have spent more than the request's remaining budget."""
+
+
+class _TooManyEntries(Exception):
+    """An archive declares more members than the caller is willing to open."""
 
 
 class _Budget:
@@ -86,18 +94,24 @@ class _Budget:
         return chunk
 
 
-def expandUploads(uploads, maxUncompressedBytes):
+def expandUploads(uploads, maxUncompressedBytes, maxArchiveEntries=None):
     """Decode `uploads` (werkzeug FileStorages) into importable history text.
 
     A ZIP is expanded in place; anything else is read as text as before. The
-    cap applies to the total of both - a mixed upload must not be able to
-    route around it by putting the bulk in whichever half is unmetered."""
+    byte cap applies to the total of both - a mixed upload must not be able to
+    route around it by putting the bulk in whichever half is unmetered.
+
+    `maxArchiveEntries` is a second, independent ceiling, because the byte
+    budget cannot see this one: an archive of 50,000 zero-byte entries spends
+    0% of it and still costs seconds of a worker thread (measured). None means
+    no ceiling; the policy number lives in config.py and the route passes it,
+    so there is one place to change it."""
     result = UploadExpansion()
     budget = _Budget(maxUncompressedBytes)
     for upload in uploads:
         try:
             if _looksLikeZip(upload.stream):
-                _expandArchive(upload, budget, result)
+                _expandArchive(upload, budget, result, maxArchiveEntries)
             else:
                 _decodeInto(budget.take(upload.stream, upload.filename),
                             upload.filename, result)
@@ -106,6 +120,10 @@ def expandUploads(uploads, maxUncompressedBytes):
             # from a complete one downstream, and in overwrite mode the
             # covered-range delete would then span data that never arrived.
             result.exceededCap = True
+            result.contents = []
+            return result
+        except _TooManyEntries:
+            result.tooManyEntries = True
             result.contents = []
             return result
     return result
@@ -125,15 +143,27 @@ def _looksLikeZip(stream):
     return isZip
 
 
-def _expandArchive(upload, budget, result):
+def _expandArchive(upload, budget, result, maxArchiveEntries):
     try:
         with zipfile.ZipFile(upload.stream) as archive:
-            names = sorted(name for name in archive.namelist() if _isHistoryEntry(name))
-            if not names:
+            # infolist(), never namelist(): a name is not an identity here.
+            # archive.open(<str>) resolves through zipfile's NameToInfo dict,
+            # which keeps only the LAST record for a repeated name - so two
+            # entries sharing one name were read as the same entry twice, and
+            # the first one's content vanished with unreadableCount still 0.
+            # The ZipInfo records are distinct even when their names are not.
+            entries = archive.infolist()
+            if maxArchiveEntries is not None and len(entries) > maxArchiveEntries:
+                logger.warning("Refusing %r: %d entries, over the %d the importer will open",
+                               upload.filename, len(entries), maxArchiveEntries)
+                raise _TooManyEntries
+            wanted = sorted((entry for entry in entries if _isHistoryEntry(entry.filename)),
+                            key=lambda entry: entry.filename)
+            if not wanted:
                 result.emptyArchive = True
                 return
-            for name in names:
-                _takeEntry(archive, name, budget, result)
+            for entry in wanted:
+                _takeEntry(archive, entry, budget, result)
     except zipfile.BadZipFile as error:
         # is_zipfile only reads the central directory, so an archive truncated
         # or corrupted anywhere before it gets this far before failing.
@@ -142,9 +172,10 @@ def _expandArchive(upload, budget, result):
                        upload.filename, error)
 
 
-def _takeEntry(archive, name, budget, result):
+def _takeEntry(archive, info, budget, result):
+    name = info.filename
     try:
-        with archive.open(name) as entry:
+        with archive.open(info) as entry:
             raw = budget.take(entry, name)
     except (zipfile.BadZipFile, zlib.error, RuntimeError, OSError, EOFError) as error:
         # BadZipFile/zlib.error: a corrupt deflate stream, a local header that
