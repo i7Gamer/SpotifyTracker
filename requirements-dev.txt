@@ -18,7 +18,7 @@ pytest-xdist==3.8.0
 # endpoints were found this way, at 78% with no test at all (they are at 100%
 # now). Not needed to RUN the suite, but declared so `coverage run -m pytest`
 # works from a clone.
-coverage==7.16.0
+coverage==7.16.1
 
 # What lets CI measure coverage without a 7-minute serial run. `coverage run`
 # alone cannot see pytest-xdist's worker SUBPROCESSES - it needs
