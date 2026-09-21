@@ -30,9 +30,15 @@ from Database.Listeners.spotifyListener import (
 )
 
 
-def _bareListener(recentlyPlayed=None, get_recorded_track_ids=None):
+def _bareListener(recentlyPlayed=None, get_recorded_track_ids=None,
+                  user="alice", email="alice@example.com"):
     listener = Listener.__new__(Listener)
     listener.run = True
+    #< logUser is a property over these two - a real Listener always has them,
+    #  and without them every self.logUser read raises AttributeError into the
+    #  cross-check's own except-clause, silently cancelling the warning
+    listener.user = user
+    listener.email = email
     listener.sp = MagicMock()
     listener.recentlyPlayed_Z1 = recentlyPlayed if recentlyPlayed is not None else []
     listener._settledMissingTrackUris = collections.OrderedDict()
@@ -144,6 +150,35 @@ class TestCheckConnectStateForMissedTracks(unittest.TestCase):
             listener._checkConnectStateForMissedTracks()
 
         self.assertTrue(any("bbb" in message for message in cm.output))
+
+    def test_the_warning_names_the_user_it_belongs_to(self):
+        """Every listener runs its own cross-check against its own account's
+        queue history, so an unattributed warning cannot be acted on: a live
+        scorecard of these warnings had to say "some user has this play"
+        instead of "this user does", purely because the line did not say whose
+        prev_tracks it came from."""
+        listener = _bareListener(recentlyPlayed=[], user="carol")
+        _withConnectState(listener, [{"uri": "spotify:track:bbb"}])
+
+        listener._checkConnectStateForMissedTracks()
+        _ripen(listener)
+        with self.assertLogs("Database.Listeners.spotifyListener", level="WARNING") as cm:
+            listener._checkConnectStateForMissedTracks()
+
+        self.assertTrue(any("carol" in message for message in cm.output))
+
+    def test_the_warning_falls_back_to_the_email_when_there_is_no_user_key(self):
+        """Same fallback as logUser everywhere else - an anonymous listener
+        still has to be distinguishable from its neighbours."""
+        listener = _bareListener(recentlyPlayed=[], user=None, email="dave@example.com")
+        _withConnectState(listener, [{"uri": "spotify:track:bbb"}])
+
+        listener._checkConnectStateForMissedTracks()
+        _ripen(listener)
+        with self.assertLogs("Database.Listeners.spotifyListener", level="WARNING") as cm:
+            listener._checkConnectStateForMissedTracks()
+
+        self.assertTrue(any("dave@example.com" in message for message in cm.output))
 
     def test_does_not_warn_when_all_tracks_already_recorded(self):
         listener = _bareListener(recentlyPlayed=[self._recordedItem("aaa"), self._recordedItem("bbb")])
