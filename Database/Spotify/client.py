@@ -79,6 +79,10 @@ SEARCH_DEFAULT_LIMIT = 10              #< spotapi query_songs' own default, and 
 # The curl_cffi TLS fingerprint each per-user client impersonates.
 TLS_CLIENT_PROFILE = "chrome120"
 TLS_CLIENT_AUTO_RETRIES = 3
+_PUBLIC_QUERY_ERROR_TYPES = (
+    spotapi.exceptions.SongError, spotapi.exceptions.AlbumError,
+    spotapi.exceptions.ArtistError, spotapi.exceptions.PlaylistError,
+)
 
 
 class IncompleteTrackInfoError(Exception):
@@ -169,7 +173,7 @@ def _isPersistedQueryError(payload):
     """Recognize the GraphQL marker, including spotapi's status/body exception text."""
     if isinstance(payload, PersistedQueryError):
         return True
-    if isinstance(payload, spotapi.exceptions.SongError):
+    if isinstance(payload, _PUBLIC_QUERY_ERROR_TYPES):
         # ParentException.__str__ only contains the generic message. Exclude
         # 5xx even if an intermediary echoed a GraphQL error in its body.
         detail = payload.error
@@ -191,6 +195,29 @@ def _isPersistedQueryError(payload):
                     r"persisted[_\s]?query[_\s]?not[_\s]?found", marker, re.IGNORECASE):
                 return True
     return False
+
+
+def _publicQueryWithHashRetry(request):
+    """One generation-aware refresh for an album, artist, playlist or search.
+
+    Classify before formatting, so HTTP 200 GraphQL rejections cannot become
+    empty catalog records. The track path keeps the same one-refresh budget
+    across its separate transport and incomplete-response retry ladder.
+    """
+    from Database.patches import beginSpotapiHashAttempt, invalidateUsedSpotapiHash
+    hashRefreshUsed = False
+    while True:
+        beginSpotapiHashAttempt()
+        try:
+            payload = request()
+            if _isPersistedQueryError(payload):
+                raise PersistedQueryError("Persisted query rejected")
+            return payload
+        except Exception as error:
+            if hashRefreshUsed or not _isPersistedQueryError(error):
+                raise
+            hashRefreshUsed = True
+            invalidateUsedSpotapiHash()
 
 
 def getTrackInfoWithRetry(trackId: str, max_retries: int = TRACK_FETCH_MAX_RETRIES):
@@ -482,7 +509,8 @@ class Spotify:
         replaces; the backfiller uses those tracks as a duration source)."""
         albumId = normalizeSpotifyId(albumId)
         with _pooledPublicClient() as client:
-            payload = spotapi.PublicAlbum(albumId, client=client).get_album_info()
+            payload = _publicQueryWithHashRetry(
+                lambda: spotapi.PublicAlbum(albumId, client=client).get_album_info())
         return formatAlbumUnion(((payload or {}).get("data") or {}).get("albumUnion") or {})
 
     def artist(self, artistId, *args, **kwargs) -> dict:
@@ -490,13 +518,15 @@ class Spotify:
         fallback reads images[0].url."""
         artistId = normalizeSpotifyId(artistId)
         with _pooledPublicClient() as client:
-            payload = spotapi.Artist(client=client).get_artist(artistId)
+            payload = _publicQueryWithHashRetry(
+                lambda: spotapi.Artist(client=client).get_artist(artistId))
         return formatArtistUnion(((payload or {}).get("data") or {}).get("artistUnion") or {})
 
     def playlist(self, playlistId, *args, **kwargs) -> dict:
         playlistId = normalizeSpotifyId(playlistId)
         with _pooledPublicClient() as client:
-            payload = spotapi.PublicPlaylist(playlistId, client=client).get_playlist_info()
+            payload = _publicQueryWithHashRetry(
+                lambda: spotapi.PublicPlaylist(playlistId, client=client).get_playlist_info())
         return formatPlaylistV2(((payload or {}).get("data") or {}).get("playlistV2") or {})
 
     def search(self, query, type="track", limit=SEARCH_DEFAULT_LIMIT, *args, **kwargs) -> dict:
@@ -510,7 +540,8 @@ class Spotify:
         it used. Song's `client` default is the same shared import-time
         TLSClient as PublicAlbum's, hence the pooled borrow."""
         with _pooledPublicClient() as client:
-            payload = spotapi.Song(client=client).query_songs(query, limit=limit)
+            payload = _publicQueryWithHashRetry(
+                lambda: spotapi.Song(client=client).query_songs(query, limit=limit))
 
         results = ((((payload or {}).get("data") or {}).get("searchV2") or {})
                    .get("tracksV2") or {}).get("items") or []

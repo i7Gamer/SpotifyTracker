@@ -29,6 +29,15 @@ TOKEN_EXPIRY_MS = 2000000
 PACK_URL = "https://open.spotifycdn.com/cdn/build/web-player/web-player.test.js"
 TRACK = {"data": {"trackUnion": {"uri": "spotify:track:test"}}}
 STALE = {"errors": [{"message": "PersistedQueryNotFound"}]}
+PUBLIC_LOOKUPS = ("album", "artist", "playlist", "search")
+CATALOG = {"data": {
+    "albumUnion": {"uri": "spotify:album:test", "name": "Recovered"},
+    "artistUnion": {"uri": "spotify:artist:test", "profile": {"name": "Recovered"}},
+    "playlistV2": {"uri": "spotify:playlist:test", "name": "Recovered"},
+    "searchV2": {"tracksV2": {"items": [{"item": {"data": {
+        "uri": "spotify:track:test", "name": "Recovered", "__typename": "Track",
+    }}}]}},
+}}
 
 
 class HttpScript:
@@ -92,6 +101,7 @@ def script(monkeypatch):
 
     value.pool = Pooler(factory=factory)
     monkeypatch.setattr(spotapi.public, "client_pool", value.pool)
+    monkeypatch.setattr(owned, "client_pool", value.pool)
     yield value
     for tls in clients:
         atexit.unregister(tls.close)
@@ -326,3 +336,46 @@ def test_late_hash_failure_does_not_discard_new_generation(script):
     script.catalog = [(200, STALE, {}), (200, TRACK, {})]
     assert owned.getTrackInfoWithRetry("test") == TRACK["data"]["trackUnion"]
     assert sum(url == PACK_URL for _, url, _ in script.calls) == 2
+
+
+@pytest.mark.parametrize("operation", PUBLIC_LOOKUPS)
+@pytest.mark.parametrize("status", [200, 400])
+def test_all_public_lookups_refresh_stale_hash_before_formatting_and_stay_warm(script, operation, status):
+    script.catalog = [(status, STALE, {}), (200, CATALOG, {}), (200, CATALOG, {})]
+    lookup = getattr(owned.Spotify(), operation)
+    result = lookup("test")
+    item = result["tracks"]["items"][0] if operation == "search" else result
+    assert item["id"] == "test"
+    assert item["name"] == "Recovered"
+    assert sum(url == PACK_URL for _, url, _ in script.calls) == 2
+    script.calls.clear()
+    assert lookup("test") == result
+    assert len(script.calls) == 1
+    assert script.calls[0][1] == "https://api-partner.spotify.com/pathfinder/v1/query"
+
+
+@pytest.mark.parametrize("operation", PUBLIC_LOOKUPS)
+@pytest.mark.parametrize("status", [200, 400])
+def test_public_hash_recovery_is_bounded_and_returns_the_transport_to_its_pool(script, operation, status):
+    script.catalog = [(status, STALE, {})] * 2
+    with pytest.raises(spotapi.exceptions.ParentException) as failure:
+        getattr(owned.Spotify(), operation)("test")
+    assert owned._isPersistedQueryError(failure.value)
+    assert sum(url == PACK_URL for _, url, _ in script.calls) == 2
+    assert len(script.pool.queue) == 1
+
+
+@pytest.mark.parametrize("operation", PUBLIC_LOOKUPS)
+@pytest.mark.parametrize("status,body", [(503, STALE), (200, "invalid JSON")])
+def test_public_transport_or_json_failure_never_evicts_the_hash_cache(script, operation, status, body):
+    script.catalog = [(200, CATALOG, {})]
+    lookup = getattr(owned.Spotify(), operation)
+    lookup("test")
+    script.calls.clear()
+    script.catalog = [(status, body, {})]
+    generation = patches._spotapiBundleGeneration
+    with pytest.raises(spotapi.exceptions.ParentException):
+        lookup("test")
+    assert patches._spotapiBundleGeneration == generation
+    assert len(script.calls) == 1
+    assert len(script.pool.queue) == 1
