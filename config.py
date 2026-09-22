@@ -107,10 +107,12 @@ MAX_UNCOMPRESSED_IMPORT_MB = MAX_UPLOAD_MB
 # A second ceiling the byte cap above cannot enforce: empty archive entries
 # cost nothing to store and plenty to parse, so 50,000 zero-byte members spend
 # 0% of the budget and still take seconds of a waitress worker thread
-# (measured). Spotify's own export holds a few dozen files, and Flask's
+# (measured). This is request-wide across every ZIP in the upload and counts
+# ignored members/directories too, because the cost appears before suffix
+# filtering. Spotify's own export holds a few dozen files, and Flask's
 # MAX_FORM_PARTS default is this same 1000, so this is generous for anything
-# real. It bounds opening the entries; the central-directory parse before that
-# stays bounded only by MAX_UPLOAD_MB.
+# real. It bounds opening entries and per-member read-ahead; the
+# central-directory parse before that stays bounded only by MAX_UPLOAD_MB.
 MAX_IMPORT_ARCHIVE_ENTRIES = 1000
 # Unit conversions, named so the ladders that format a byte count or split
 # an hour total into days read as units rather than as bare powers of two.

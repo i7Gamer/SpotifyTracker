@@ -35,6 +35,15 @@ _PLAY_JSON = '{"ms_played": 1}'
 _EXPORT_DIR = "Spotify Extended Streaming History/"
 # Big enough that no test trips the guard by accident, small enough to be free.
 _GENEROUS_CAP = 10 * 1024 * 1024
+_LOCAL_HEADER_SIGNATURE = b"PK\x03\x04"
+_CENTRAL_HEADER_SIGNATURE = b"PK\x01\x02"
+_LOCAL_METHOD_OFFSET = 8
+_CENTRAL_METHOD_OFFSET = 10
+_UNSUPPORTED_METHOD = 99
+_SMALL_BYTE_CAP = 64 * 1024
+_BOMB_PAYLOAD_BYTES = 8 * 1024 * 1024
+_CORRUPTION_START = 40
+_CORRUPTION_END = 60
 
 
 def _zipBytes(entries, compressionLevel=None):
@@ -198,23 +207,21 @@ class TestExpandUploads(unittest.TestCase):
         self.assertTrue(result.emptyArchive)
         self.assertEqual(result.unreadableCount, 0)
 
-    def test_a_corrupt_archive_is_counted_unreadable_not_raised(self):
-        """Truncated mid-entry: is_zipfile reads the central directory at the
-        END of the file, so this is detected as a ZIP and then fails on read."""
+    def test_a_corrupt_archive_rejects_the_request_without_raising(self):
+        """Damage an earlier header/data region while leaving EOCD intact:
+        the upload is still detected as a ZIP and then fails when opened."""
         archive = bytearray(_zipBytes({"Streaming_History.json": _PLAY_JSON * 200}))
-        archive[40:60] = b"\x00" * 20   #< corrupt the deflate stream, keep the directory
+        archive[_CORRUPTION_START:_CORRUPTION_END] = b"\x00" * (_CORRUPTION_END - _CORRUPTION_START)
 
         result = expandUploads([_upload("export.zip", bytes(archive))], _GENEROUS_CAP)
 
         self.assertEqual(result.contents, [])
-        self.assertEqual(result.unreadableCount, 1)
+        self.assertEqual(result.unreadableCount, 0)
+        self.assertTrue(result.unreadableArchive)
 
-    def test_an_unsupported_compression_method_is_counted_not_raised(self):
-        """zipfile raises NotImplementedError for a method this build has no
-        decompressor for (WinZip AE-x encryption, method 99, is the one seen
-        in the wild). It subclasses RuntimeError so the except tuple already
-        covered it - this pins that, because the relationship is implicit and
-        a reviewer read the tuple as leaving the route open to a 500."""
+    def test_an_unsupported_compression_method_rejects_readable_siblings(self):
+        """An unsupported history member rejects the entire request before
+        opening it, including readable siblings that could otherwise import."""
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
             archive.writestr("a_odd.json", _PLAY_JSON)
@@ -222,14 +229,16 @@ class TestExpandUploads(unittest.TestCase):
         raw = bytearray(buffer.getvalue())
         # Rewrite ONLY the first entry's method, in both headers that carry it:
         # local (PK\x03\x04, +8) and central directory (PK\x01\x02, +10).
-        for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        for signature, offset in ((_LOCAL_HEADER_SIGNATURE, _LOCAL_METHOD_OFFSET),
+                                  (_CENTRAL_HEADER_SIGNATURE, _CENTRAL_METHOD_OFFSET)):
             at = raw.find(signature)
-            struct.pack_into("<H", raw, at + offset, 99)
+            struct.pack_into("<H", raw, at + offset, _UNSUPPORTED_METHOD)
 
         result = expandUploads([_upload("odd.zip", bytes(raw))], _GENEROUS_CAP)
 
-        self.assertEqual(result.contents, ['{"ms_played": 2}'])   #< the sibling survives
-        self.assertEqual(result.unreadableCount, 1)
+        self.assertEqual(result.contents, [])
+        self.assertEqual(result.unreadableCount, 0)
+        self.assertTrue(result.unsupportedCompression)
 
     def test_a_file_named_zip_that_is_not_one_falls_back_to_text(self):
         result = expandUploads([_upload("not_really.zip", _PLAY_JSON)], _GENEROUS_CAP)
@@ -331,9 +340,8 @@ class TestExpandUploads(unittest.TestCase):
         self.assertEqual(result.contents, [])
 
     def test_a_zip_bomb_is_refused_without_materialising_it(self):
-        """The whole point. 8 MB of zeroes compresses to a few KB; a cap
-        enforced on ZipInfo.file_size alone would be enforced on a number the
-        archive itself supplies."""
+        """An honest oversized declaration is rejected before member open.
+        Deceptive declarations have separate measured-output regressions."""
         archive = _zipBytes({"Streaming_History.json": "\0" * (8 * 1024 * 1024)},
                             compressionLevel=9)
         self.assertLess(len(archive), 100 * 1024, "the fixture stopped being a bomb")
@@ -343,33 +351,18 @@ class TestExpandUploads(unittest.TestCase):
         self.assertTrue(result.exceededCap)
         self.assertEqual(result.contents, [])
 
-    def test_a_bomb_is_never_inflated_past_the_cap(self):
-        """Refusing it is only half the guard.
-
-        A cap enforced AFTER inflating 10 GB has already spent the memory it
-        exists to save, and no assertion on the returned result can tell the
-        two apart - both just say "refused". So pin the read itself: nothing
-        may ask the decompressing stream for more than the budget. This is the
-        assertion that fails if `read(remaining + 1)` ever becomes `read()`,
-        or starts trusting the archive's own declared size."""
-        cap = 64 * 1024
-        archive = _zipBytes({"Streaming_History.json": "\0" * (8 * 1024 * 1024)},
+    def test_an_excessive_declared_size_never_opens_the_member(self):
+        """Preflight rejects excessive metadata before any member decoding.
+        Actual decoder-output bounds for forged small sizes are tested in
+        test_import_upload_budget rather than inferred from read arguments."""
+        archive = _zipBytes({"Streaming_History.json": "\0" * _BOMB_PAYLOAD_BYTES},
                             compressionLevel=9)
-        requested = []
-        realRead = zipfile.ZipExtFile.read
-
-        def recordingRead(entry, size=-1):
-            requested.append(size)
-            return realRead(entry, size)
-
-        with patch.object(zipfile.ZipExtFile, "read", recordingRead):
-            result = expandUploads([_upload("bomb.zip", archive)], cap)
+        with patch.object(zipfile.ZipFile, "open", side_effect=AssertionError("member must not open")) as opened:
+            result = expandUploads([_upload("bomb.zip", archive)], _SMALL_BYTE_CAP)
 
         self.assertTrue(result.exceededCap)
-        self.assertTrue(requested, "the entry was never read through ZipExtFile.read")
-        self.assertTrue(
-            all(size is not None and 0 <= size <= cap + 1 for size in requested),
-            f"asked the decompressor for {requested} bytes on a {cap}-byte budget")
+        self.assertEqual(result.contents, [])
+        opened.assert_not_called()
 
     def test_nothing_decoded_before_the_cap_tripped_survives(self):
         """All or nothing. A partial import is indistinguishable from a
@@ -386,12 +379,13 @@ class TestExpandUploads(unittest.TestCase):
         self.assertEqual(result.contents, [])
 
     def test_a_lying_declared_size_does_not_get_a_free_pass(self):
-        """ZipInfo.file_size is attacker-supplied. Rewriting it to 1 must not
-        change what the guard measures - only the bytes actually read count."""
+        """A forged small size with the original full-payload CRC is corrupt.
+        Matching-prefix CRCs are covered by the measured-output regressions."""
         payload = "x" * 5000
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
             info = zipfile.ZipInfo("Streaming_History.json")
+            info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, payload)
         raw = buffer.getvalue()
         self.assertIn(b"\x88\x13", raw, "5000 little-endian should appear as a declared size")
@@ -399,10 +393,8 @@ class TestExpandUploads(unittest.TestCase):
 
         result = expandUploads([_upload("liar.zip", raw)], 1000)
 
-        # Either outcome is safe: refused by the guard, or refused as corrupt
-        # (zipfile itself checks the declared size against what it inflated).
-        # What must never happen is 5000 bytes sailing through a 1000 cap.
         self.assertEqual(result.contents, [])
+        self.assertTrue(result.unreadableArchive)
 
     def test_content_exactly_at_the_cap_is_allowed(self):
         """Off-by-one: the cap is a ceiling, not an exclusive bound."""
@@ -522,7 +514,8 @@ class TestZipUploadRoute(AppTestCase):
 
         self.assertIn("error=too_many_entries", resp.headers["Location"])
         db.importHistoryBatch.assert_not_called()
-        self.assertIn("too many files", self._getImportPage(dash, db, "?error=too_many_entries"))
+        self.assertIn("total entries across ZIPs in one request",
+                      self._getImportPage(dash, db, "?error=too_many_entries"))
 
     def test_the_route_passes_the_configured_entry_ceiling(self):
         """The cap is policy, so config owns the number and the route hands it
@@ -567,7 +560,7 @@ class TestZipUploadRoute(AppTestCase):
 
         self.assertNotIn("unpacks to more than", page)
         self.assertNotIn("no .json or .csv files", page)
-        self.assertNotIn("too many files", page)
+        self.assertNotIn("total entries across ZIPs in one request", page)
 
     def test_the_form_accepts_zip_files(self):
         dash = self._makeApp()

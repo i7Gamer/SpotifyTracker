@@ -29,7 +29,13 @@
       <p class="error">That archive unpacks to more than {{ maxUncompressedImportMb }} MB of data, so nothing was imported. Unzip it yourself and upload the history files in a few smaller batches.</p>
     {% endif %}
     {% if tooManyEntries %}
-      <p class="error">That archive holds too many files ({{ maxImportArchiveEntries }} is the limit), so nothing was imported. A Spotify export holds a few dozen - if this is one, unzip it and upload the history files directly.</p>
+      <p class="error">Those archives hold too many total entries across ZIPs in one request ({{ maxImportArchiveEntries }} is the limit), so nothing was imported. A Spotify export holds a few dozen - if this is one, unzip it and upload the history files directly.</p>
+    {% endif %}
+    {% if unsupportedCompression %}
+      <p class="error">This ZIP uses unsupported compression. Nothing was imported. Extract it and upload the JSON/CSV files, or create a ZIP using Stored or Deflate compression.</p>
+    {% endif %}
+    {% if unreadableArchive %}
+      <p class="error">This ZIP could not be read safely. Nothing was imported. If it is password-protected, unlock and extract it locally, then upload the JSON/CSV files. Otherwise, download the export again or extract readable history files and upload them separately.</p>
     {% endif %}
     {% if emptyArchive %}
       <p class="error">That archive contained no .json or .csv files. Upload the ZIP Spotify sent you - the history files live in a folder inside it, and re-zipping just that folder works too.</p>
@@ -45,9 +51,9 @@
         <p id="import-hint" class="import-hint">Drag and drop your files here or click to browse (max {{ maxUploadMb }} MB total)</p>
       </div>
       <p class="import-note">Upload the <code>.zip</code> Spotify sent you as-is - it unpacks here, and it is a fraction of
-        the size unzipped, which matters if anything sits between you and this app. Loose files work too: upload both the
-        <code>Streaming_History_Audio_*.json</code> and <code>Streaming_History_Video_*.json</code> files - music-video
-        streams are real plays too.</p>
+        the size unzipped, which matters if anything sits between you and this app. ZIPs must use Stored or Deflate
+        compression. Loose files work too: upload both the <code>Streaming_History_Audio_*.json</code> and
+        <code>Streaming_History_Video_*.json</code> files - music-video streams are real plays too.</p>
       <label class="import-overwrite-option">
         <input id="overwrite-range" type="checkbox" name="overwrite_range" />
         Replace existing data in the time covered by these files
