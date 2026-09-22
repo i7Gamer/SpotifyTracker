@@ -17,10 +17,52 @@ from Database.Spotify.recentlyPlayed import _connectStateInt
 #< a direct import, unlike _dbmod above: Database.utils takes part in no cycle
 #  (see the note on its TRUTHY_ENV_VALUES re-export)
 from Database.utils import flaskDebugEnabled
+from Database.backfill_matching import (
+    backfill_page_window,
+    missing_backfill_items,
+    recorded_play_times_by_track,
+)
+from Database.db import WEB_API_BACKFILL_SOURCE
 
 
 class ListenerMixin:
     """Spotify listener lifecycle: connect/reconnect, live play ingestion, web-API reconcile, now-playing, and overall stop coordination."""
+
+    def process_backfill_page(self, items: list) -> None:
+        """Filter and enqueue one complete Web API recently-played page."""
+        if not items:
+            return
+
+        recorded_timestamps = {}
+        window = backfill_page_window(items)
+        if window is not None:
+            try:
+                rows = self.repo.getTrackPlayTimesInRange(self.user, *window)
+                recorded_timestamps = recorded_play_times_by_track(rows)
+            except Exception as e:
+                # A failed lookup answered nothing. Reoffer conservatively and
+                # let the insert guard settle already-recorded rows.
+                _dbmod.logger.debug(
+                    "Backfill dedup database lookup failed, conservatively reoffering plays: %s",
+                    _dbmod.parseError(e),
+                )
+
+        missed_items = missing_backfill_items(items, recorded_timestamps, self.user)
+        if not missed_items:
+            return
+
+        if flaskDebugEnabled():
+            _dbmod.logger.info(
+                "Backfilling %d plays from Web API recently-played history for user %s",
+                len(missed_items),
+                self.user,
+            )
+        # Mark these as backfilled so the database can record the source.
+        for missed_item in missed_items:
+            missed_item["_source"] = WEB_API_BACKFILL_SOURCE
+        # Web API returns newest plays first; enqueue in chronological order.
+        missed_items.reverse()
+        self._addToDatabaseFromListener(missed_items)
 
     def _addToDatabaseFromListener(self, data) -> None:
         """Record plays from the listener. Includes validation to detect cross-user
@@ -301,7 +343,7 @@ class ListenerMixin:
                 get_backfill_enabled=self.repo.isSpotifyApiBackfillEnabled,
                 on_scope_status_change=self.setSpotifyNeedsReauth,
                 get_recorded_track_ids=self.getRecentlyRecordedTrackIds,
-                get_recorded_play_times=self.getRecordedPlayTimes))
+                process_backfill_page=self.process_backfill_page))
             if self._stopRequested():
                 # stop() gave up waiting on this lock while the (slow,
                 # uninterruptible) Listener login above was in flight - tear

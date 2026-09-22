@@ -41,6 +41,7 @@ FIRST_IMPORTS = (
     "Database.Migrators.migrate1_32_0", #< settings seeding imports the leaf directly
     "Database.telemetry",
     "Database.metadata_repair",
+    "Database.backfill_matching",
     "Database.import_service",
     "Database.media_fetch",
     "Database.queries.merges",

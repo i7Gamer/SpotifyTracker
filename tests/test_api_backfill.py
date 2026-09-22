@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from Database.repository import Repository
+from Database.database import Database
 from Database.Listeners.spotifyListener import (
     Listener,
     WEB_API_POLL_INTERVAL_SECONDS,
@@ -38,22 +39,41 @@ def _isoFromTimestamp(ts):
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _testPageProcessor(getRecordedPlayTimes, callback):
+    """Build the real Database page seam around a test-only evidence source."""
+    if getRecordedPlayTimes is None:
+        return None
+
+    db = Database.__new__(Database)
+    db.user = "alice"
+    db.repo = MagicMock()
+
+    def getRecorded(username, startTs, endTs):
+        if username != db.user:
+            raise AssertionError(f"unexpected evidence user: {username!r}")
+        return getRecordedPlayTimes(startTs, endTs)
+
+    db.repo.getTrackPlayTimesInRange.side_effect = getRecorded
+    db._addToDatabaseFromListener = callback
+    return db.process_backfill_page
+
+
 def _runBackfillPoll(getRecordedPlayTimes, items):
-    """One _checkWebApiBackfill poll against `items`, with the dedup's database
-    lookup wired to `getRecordedPlayTimes`. Returns the announce callback, so a
-    test can assert what (if anything) was declared missing."""
+    """One _checkWebApiBackfill poll against `items`, with the moved page seam
+    wired to `getRecordedPlayTimes`. Returns the announce callback, so a test
+    can assert what (if anything) was declared missing."""
     getCredentials = MagicMock(return_value={
         "client_id": "cid", "client_secret": "cs", "refresh_token": "rt",
     })
+    callback = MagicMock()
     with patch("Database.Listeners.spotifyListener.Spotify") as mockSpotifyCls:
         mockSp = MagicMock()
         mockSp.current_user_recently_played.return_value = []
         mockSpotifyCls.return_value = mockSp
         listener = Listener("dummy_cookie", email="alice@example.com",
                             get_credentials=getCredentials,
-                            get_recorded_play_times=getRecordedPlayTimes)
+                            process_backfill_page=_testPageProcessor(getRecordedPlayTimes, callback))
     listener._lastWebApiPollTime = 0
-    callback = MagicMock()
     with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api",
                return_value={"id": "alice", "display_name": "Alice", "email": "alice@example.com"}):
         with patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api",

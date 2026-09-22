@@ -72,7 +72,7 @@ class TestFallbackMetadataRepair(DatabaseTestCase):
             spotify.return_value.current_user_recently_played.return_value = []
             listener = Listener("dummy", email="alice@example.test",
                                 get_credentials=lambda: {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt"},
-                                get_recorded_play_times=self.db.getRecordedPlayTimes)
+                                process_backfill_page=self.db.process_backfill_page)
         callback = MagicMock(wraps=self.db._addToDatabaseFromListener)
         items = [{"track": catalogTrack(), "played_at": PLAYED_AT}]
         with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api", return_value={"id": "alice", "email": "alice@example.test"}), \
