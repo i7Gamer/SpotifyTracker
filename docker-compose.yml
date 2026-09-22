@@ -22,10 +22,10 @@ services:
       # - SKIP_EMAIL_VERIFICATION=1   #< Uncomment to disable the "do these cookies belong to this email" check at login (only do this if you trust everyone who can reach this instance - it's what stops one user from claiming another's account, AND what stops /reset-password from letting anyone set a new password on any account)
       # - SMTP_SKIP_TLS_VERIFY=1   #< Uncomment ONLY for a self-hosted mail relay with a self-signed certificate: notification mail then skips certificate and hostname verification, which otherwise protects the SMTP password and every mail from a spoofed relay
       # - SPOTIFY_TOTP_SECRET=61:44,55,...  #< Emergency override for the pinned Spotify TOTP secret. Only needed if Spotify rotates it and logins start failing instance-wide before a fixed release is out - the log line at that point tells you so. Format is "<version>:<comma-separated bytes>"; a malformed value is ignored (with an error logged) rather than taking login offline.
-      # - SPOTIFY_TOTP_AUTO_RECOVER=0 #< On by default: once 3 session-token requests in a row fail (the sign Spotify rotated that secret) the app reads the current one from Spotify's own web player and adopts it, retrying at most every 15 minutes. Set to 0 if you would rather nothing touched authentication on its own - then only SPOTIFY_TOTP_SECRET or a fixed release gets logins back.
+      # - SPOTIFY_TOTP_AUTO_RECOVER=0 #< On by default: after 3 explicit TOTP rejections, tries to recover a newer secret from Spotify's own web player, at most every 15 minutes. Transport failures are counted separately. Set to 0 to disable automatic secret discovery.
       # - ALLOW_INSTANCE_RESTART=1    #< Shows the admin console's "Restart app to apply" button (needed after changing worker-pool sizes on Advanced Tuning) and enables POST /admin/restart. Safe here because Docker already relaunches on exit (restart: always, below) - do not enable this outside a supervised launch.
-      # - BACKUP_INTERVAL_HOURS=24    #< how often to snapshot; 0 disables automatic backups
-      # - BACKUP_RETENTION_COUNT=7    #< how many snapshots to keep; 0 disables automatic backups
+      # - BACKUP_INTERVAL_HOURS=24    #< environment fallback interval; saved /admin setting wins; effective 0 disables automatic backups
+      # - BACKUP_RETENTION_COUNT=7    #< environment fallback retention; saved /admin setting wins; effective 0 disables automatic backups
       # - BACKUP_DIR=/backups        #< where snapshots go; default is Backups/ beside the database
     restart: always
     # Shutdown stops every user's listener, watchdog and five periodic workers,

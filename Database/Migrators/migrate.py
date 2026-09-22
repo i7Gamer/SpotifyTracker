@@ -8,7 +8,13 @@ except ModuleNotFoundError:
     from base import resolveRuntimeDir, BaseMigrator
     import dbversion
 
+try:
+    from Database.backup_settings import BACKUP_INTERVAL_HOURS_KEY, BACKUP_RETENTION_COUNT_KEY
+except ModuleNotFoundError:
+    from backup_settings import BACKUP_INTERVAL_HOURS_KEY, BACKUP_RETENTION_COUNT_KEY
+
 import logging
+import sqlite3
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -36,6 +42,25 @@ MIGRATION_FLOOR_VERSION = "1.6.0"
 # floor.
 # (tests/test_migrators.py pins this constant strictly below Database/VERSION.)
 LAST_JSON_ERA_CAPABLE_RELEASE = "1.45.0"
+
+
+def _readBackupSettings(dbPath: Path) -> tuple[str | None, str | None]:
+    """Read only persisted backup rows without opening the application schema."""
+    conn = dbversion.openMigrationConnection(dbPath, readOnly=True)
+    try:
+        tableExists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_settings'"
+        ).fetchone() is not None
+        if not tableExists:
+            return None, None
+        rows = conn.execute(
+            "SELECT key, value FROM app_settings WHERE key IN (?, ?)",
+            (BACKUP_INTERVAL_HOURS_KEY, BACKUP_RETENTION_COUNT_KEY),
+        ).fetchall()
+        values = {row[0]: row[1] for row in rows}
+        return values.get(BACKUP_INTERVAL_HOURS_KEY), values.get(BACKUP_RETENTION_COUNT_KEY)
+    finally:
+        conn.close()
 
 
 def _loadMigratorModule(moduleName: str, modulePath: Path):
@@ -134,15 +159,31 @@ def _snapshotBeforeMigrating(runtimeDir: Path) -> None:
         return
     try:
         from Database.backup import BackupWorker, BACKUP_INTERVAL_ENV_VAR, BACKUP_RETENTION_ENV_VAR
+        from Database.backup_settings import (
+            resolveBackupSettings,
+        )
     except ModuleNotFoundError:
         from backup import BackupWorker, BACKUP_INTERVAL_ENV_VAR, BACKUP_RETENTION_ENV_VAR
+        from backup_settings import (
+            resolveBackupSettings,
+        )
+    try:
+        savedInterval, savedRetention = _readBackupSettings(dbPath)
+        settings = resolveBackupSettings(savedInterval, savedRetention)
+    except (sqlite3.Error, OSError) as e:
+        logger.error("Skipping pre-migration snapshot: could not read backup settings: %s", e)
+        return
     # No backupDir on purpose: the operator's BACKUP_DIR governs this
     # snapshot exactly like the scheduled ones - off-disk protection matters
     # most at the riskiest write of the boot. The trade is that a BACKUP_DIR
     # mount that is down at boot costs this snapshot (caught below, startup
     # continues), which the beside-the-db default never risked.
     # test_migration_chain pins this call shape.
-    worker = BackupWorker(dbPath=dbPath)
+    worker = BackupWorker(
+        dbPath=dbPath,
+        intervalHours=settings.intervalHours,
+        retentionCount=settings.retentionCount,
+    )
     if not worker.isEnabled():
         logger.info(
             "Skipping pre-migration snapshot: backups are disabled (%s=%s, %s=%s).",

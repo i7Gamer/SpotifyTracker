@@ -37,7 +37,7 @@ class PlayQueries:
         return ", ".join(f"{column} = COALESCE(?, {column})" for column in BEHAVIORAL_COLUMNS)
 
     def correctPlay(self, playId: int, playedAt: float, timePlayed: int, isSkip: int,
-                     extrasValues: tuple) -> None:
+                     playedFrom: str | None, extrasValues: tuple) -> None:
         """Rewrite one play from a more accurate import row.
 
         Raises sqlite3.IntegrityError when moving played_at would collide with
@@ -45,17 +45,20 @@ class PlayQueries:
         whether to leave the row uncorrected, since that is an import-policy
         question, not a storage one."""
         self._conn().execute(
-            f"UPDATE plays SET played_at = ?, time_played = ?, is_skip = ?, {self._behavioralSetSql()}"
+            f"UPDATE plays SET played_at = ?, time_played = ?, is_skip = ?, "
+            f"played_from = COALESCE(?, played_from), {self._behavioralSetSql()}"
             " WHERE id = ?",
-            (playedAt, timePlayed, isSkip, *extrasValues, playId),
+            (playedAt, timePlayed, isSkip, playedFrom, *extrasValues, playId),
         )
 
-    def enrichPlayBehavioralColumns(self, playId: int, extrasValues: tuple) -> None:
-        """Backfill one play's behavioral columns from an import that carries
-        metadata the stored row lacks. The play itself is unchanged."""
+    def enrichPlayBehavioralColumns(self, playId: int, playedFrom: str | None,
+                                    extrasValues: tuple) -> None:
+        """Backfill one play's context and behavioral columns from an import
+        that carries metadata the stored row lacks. The play itself is unchanged."""
         self._conn().execute(
-            f"UPDATE plays SET {self._behavioralSetSql()} WHERE id = ?",
-            (*extrasValues, playId),
+            f"UPDATE plays SET played_from = COALESCE(?, played_from), "
+            f"{self._behavioralSetSql()} WHERE id = ?",
+            (playedFrom, *extrasValues, playId),
         )
 
     def insertPlay(self, username: str, trackId: str, playedAt: float, timePlayed: int,
@@ -126,54 +129,6 @@ class PlayQueries:
         )
         return cur.rowcount > 0
 
-    def hasPlayNearTime(self, username: str, trackId: str, playedAt: float, toleranceSeconds: float,
-                        listenerEndToleranceSeconds: float | None = None,
-                        skipToleranceSeconds: float | None = None) -> bool:
-        """True if a play for this exact track already exists for this user
-        within toleranceSeconds of playedAt (inclusive both directions).
-        Reuses idx_plays_user_track. See Database.appendTrackData for why this
-        is a wide, defense-in-depth guard applied only to Web API backfill
-        inserts, not the live listener's own insert path.
-
-        listenerEndToleranceSeconds additionally matches a LISTENER row whose
-        created_at sits within that (much tighter) tolerance of playedAt: the
-        listener inserts at the track-change moment, so its created_at is the
-        observed end of the play, pauses included - which the duration-based
-        window above cannot cover, since a mid-track pause stretches
-        start-to-end by an unbounded amount. Listener rows only: any other
-        source's created_at is an import/poll moment, not a play end.
-
-        Both of those arms are is_skip=0, which near-time matching has been
-        since skips lived in their own table: a backfill row must never dedup
-        against, or claim/correct, a merged skip row. That filter cannot hold
-        for this caller, though - the Web API reports no ms_played, so a
-        backfill row stamps the track's whole duration and is is_skip=0 by
-        construction, and a listen the listener classified as a SKIP was
-        therefore invisible to every arm and got re-added as a full play.
-        skipToleranceSeconds is the answer: a third arm matching a skip's
-        played_at, kept far tighter than the duration window because at that
-        distance a skip followed by a genuine replay is the likelier reading
-        (see Database.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS). played_at only -
-        a skip's created_at is when the user skipped AWAY, not an end the feed
-        still owes us, the same rule getPlaysWithSourceInRange enforces. Not
-        restricted by source, unlike the end arm: that one needs created_at to
-        MEAN a play end, while played_at is recorded honestly by all of them."""
-        conn = self._conn()
-        timeMatch = "played_at BETWEEN ? AND ?"
-        params: list = [playedAt - toleranceSeconds, playedAt + toleranceSeconds]
-        if listenerEndToleranceSeconds is not None:
-            timeMatch += " OR (created_reason LIKE 'listener_play%' AND created_at BETWEEN ? AND ?)"
-            params += [playedAt - listenerEndToleranceSeconds, playedAt + listenerEndToleranceSeconds]
-        clauses = f"(is_skip=0 AND ({timeMatch}))"
-        if skipToleranceSeconds is not None:
-            clauses += " OR (is_skip=1 AND played_at BETWEEN ? AND ?)"
-            params += [playedAt - skipToleranceSeconds, playedAt + skipToleranceSeconds]
-        row = conn.execute(
-            f"SELECT 1 FROM plays WHERE username=? AND track_id=? AND ({clauses}) LIMIT 1",
-            (username, trackId, *params),
-        ).fetchone()
-        return row is not None
-
     def getRecentlyRecordedTrackIds(self, username: str, trackIds: list[str],
                                     sinceSeconds: float) -> set[str]:
         """Which of `trackIds` this user has any play for in the last
@@ -222,9 +177,8 @@ class PlayQueries:
         return {row["track_id"] for row in rows}
 
     def getTrackPlayTimesInRange(self, username: str, startTs: float,
-                                 endTs: float) -> list[tuple[str, float, float | None]]:
-        """Every (track_id, played_at, listener_created_at) this user has in
-        the closed [startTs, endTs] window.
+                                 endTs: float, *, page=None) -> list[dict]:
+        """Return rich physical play evidence in the closed window.
 
         Backs the Web API backfill's duplicate check (see _checkWebApiBackfill):
         the listener's in-memory caches only cover the current listener object's
@@ -249,38 +203,74 @@ class PlayQueries:
         norm, since a missing track's derived start equals its predecessor's
         recorded end.
 
-        The third element is the row's created_at, passed through for real
-        LISTENER plays only: the listener inserts a play at the track-change
-        moment, so its created_at IS the observed end of the play, pauses
-        included - the anchor the caller's end-time dedup arm compares
-        against. Any other source's created_at is an import/poll moment,
-        meaningless as a play end, and comes through as None. So is a SKIP's:
-        that stamp is when the user skipped away, not the end of a play the
-        feed still owes us, and letting it anchor the arm let a skip suppress
-        the backfill of a real play seconds later. Note this nulls the ANCHOR
-        only - a skip's played_at still comes through, and the insert guard
-        behind this check matches it directly on a tight tolerance (see
-        hasPlayNearTime's skipToleranceSeconds). Real listener plays are also
-        matched INTO the window by that created_at, not just by played_at: a
-        paused play can start more than one track-length before its end, which
-        is exactly when the played_at-only window would miss the row the
-        end-time arm needs."""
-        conn = self._conn()
-        rows = conn.execute(
-            "SELECT track_id, played_at, "
-            "CASE WHEN created_reason LIKE 'listener_play%' AND is_skip=0 THEN created_at "
-            "ELSE NULL END AS listener_created_at "
-            "FROM plays WHERE username=? AND (played_at BETWEEN ? AND ? "
-            "OR (created_reason LIKE 'listener_play%' AND is_skip=0 AND created_at BETWEEN ? AND ?))",
-            (username, startTs, endTs, startTs, endTs),
-        ).fetchall()
-        recorded = [(row["track_id"], row["played_at"], row["listener_created_at"]) for row in rows]
-        aliases = self._sameRecordingTrackIds({row["track_id"] for row in rows})
-        return recorded + [(aliasId, playedAt, listenerCreatedAt)
-                           for trackId, playedAt, listenerCreatedAt in recorded
-                           for aliasId in aliases.get(trackId, ())]
+        ``listenerCreatedAt`` is retained as evidence only for real listener
+        plays, whose insert observes the end; other sources and skips get
+        None. The query still includes listener ends within the window, but
+        the matcher deliberately reoffers end-only ambiguity instead of using
+        it to suppress a possible repeat. Each physical row is returned once;
+        its aliases describe alternative release IDs for that same row."""
+        return self._getTrackPlayEvidence(username, startTs, endTs, page=page, includeListenerEnds=True)
 
-    def _sameRecordingTrackIds(self, trackIds: set[str]) -> dict[str, set[str]]:
+    def _getTrackPlayEvidence(self, username: str, startTs: float,
+                              endTs: float, *, page=None, includeListenerEnds: bool = False) -> list[dict]:
+        conn = self._conn()
+        timeClause = "p.played_at BETWEEN ? AND ?"
+        params = [username, startTs, endTs]
+        if includeListenerEnds:
+            # The initial page snapshot retains observed ends as evidence.
+            # Atomic guards cannot use end-only matches, so keep their frequent
+            # lookups on the indexed username/played_at range instead of
+            # scanning the user's history for an unindexed created_at arm.
+            timeClause += (" OR (p.created_reason LIKE 'listener_play%' AND p.is_skip=0 "
+                           "AND p.created_at BETWEEN ? AND ?)")
+            params += [startTs, endTs]
+        rows = conn.execute(
+            "SELECT p.id AS row_id, p.track_id, p.played_at, p.created_reason, p.is_skip, "
+            "CASE WHEN p.created_reason LIKE 'listener_play%' AND p.is_skip=0 THEN p.created_at "
+            "ELSE NULL END AS listener_created_at "
+            f"FROM plays p WHERE p.username=? AND ({timeClause})",
+            params,
+        ).fetchall()
+        physical_ids = {row["track_id"] for row in rows}
+        seed_ids = physical_ids | (set(page.trackIds) if page is not None else set())
+        aliases = self._sameRecordingTrackIds(
+            seed_ids,
+            candidateIds=(physical_ids if page is not None else None),
+            pendingTracks=(page.pendingTracks if page is not None else ()),
+        )
+        result = []
+        for row in rows:
+            row_aliases = set(aliases.get(row["track_id"], ())) | {row["track_id"]}
+            result.append({
+                "rowId": row["row_id"],
+                "trackId": row["track_id"],
+                "aliases": row_aliases,
+                "playedAt": row["played_at"],
+                "listenerCreatedAt": row["listener_created_at"],
+                "createdReason": row["created_reason"],
+                "isSkip": row["is_skip"],
+            })
+        return result
+
+    def findMatchingBackfillPlay(self, username: str, trackId: str, playedAt: float,
+                                 toleranceSeconds: float,
+                                 skipToleranceSeconds: float | None = None, *, page):
+        """Fresh repository-side backfill evidence lookup.
+
+        This calls the private query path directly so a failed initial page
+        lookup cannot turn the transactional guard into a false negative.
+        Each physical row carries its stable ``rowId`` and an alias set; the
+        page matcher claims the physical row once rather than duplicating it
+        once per alias.
+        """
+        reach = max(toleranceSeconds, skipToleranceSeconds or 0)
+        rows = self._getTrackPlayEvidence(username, playedAt - reach, playedAt + reach, page=page)
+        return page.match(trackId, playedAt, rows,
+                          toleranceSeconds=toleranceSeconds,
+                          skipToleranceSeconds=skipToleranceSeconds)
+
+    def _sameRecordingTrackIds(self, trackIds: set[str], candidateIds: set[str] | None = None,
+                               *, pendingTracks=(), includeRecordingKey: bool = True) -> dict[str, set[str]]:
         """{track id -> the OTHER ids denoting the same recording}, for the
         caller above: one listen can reach us under two Spotify track ids,
         because the connect player_state and the Web API's recently-played
@@ -305,12 +295,14 @@ class PlayQueries:
             which exists to ask a person precisely because that width also
             catches re-recordings.
 
-        One scan of tracks per backfill poll (every 15 minutes per user);
-        tracks carries no index on name/isrc/canonical_id, and adding three to
-        serve this would cost every write for it."""
+        Production page/guard calls constrain SQL candidates to the physical
+        IDs found in the user's time window. This avoids a full catalog scan
+        for every atomic insert guard without persisting stale alias state.
+        Calls without a candidate bound retain the original catalog lookup."""
         if not trackIds:
             return {}
         conn = self._conn()
+        trackIds = set(trackIds)
         seeds = conn.execute(
             f"""
             SELECT t.id, t.name, t.duration_ms, t.isrc,
@@ -321,6 +313,22 @@ class PlayQueries:
             """,
             list(trackIds),
         ).fetchall()
+        seed_by_id = {row["id"]: row for row in seeds}
+        for pending in pendingTracks or ():
+            pending_id = pending.get("id") or pending.get("trackId")
+            pending_row = {
+                "id": pending_id,
+                "name": pending.get("name"),
+                "duration_ms": pending.get("durationMs", pending.get("duration_ms")),
+                "isrc": pending.get("isrc") or "",
+                "group_id": pending_id,
+                "primary_artist": pending.get("primaryArtistId", pending.get("primary_artist_id")),
+            }
+            if pending_id and pending_id not in seed_by_id:
+                # Raw Web API metadata cannot assert a canonical/merge group.
+                # It may still supply the two independent identity fallbacks.
+                seed_by_id[pending_id] = pending_row
+        seeds = list(seed_by_id.values())
         if not seeds:
             return {}
 
@@ -334,14 +342,25 @@ class PlayQueries:
         groupIds = {row["group_id"] for row in seeds}
         isrcs = {row["isrc"] for row in seeds if row["isrc"]}
         names = {row["name"] for row in seeds if recordingKey(row)}
-        clauses = [f"COALESCE(t.canonical_id, t.id) IN ({','.join('?' for _ in groupIds)})"]
-        params = list(groupIds)
+        proofClauses = [f"COALESCE(t.canonical_id, t.id) IN ({','.join('?' for _ in groupIds)})"]
+        proofParams = list(groupIds)
         if isrcs:
-            clauses.append(f"(t.isrc <> '' AND t.isrc IN ({','.join('?' for _ in isrcs)}))")
-            params += list(isrcs)
-        if names:
-            clauses.append(f"t.name IN ({','.join('?' for _ in names)})")
-            params += list(names)
+            proofClauses.append(f"(t.isrc <> '' AND t.isrc IN ({','.join('?' for _ in isrcs)}))")
+            proofParams += list(isrcs)
+        if names and includeRecordingKey:
+            proofClauses.append(f"t.name IN ({','.join('?' for _ in names)})")
+            proofParams += list(names)
+        if candidateIds is not None:
+            candidateIds = set(candidateIds)
+            if not candidateIds:
+                return {row["id"]: set() for row in seeds}
+            clauses = [
+                f"t.id IN ({','.join('?' for _ in candidateIds)}) AND ({' OR '.join(proofClauses)})"
+            ]
+            params = list(candidateIds) + proofParams
+        else:
+            clauses = proofClauses
+            params = proofParams
         candidates = conn.execute(
             f"""
             SELECT t.id, t.name, t.duration_ms, t.isrc,
@@ -356,20 +375,24 @@ class PlayQueries:
         byGroup: dict = {}
         byIsrc: dict = {}
         byRecording: dict = {}
-        for row in candidates:
+        # Include the requested seed identities as well as the bounded SQL
+        # candidates. This preserves both directions of a decided merge even
+        # when the page's release has no physical row in the time window.
+        # Uncatalogued seeds have only their own ID as group_id; raw input
+        # cannot create a merge relation.
+        for row in [*candidates, *seeds]:
             byGroup.setdefault(row["group_id"], set()).add(row["id"])
             if row["isrc"]:
                 byIsrc.setdefault(row["isrc"], set()).add(row["id"])
-            key = recordingKey(row)
+            key = recordingKey(row) if includeRecordingKey else None
             if key:
                 byRecording.setdefault(key, set()).add(row["id"])
-
         result = {}
         for row in seeds:
             same = set(byGroup.get(row["group_id"], ()))
             if row["isrc"]:
                 same |= byIsrc.get(row["isrc"], set())
-            key = recordingKey(row)
+            key = recordingKey(row) if includeRecordingKey else None
             if key:
                 same |= byRecording.get(key, set())
             same.discard(row["id"])
@@ -384,9 +407,9 @@ class PlayQueries:
         carries the behavioral columns so the import can enrich NULLs in place."""
         conn = self._conn()
         behavioralSelect = ", ".join(BEHAVIORAL_COLUMNS)
-        # is_skip=0: only real plays are correction/dedup candidates (see hasPlayNearTime).
+        # is_skip=0: only real plays are correction/dedup candidates.
         rows = conn.execute(
-            f"SELECT id, played_at, time_played, is_skip, {behavioralSelect} FROM plays "
+            f"SELECT id, played_at, time_played, is_skip, played_from, {behavioralSelect} FROM plays "
             f"WHERE username=? AND track_id=? AND played_at BETWEEN ? AND ? AND is_skip=0",
             (username, trackId, playedAt - toleranceSeconds, playedAt + toleranceSeconds),
         ).fetchall()
@@ -399,15 +422,16 @@ class PlayQueries:
 
         Deliberately scoped to is_skip=1 in both directions: a skip must never
         dedup against, claim or correct a real play row, and a real play must
-        never dedup against a skip (see hasPlayNearTime). This exists because
+        never dedup against a skip. This exists because
         the live listener and a history import both record the same physical
         sub-threshold event, and their played_at can differ by seconds
         (Spotify's documented start-vs-end ambiguity), so plays' UNIQUE
         constraint - which needs an exact timestamp match - let one skip land
         twice and inflate skip counts."""
         conn = self._conn()
+        behavioralSelect = ", ".join(BEHAVIORAL_COLUMNS)
         rows = conn.execute(
-            "SELECT id, played_at FROM plays "
+            f"SELECT id, played_at, played_from, {behavioralSelect} FROM plays "
             "WHERE username=? AND track_id=? AND played_at BETWEEN ? AND ? AND is_skip=1",
             (username, trackId, playedAt - toleranceSeconds, playedAt + toleranceSeconds),
         ).fetchall()
@@ -667,43 +691,15 @@ class PlayQueries:
         record one listen under two ids. The reconciler groups on these rather
         than on track_id (see Database._groupPlaysByIdentity).
 
-        createdAt carries the row's created_at for LISTENER rows only - their
-        insert happens at the track-change moment, so it is the observed end
-        of the play, pauses included; the reconciler's end-time pairing needs
-        it to recognise a pause-stretched backfill copy. Other sources'
-        created_at (an import/poll moment) comes through as None. Listener
-        rows are also matched into the window by that created_at: a paused
-        play can start before the window the API items span while still
-        ending inside it.
+        createdAt is retained for listener rows as observed-end evidence.
+        Including those rows in the window does not prove duplication: the
+        reconciler now requires direct timestamp proximity and one-to-one
+        assignments over the complete page, never an end-only match.
 
-        is_skip=0 is DELIBERATE, and it is not the same omission the insert
-        guard had. hasPlayNearTime was blind to skips and re-added a skipped
-        listen as a full play, which is why it grew a third arm; this reads as
-        the matching gap and is not one, because the two do different things.
-        hasPlayNearTime declines to INSERT - free, reversible, and wrong only
-        by leaving a play out that the next poll re-offers. This DELETES, on
-        the live history, with nothing to recover from.
-
-        The tolerances are what make reusing this path wrong rather than
-        merely unnecessary. Skips pair on BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS
-        (20s), which is tight on purpose: measured against live data the
-        provable duplicates sat 3-15s from their skip while the ambiguous ones
-        sat 95s and 291s away, where "skip, then a genuine replay the listener
-        missed" is the likelier reading. The reconciler's own windows are tuned
-        for pairing real plays - 5s proximity, and an end-time arm reaching 10s
-        off a listener created_at that a mid-track pause can stretch by minutes
-        - and its mixed-sources rule then deletes the backfill row from any
-        cluster holding a sibling from another source. Letting skips into these
-        clusters would delete genuine replays.
-
-        So the skip case is OWNED by hasPlayNearTime's skip arm, which stops
-        the duplicate being written at all, and by tools/sweep_backfill_duplicates.py
-        for anything that landed before that arm existed (its own
-        --skip-tolerance, same constant). Reaching it from here would need a
-        separate arm in _isSameListen keyed to the skip tolerance, not a
-        widening of this filter. The ordering the gap would require is also the
-        unnatural one: the listener writes its skip at the track-change moment
-        while the backfill only sees a play after it has ended."""
+        is_skip=0 is deliberate. Insert guards may match a skip on a tight
+        tolerance, but a skip cannot authorize deletion of a nearby full
+        play from stored history. All sources of real plays remain visible
+        so reconciliation can preserve primary rows and all-API groups."""
         conn = self._conn()
         #< the join is enrichment, not a filter: every WHERE clause still reads
         #  a plays column, so this stays the same narrow indexed range scan and
@@ -712,7 +708,7 @@ class PlayQueries:
         #  somehow missing still comes through with a null identity rather than
         #  vanishing from a pass that DELETES what it does see.
         rows = conn.execute(
-            "SELECT p.track_id, p.played_at, p.time_played, p.created_reason, "
+            "SELECT p.id AS row_id, p.track_id, p.played_at, p.time_played, p.created_reason, p.is_skip, "
             "t.canonical_id, t.isrc, "
             "CASE WHEN p.created_reason LIKE 'listener_play%' THEN p.created_at ELSE NULL END AS listener_created_at "
             "FROM plays p LEFT JOIN tracks t ON t.id = p.track_id "
@@ -722,6 +718,7 @@ class PlayQueries:
         ).fetchall()
         return [
             {
+                "rowId": r["row_id"],
                 "id": r["track_id"],
                 "playedAt": r["played_at"],
                 "timePlayed": r["time_played"],
@@ -731,6 +728,7 @@ class PlayQueries:
                 #  identity grouping (Database._groupPlaysByIdentity)
                 "canonicalId": r["canonical_id"],
                 "isrc": r["isrc"],
+                "isSkip": r["is_skip"],
             }
             for r in rows
         ]

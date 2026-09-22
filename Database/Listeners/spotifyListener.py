@@ -16,6 +16,10 @@ from Database.rate_limit import (
     SPOTIFY_LIMITER, SPOTIFY_RATE_LIMIT_BACKOFF_SECONDS, SpotifyLocallyRateLimitedError,
     retryAfterSeconds,
 )
+from Database.backfill_matching import (
+    missing_backfill_items,
+    cache_backfill_evidence,
+)
 from Database.utils import parseError, timeToInt, flaskDebugEnabled, truncateForLog
 #< the connect-state string-number coercion, shared with the poll/push tracking
 #  and Database.getNowPlaying rather than copied a third time; recentlyPlayed
@@ -270,21 +274,6 @@ SPOTIFY_TRACK_URI_PREFIX = "spotify:track:"  #< connect-state prev_tracks mixes 
                                               #  with this prefix are playable tracks
 
 WEB_API_POLL_INTERVAL_SECONDS = 15 * 60  #< Query Web API recently-played backfill every 15 minutes
-
-WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS = 2  #< max gap between a Web API item's played_at (interpreted as
-                                               #  either a start or end time - see the comment at its use site)
-                                               #  and an already-recorded play's timestamp for them to count as
-                                               #  the same play rather than a genuinely missing one
-
-WEB_API_BACKFILL_END_TIME_DEDUP_TOLERANCE_SECONDS = 10  #< max gap between a Web API item's played_at and a
-                                                         #  recorded listener row's created_at (its observed play
-                                                         #  end - the listener inserts at the track-change moment)
-                                                         #  for them to count as the same play. Wider than the 2s
-                                                         #  tolerance above because insert lag sits between the
-                                                         #  two stamps (~1s live, a few seconds in poll mode), but
-                                                         #  deliberately still a point match - a recorded end
-                                                         #  minutes away is evidence of a DIFFERENT listen, and
-                                                         #  suppressing on it would lose that play for good
 
 # Sentinel returned by _fetch_recently_played_from_web_api to distinguish a
 # scope-related rejection (the stored refresh token was never granted
@@ -745,7 +734,7 @@ def _suppress_signal_in_thread():
 class Listener:  #< one user's live playback watcher: cookie session + Web API backfill
     def __init__(self, cookiesFile, refreshInterval=None, email=None, get_credentials=None,
                  get_backfill_enabled=None, on_scope_status_change=None, user=None,
-                 get_recorded_track_ids=None, get_recorded_play_times=None):
+                 get_recorded_track_ids=None, process_backfill_page=None):
         # None (every production caller) means "the shared cadence, jittered
         # for this listener" - see _pollIntervalWithJitter. An explicit value
         # is honoured verbatim so a test can pin it.
@@ -780,10 +769,9 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
         # recent play for; see _dropUrisAlreadyInDatabase. None means the
         # missed-track cross-check judges on its in-memory cache alone.
         self.get_recorded_track_ids = get_recorded_track_ids
-        # Optional callback(startTs, endTs) -> the played_at values this user
-        # already has in that window; see _recordedPlayTimesFromDatabase. None
-        # means the Web API backfill judges on its in-memory caches alone.
-        self.get_recorded_play_times = get_recorded_play_times
+        # Optional database-owned callback(items) for a complete Web API page.
+        # None means the Web API backfill judges on its in-memory caches alone.
+        self.process_backfill_page = process_backfill_page
         self._consecutiveScopeErrors = 0  #< see SCOPE_ERROR_CONFIRM_THRESHOLD
         self._lastWebApiPollTime = None  #< None means "never polled yet" - forces an immediate first poll
         with _suppress_signal_in_thread():
@@ -1630,55 +1618,6 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                     logger.error("Error in listener: %s", parseError(e))
                     self._stop_event.wait(30)
 
-    def _recordedPlayTimesFromDatabase(self, items: list) -> dict:
-        """{track_id: {(played_at, listener_created_at), ...}} for the window
-        `items` spans - the half of the backfill's dedup set that survives a
-        listener rebuild. The second tuple element is the recorded row's
-        created_at when the row came from the live listener (its observed play
-        end - see the dedup comment in _checkWebApiBackfill), None otherwise.
-
-        Keyed by track because this window is wide (the whole API page plus a
-        track length: hours, typically hundreds of rows, and skip bursts sitting
-        seconds apart). A flat set of timestamps let any recorded row answer for
-        any candidate, and the end-time interpretation below made that
-        systematic rather than accidental - see the dedup comment in
-        _checkWebApiBackfill.
-
-        Kept as a callback rather than a repo handle so the listener still knows
-        nothing about the database (same contract as get_credentials /
-        get_recorded_track_ids). No callback, no usable timestamps, or a failing
-        lookup return no confirmations: announcing an
-        already-recorded play is harmless (appendTrackData's guard drops it),
-        whereas suppressing a genuinely missing one would lose it for good."""
-        if not self.get_recorded_play_times or not items:
-            return {}
-
-        timestamps = [ts for ts in (timeToInt(item.get("played_at")) for item in items) if ts > 0]
-        if not timestamps:
-            return {}
-
-        # played_at may be the END of a play (see the dedup comment below), in
-        # which case the recorded row sits up to one track-length earlier - so
-        # the window has to reach back that far to find it. A PAUSED play's
-        # start sits even earlier (duration + pause), which no fixed reach-back
-        # can cover - the query closes that gap itself by also matching
-        # listener rows into the window by their created_at.
-        longestTrackSeconds = max(
-            ((item.get("track") or {}).get("duration_ms", 0) or 0) // 1000 for item in items
-        )
-        startTs = min(timestamps) - longestTrackSeconds - WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-        endTs = max(timestamps) + WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-        try:
-            recorded: dict = {}
-            for trackId, playedAt, listenerCreatedAt in self.get_recorded_play_times(startTs, endTs):
-                recorded.setdefault(trackId, set()).add(
-                    (float(playedAt), float(listenerCreatedAt) if listenerCreatedAt is not None else None))
-            return recorded
-        except Exception as e:
-            logger.debug("Backfill dedup database lookup failed, conservatively reoffering plays: %s",
-                         parseError(e))
-            return {}
-
     def _checkWebApiBackfill(self, callback, onWebApiSnapshot=None) -> None:
         if not self.get_credentials:
             return
@@ -1816,130 +1755,40 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
             if not items:
                 return
 
-            # Production supplies the database confirmation callback. Both
-            # caches contain observations/offers, including failed inserts, so
-            # neither can acknowledge persistence. A failed lookup reoffers
-            # conservatively; the database's insert guard still deduplicates.
-            # Keep cache-only behavior for embedders without a provider.
-            recorded_timestamps: dict = {}
-            if not self.get_recorded_play_times:
-                for item in self.recentlyPlayed_Z1 + self.webApiRecentlyPlayed_Z1:
-                    trackId = _itemTrackId(item)
-                    if not item.get("played_at") or not trackId:
-                        continue
-                    recorded_timestamps.setdefault(trackId, set()).add((timeToInt(item.get("played_at")), None))
-            # Both caches above live and die with this listener object, and a
-            # listener is rebuilt on every stale-feed reconnect (1,568 times in
-            # 11 days for 3 users) - webApiRecentlyPlayed_Z1 starts empty, and
-            # so does recentlyPlayed_Z1, since the client's deque only fills
-            # from track changes its websocket observes after start. So the
-            # first poll after every rebuild saw the whole page as missing:
-            # 74,579 plays announced over those 11 days, of which 201 were
-            # genuinely new - the rest were dropped one at a time by
-            # appendTrackData's own duplicate guard, long after the log had
-            # claimed them. The database is what tells a real gap from a cold
-            # cache.
-            for trackId, playedAts in self._recordedPlayTimesFromDatabase(items).items():
-                recorded_timestamps.setdefault(trackId, set()).update(playedAts)
-
-            # Built directly from `items` in one pass so each missed item stays
-            # tied to its OWN source API item's played_at - no post-hoc
-            # re-matching by track ID, which breaks when the same track
-            # appears more than once in `items` (all copies would resolve to
-            # whichever occurrence next() finds first).
-            missed_items = []
-
-            for item in items:
-                played_at_str = item.get("played_at")
-                track = item.get("track")
-                track_id = track.get("id") if track else None
-                if not played_at_str or not track_id:
-                    continue
-
-                timestamp = timeToInt(played_at_str)
-                # `or 0` (not get's default): an item's track can carry
-                # "duration_ms": None (present but null), where dict.get
-                # returns None rather than falling back to 0, and the
-                # division below would crash and abort the whole poll.
-                duration_ms = track.get("duration_ms", 0) or 0
-                duration_s = duration_ms // 1000
-
-                # Spotify's Web API documents played_at only as "the date and
-                # time the track was played" - it does NOT specify start vs
-                # end, and Spotify's own developer community has confirmed the
-                # same endpoint can report either for different entries (see
-                # spotify/web-api#1083). So this can't assume one direction:
-                # check both interpretations - timestamp itself already being
-                # a start time, or timestamp being an end time duration_s
-                # seconds after the true start - before deciding this play is
-                # genuinely missing.
-                #
-                # Only THIS track's recorded times can answer for it. A flat set
-                # of timestamps meant any recorded play within the tolerance
-                # did, and the second arm made that systematic: under gapless
-                # playback a missing track's derived start equals the recorded
-                # END of the track before it - i.e. the one recorded neighbour a
-                # real gap always has beside it. The suppressed play was then
-                # lost for good, since the next poll's page collides identically
-                # and nothing else retries it.
-                #
-                # The third arm covers what the second cannot: a mid-track
-                # PAUSE stretches start-to-end beyond duration_s by an
-                # unbounded amount (2026-08-04: a ~3min pause put played_at
-                # 474s after a 287s track's recorded start, and the same
-                # listen was recorded twice). A listener row's created_at is
-                # its OBSERVED end - the row is inserted at the track-change
-                # moment, pauses included - so the end-time interpretation is
-                # matched against that stamp directly instead of deriving a
-                # start that assumes uninterrupted playback.
-                recordedTimes = recorded_timestamps.get(track_id, ())
-                matched_by_played_at = any(
-                    abs(timestamp - recorded_t) <= WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-                    or abs(timestamp - duration_s - recorded_t) <= WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-                    for recorded_t, _recorded_end in recordedTimes
-                )
-                matched_by_end = not matched_by_played_at and any(
-                    recorded_end is not None
-                    and abs(timestamp - recorded_end) <= WEB_API_BACKFILL_END_TIME_DEDUP_TOLERANCE_SECONDS
-                    for _recorded_t, recorded_end in recordedTimes
-                )
-                if matched_by_end and _flaskDebugEnabled():
-                    # Live validation for the 2026-08-04 pause-duplicate fix:
-                    # only the cases the two played_at arms would have MISSED
-                    # are interesting - remove once a few days of logs confirm
-                    # the arm fires on real pauses and nothing else.
-                    logger.info(
-                        "Backfill item for track %s (played_at=%s) suppressed by the end-time arm alone "
-                        "(pause-stretched play already recorded) for user %s",
-                        track_id, played_at_str, self.logUser,
-                    )
-                is_recorded = matched_by_played_at or matched_by_end
-                if not is_recorded:
-                    context = item.get("context") or {}
-
-                    # Store played_at as given, untouched - see comment above
-                    # on why we no longer subtract duration_s here.
-                    missed_items.append({
-                        "track": track,
-                        "played_at": played_at_str,
-                        "ms_played": duration_ms,
-                        "context": context
-                    })
-
-            if missed_items:
-                # Routine progress, like the two lines above: the plays this
-                # announces are written to the database with their
-                # web_api_backfill source, so the record survives without it.
-                if _flaskDebugEnabled():
-                    logger.info("Backfilling %d plays from Web API recently-played history for user %s",
-                                len(missed_items), self.logUser)
-                # Mark these as backfilled so the database can record the source
-                for missed_item in missed_items:
-                    missed_item["_source"] = WEB_API_BACKFILL_SOURCE
-                # Pass them to callback (it expects a list, newest plays last)
-                # Web API returns newest plays first, so reverse to maintain cron order
-                missed_items.reverse()
-                callback(missed_items)
+            if getattr(self, "process_backfill_page", None) is not None:
+                # The database owns evidence lookup and page filtering. The
+                # Listener passes the fetched page unchanged and retains no
+                # database rows or claims.
+                self.process_backfill_page(items)
+            else:
+                # Keep cache-only behavior for embedders without a provider.
+                evidence = cache_backfill_evidence(self.recentlyPlayed_Z1, self.webApiRecentlyPlayed_Z1)
+                # Both caches above live and die with this listener object, and a
+                # listener is rebuilt on every stale-feed reconnect (1,568 times in
+                # 11 days for 3 users) - webApiRecentlyPlayed_Z1 starts empty, and
+                # so does recentlyPlayed_Z1, since the client's deque only fills
+                # from track changes its websocket observes after start. So the
+                # first poll after every rebuild saw the whole page as missing:
+                # 74,579 plays announced over those 11 days, of which 201 were
+                # genuinely new - the rest were dropped one at a time by
+                # appendTrackData's own duplicate guard, long after the log had
+                # claimed them. The database is what tells a real gap from a cold
+                # cache.
+                missed_items = missing_backfill_items(items, evidence)
+                if missed_items:
+                    # Routine progress, like the two lines above: the plays this
+                    # announces are written to the database with their
+                    # web_api_backfill source, so the record survives without it.
+                    if _flaskDebugEnabled():
+                        logger.info("Backfilling %d plays from Web API recently-played history for user %s",
+                                    len(missed_items), self.logUser)
+                    # Mark these as backfilled so the database can record the source
+                    for missed_item in missed_items:
+                        missed_item["_source"] = WEB_API_BACKFILL_SOURCE
+                    # Pass them to callback (it expects a list, newest plays last)
+                    # Keep delivery deterministic even if a caller reverses a page.
+                    missed_items.sort(key=lambda item: (timeToInt(item["played_at"]), item["track"]["id"]))
+                    callback(missed_items)
 
             # Replace webApiRecentlyPlayed_Z1 (NOT recentlyPlayed_Z1 - that
             # cache belongs to the live listener) with this batch so it holds

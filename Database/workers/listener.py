@@ -17,12 +17,55 @@ from Database.Spotify.recentlyPlayed import _connectStateInt
 #< a direct import, unlike _dbmod above: Database.utils takes part in no cycle
 #  (see the note on its TRUTHY_ENV_VALUES re-export)
 from Database.utils import flaskDebugEnabled
+from Database.backfill_matching import (
+    backfill_page_window,
+    missing_backfill_items,
+    BackfillPage,
+)
+from Database.db import WEB_API_BACKFILL_SOURCE
 
 
 class ListenerMixin:
     """Spotify listener lifecycle: connect/reconnect, live play ingestion, web-API reconcile, now-playing, and overall stop coordination."""
 
-    def _addToDatabaseFromListener(self, data) -> None:
+    def process_backfill_page(self, items: list) -> None:
+        """Filter and enqueue one complete Web API recently-played page."""
+        if not items:
+            return
+
+        page = BackfillPage(items)
+        evidence = []
+        window = backfill_page_window(items)
+        if window is not None:
+            try:
+                evidence = self.repo.getTrackPlayTimesInRange(self.user, *window, page=page)
+            except Exception as e:
+                # A failed lookup answered nothing. Reoffer conservatively and
+                # let the insert guard settle already-recorded rows.
+                _dbmod.logger.debug(
+                    "Backfill dedup database lookup failed, conservatively reoffering plays: %s",
+                    _dbmod.parseError(e),
+                )
+
+        missed_items = missing_backfill_items(items, evidence, page=page)
+        if not missed_items:
+            return
+
+        if flaskDebugEnabled():
+            _dbmod.logger.info(
+                "Backfilling %d plays from Web API recently-played history for user %s",
+                len(missed_items),
+                self.user,
+            )
+        # Mark these as backfilled so the database can record the source.
+        for missed_item in missed_items:
+            missed_item["_source"] = WEB_API_BACKFILL_SOURCE
+        # Page order can vary on retries. Stable oldest-first delivery follows
+        # the exact-match reservations established across the complete page.
+        missed_items.sort(key=lambda item: (_dbmod.timeToInt(item["played_at"]), item["track"]["id"]))
+        self._addToDatabaseFromListener(missed_items, backfillPage=page)
+
+    def _addToDatabaseFromListener(self, data, *, backfillPage: BackfillPage | None = None) -> None:
         """Record plays from the listener. Includes validation to detect cross-user
         data contamination (a bug that previously caused plays from one user to be
         recorded under another user's account)."""
@@ -96,7 +139,9 @@ class ListenerMixin:
                 # appendTrackData records every event into plays, with is_skip
                 # materialized from the current skip threshold.
                 try:
-                    self.appendTrackData(timestamp, track, msPlayed, context=item.get("context", None), source=source)
+                    kwargs = {"backfillPage": backfillPage} if backfillPage is not None else {}
+                    self.appendTrackData(timestamp, track, msPlayed, context=item.get("context", None),
+                                         source=source, **kwargs)
                 except Exception as e:
                     _dbmod.logger.error("Error adding track %s from listener: %s", track.get("id"), _dbmod.parseError(e))
                     had_errors = True
@@ -301,7 +346,7 @@ class ListenerMixin:
                 get_backfill_enabled=self.repo.isSpotifyApiBackfillEnabled,
                 on_scope_status_change=self.setSpotifyNeedsReauth,
                 get_recorded_track_ids=self.getRecentlyRecordedTrackIds,
-                get_recorded_play_times=self.getRecordedPlayTimes))
+                process_backfill_page=self.process_backfill_page))
             if self._stopRequested():
                 # stop() gave up waiting on this lock while the (slow,
                 # uninterruptible) Listener login above was in flight - tear
@@ -378,38 +423,6 @@ class ListenerMixin:
         }
 
 
-    def _isSameListen(self, anchor: dict, other: dict) -> bool:
-        """Do these two same-track rows describe one physical listen?
-
-        Two ways to prove it:
-        - proximity: their played_at stamps sit within
-          DUPLICATE_RECORDING_TOLERANCE_SECONDS of each other, or
-        - end-time pairing: a backfill row's played_at (Spotify's end-time
-          reading of the play) sits within
-          BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS of a LISTENER row's
-          created_at - the observed end of that play, pauses included, since
-          the listener inserts its row at the track-change moment. This is
-          what recognises a pause-stretched copy: on 2026-08-04 a ~3min
-          mid-track pause put the backfill copy's played_at 474s after the
-          listener row's start (a 287s track), outside every duration-based
-          window. Only a listener row's created_at qualifies
-          (getPlaysWithSourceInRange returns None for other sources), and a
-          backfill row never anchors the pairing - two backfill rows prove
-          nothing about which is the copy."""
-        if abs(anchor["playedAt"] - other["playedAt"]) <= self.DUPLICATE_RECORDING_TOLERANCE_SECONDS:
-            return True
-
-        def isBackfill(play: dict) -> bool:
-            return (play.get("createdReason") or "").startswith(self.WEB_API_BACKFILL_SOURCE)
-
-        for backfill, primary in ((anchor, other), (other, anchor)):
-            if (isBackfill(backfill) and not isBackfill(primary)
-                    and primary.get("createdAt") is not None
-                    and abs(backfill["playedAt"] - primary["createdAt"])
-                        <= self.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS):
-                return True
-        return False
-
     @staticmethod
     def _groupPlaysByIdentity(plays: list[dict]) -> dict[str, list[dict]]:
         """The window's plays bucketed by RECORDING, not by release id.
@@ -466,45 +479,21 @@ class ListenerMixin:
         return grouped
 
     def _reconcileWithWebApiHistory(self, apiItems: list[dict]) -> None:
-        """Repair fallback metadata, then remove PROVABLE duplicate local plays:
-        Web API backfill copies of a play another source already recorded.
-        Both the live listener and the
-        backfill can capture the same instant with different timestamps
-        (Spotify's played_at field is documented as inconsistent about whether
-        it reports a track's start or end time, per spotify/web-api#1083 - see
-        _checkWebApiBackfill for how that ambiguity is handled on the ingest
-        side), leaving two rows for the same track seconds apart - or, when a
-        mid-track pause stretched the play, minutes apart.
+        """Repair metadata and remove only API copies assigned to a primary play.
 
-        Deletion requires BOTH proofs:
-        - same listen: a sibling row for the SAME RECORDING within
-          DUPLICATE_RECORDING_TOLERANCE_SECONDS, or a listener row whose
-          created_at (observed play end) sits within
-          BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS of the backfill row's
-          played_at (see _isSameListen). Same recording, not same release id -
-          the two sources name it differently (see _groupPlaysByIdentity), AND
-        - mixed sources: the cluster holds a backfill row plus at least one
-          row from another source (listener / import / legacy-NULL).
-        Only the backfill copies are deleted - backfill is the only secondary
-        recorder, so rows from primary sources are never deleted. Proximity
-        alone proves nothing: real exports genuinely contain a short skip
-        followed by a restart of the same track seconds later, and such
-        same-source clusters must survive untouched.
+        One primary row can explain one distinct API timestamp. Reserve exact
+        matches over the complete page before considering clock proximity, so
+        the start of one listen cannot also erase a later repeat. Only decided
+        merge groups and ISRCs identify aliases here; the stricter import-time
+        title/artist/duration heuristic still cannot authorize deletion.
 
-        Deliberately never deletes a play just because it's absent from the
-        Web API response: Spotify's recently-played endpoint isn't a complete
-        log (limited item count, its own internal play-duration threshold,
-        track relinking can return a different ID for the same song), so a
-        lone play with no sibling for its recording is always left alone - only a
-        genuine nearby cross-source duplicate counts as proof.
-
-        Only runs for users with working Spotify Developer API credentials
-        configured (invoked from Listener._checkWebApiBackfill's
-        onWebApiSnapshot callback).
-
-        Bounded to the [oldest, newest] played_at span the API response covers,
-        widened at each end by the width of one duplicate pair (see the padding
-        below) - so it can't touch older history."""
+        A listener's observed end once deleted pause-stretched API copies, but
+        an incomplete page cannot distinguish that copy from a new repeat at
+        the same timestamp. Keep that ambiguous row rather than erase history.
+        All-API groups and primary rows remain untouched, and absence from the
+        finite API page cannot authorize deletion. No page state persists
+        between callbacks or enters Listener.
+        """
         if not apiItems:
             return
 
@@ -512,7 +501,7 @@ class ListenerMixin:
         # full snapshot still supplies their metadata, without changing any
         # original listening facts. A repair failure must not block cleanup.
         try:
-            self._repairFallbackTrackMetadata([item.get("track") for item in apiItems])
+            self._repairFallbackTrackMetadata([item.get("track") for item in apiItems], source="history")
         except Exception as error:
             _dbmod.logger.warning("Web API metadata repair failed for user %s: %s",
                                   self.user, _dbmod.parseError(error))
@@ -544,79 +533,80 @@ class ListenerMixin:
         windowStart = min(apiTimes) - windowPadding
         windowEnd = max(apiTimes) + windowPadding
 
-        localPlays = self.repo.getPlaysWithSourceInRange(self.user, windowStart, windowEnd)
-        if not localPlays:
-            return
-
-        playsByRecording = self._groupPlaysByIdentity(localPlays)
-
-        toDelete: list[dict] = []
-        for _identity, group in playsByRecording.items():
-            if len(group) < 2:
-                continue  # no sibling for this recording - nothing proves duplication, never delete
-
-            # Cluster same-recording plays that are within tolerance of a shared
-            # anchor - each cluster of 2+ might be the same real listen
-            # recorded more than once. Sorted chronologically first (the DB
-            # query has no ORDER BY) so the anchor - and therefore which
-            # plays end up in which cluster - is deterministic and doesn't
-            # depend on the arbitrary order SQLite happens to return rows in.
-            remaining = sorted(group, key=lambda play: play["playedAt"])
-            while remaining:
-                anchor = remaining.pop(0)
-                cluster = [anchor]
-                stillRemaining = []
-                for other in remaining:
-                    if self._isSameListen(anchor, other):
-                        cluster.append(other)
-                    else:
-                        stillRemaining.append(other)
-                remaining = stillRemaining
-
-                if len(cluster) < 2:
-                    continue  # no close-in-time sibling for this one either
-
-                backfillCopies = [
-                    play for play in cluster
-                    if (play.get("createdReason") or "").startswith(self.WEB_API_BACKFILL_SOURCE)
-                ]
-                if not backfillCopies or len(backfillCopies) == len(cluster):
-                    # Same-source cluster: without a second source there is no
-                    # proof of double-recording (could be a genuine skip-then-
-                    # restart) - never guess, never delete.
-                    continue
-
-                # Collect only - the deletes (and their single commit) run below
-                # in one guarded block, so a mid-way failure rolls back cleanly.
-                toDelete.extend(backfillCopies)
-
-        if not toDelete:
-            return
-        # deletePlay doesn't commit on its own, so a failure partway through
-        # (e.g. a locked db) must roll back what was staged rather than leave it
-        # for an unrelated later commit/rollback to decide - the duplicates
-        # re-derive from the next snapshot anyway.
         try:
-            deletedCount = 0
-            for play in toDelete:
-                if self.repo.deletePlay(self.user, play["id"], play["playedAt"]):
-                    deletedCount += 1
-                    _dbmod.logger.debug(
-                        "Reconciliation deleted duplicate play: user=%s track=%s time=%d",
-                        self.user, play["id"], play["playedAt"]
-                    )
-            if deletedCount:
-                self.repo.commit()
-                _dbmod.logger.info(
-                    "Web API reconciliation: removed %d duplicate play(s) for user %s",
-                    deletedCount, self.user,
-                )
+            # Read the evidence and delete under one reservation: a concurrent
+            # writer cannot change a row's identity/source between these steps.
+            conn = self._beginMetadataWrite()
+            with conn:
+                localPlays = self.repo.getPlaysWithSourceInRange(self.user, windowStart, windowEnd)
+                if not localPlays:
+                    return
+
+                apiPage = BackfillPage(apiItems)
+                aliases = self.repo._sameRecordingTrackIds(
+                    apiPage.trackIds, {play["id"] for play in localPlays},
+                    pendingTracks=apiPage.pendingTracks,
+                    includeRecordingKey=False)
+                toDelete = []
+                for group in self._groupPlaysByIdentity(localPlays).values():
+                    primary = [play for play in group if not
+                               (play.get("createdReason") or "").startswith(self.WEB_API_BACKFILL_SOURCE)]
+                    backfill = [play for play in group if
+                                (play.get("createdReason") or "").startswith(self.WEB_API_BACKFILL_SOURCE)]
+                    if not primary or not backfill:
+                        continue
+                    trackIds = {play["id"] for play in group}
+                    # Include page events with no API row: the prefilter may
+                    # already have confirmed them against a primary source.
+                    groupItems = [item for item in apiItems if
+                                  (item.get("track") or {}).get("id") in trackIds
+                                  or trackIds.intersection(aliases.get((item.get("track") or {}).get("id"), ()))]
+                    currentTimes = {_dbmod.timeToInt(item["played_at"])
+                                    for item in groupItems if item.get("played_at")}
+                    groupItems += [{"track": {"id": play["id"]}, "played_at": play["playedAt"]}
+                                   for play in backfill]
+                    page = BackfillPage(groupItems)
+                    groupAliases = trackIds | {item["track"]["id"] for item in groupItems}
+                    evidence = [
+                        {"rowId": play["rowId"],
+                         "trackId": play["id"], "aliases": groupAliases,
+                         "playedAt": play["playedAt"], "listenerCreatedAt": play.get("createdAt"),
+                         "createdReason": play.get("createdReason"), "isSkip": False}
+                        for play in primary
+                    ]
+                    # Assign every page event, including those confirmed by
+                    # the prefilter and therefore absent as API rows. Otherwise
+                    # cleanup could reuse their primary row for a later repeat.
+                    events = sorted({(_dbmod.timeToInt(item["played_at"]), item["track"]["id"])
+                                     for item in groupItems if item.get("played_at")})
+                    matchedTimes = set()
+                    for timestamp, trackId in events:
+                        match = page.match(
+                            trackId, timestamp, evidence,
+                            toleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS,
+                            startToleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS)
+                        if match is not None and page.claim(match, timestamp):
+                            matchedTimes.add(timestamp)
+                    # Stored API events reserve primary rows too, but only
+                    # timestamps corroborated by this page authorize deletion.
+                    toDelete.extend(play for play in backfill
+                                    if play["playedAt"] in matchedTimes & currentTimes)
+
+                deletedCount = 0
+                for play in toDelete:
+                    if self.repo.deletePlay(self.user, play["id"], play["playedAt"]):
+                        deletedCount += 1
+                if deletedCount:
+                    self.repo.commit()
+                    _dbmod.logger.info(
+                        "Web API reconciliation: removed %d duplicate play(s) for user %s",
+                        deletedCount, self.user)
+                # The context also closes an empty/delete-no-op transaction.
         except Exception as e:
             self.repo.rollbackQuietly()
             _dbmod.logger.warning(
                 "Web API reconciliation aborted for user %s; staged deletes rolled back: %s",
-                self.user, _dbmod.parseError(e),
-            )
+                self.user, _dbmod.parseError(e))
 
     def getNowPlaying(self, includePlayedFlags: bool = True) -> dict | None:
         """What this user is playing right now, read from the listener's

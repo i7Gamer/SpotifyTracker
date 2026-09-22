@@ -37,7 +37,7 @@ from Database.repository import (
     GENRE_BACKFILL_RETRY_DAYS_KEY, BIO_BACKFILL_RETRY_DAYS_KEY,
     BACKFILL_RETRY_DAYS_MIN, BACKFILL_RETRY_DAYS_MAX,
 )
-from Database.backup import DEFAULT_BACKUP_INTERVAL_HOURS, DEFAULT_BACKUP_RETENTION_COUNT
+from Database.backup_settings import resolveBackupSettings
 from Database.rate_limit import SPOTIFY_LIMITER
 from Database.patches import totpAuthSnapshot
 from Database.utils import convertToDatetime, SECONDS_PER_DAY
@@ -454,6 +454,10 @@ def register(app, dashboard):
         current_tab = request.args.get("tab", "overview").lower()
         if current_tab not in ("overview", "workers", "settings"):
             current_tab = "overview"
+        backupSettings = resolveBackupSettings(
+            dashboard.repo.getAppSetting(BACKUP_INTERVAL_HOURS_KEY),
+            dashboard.repo.getAppSetting(BACKUP_RETENTION_COUNT_KEY),
+        )
 
         return render_template(
             "admin.html",
@@ -492,8 +496,8 @@ def register(app, dashboard):
             genre_backfill_retry_days=dashboard.repo.getGenreBackfillRetryDays(),
             bio_backfill_retry_days=dashboard.repo.getBioBackfillRetryDays(),
             backfill_retry_min=BACKFILL_RETRY_DAYS_MIN, backfill_retry_max=BACKFILL_RETRY_DAYS_MAX,
-            backup_interval_hours=dashboard.repo.getBackupIntervalHours(DEFAULT_BACKUP_INTERVAL_HOURS),
-            backup_retention_count=dashboard.repo.getBackupRetentionCount(DEFAULT_BACKUP_RETENTION_COUNT),
+            backup_interval_hours=backupSettings.intervalHours,
+            backup_retention_count=backupSettings.retentionCount,
             backup_interval_min=BACKUP_INTERVAL_HOURS_MIN, backup_interval_max=BACKUP_INTERVAL_HOURS_MAX,
             backup_retention_min=BACKUP_RETENTION_COUNT_MIN, backup_retention_max=BACKUP_RETENTION_COUNT_MAX,
             #< masked: the template only checks whether a password EXISTS, so

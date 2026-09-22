@@ -6,7 +6,7 @@ from Database.Listeners.spotifyListener import Listener
 from Database.Spotify.recentlyPlayed import _applyPushedState, _applyStateToTracking
 from Database.rate_limit import SpotifyLocallyRateLimitedError
 from Database.utils import timeToInt
-from test_api_backfill import _MONOTONIC_NOW
+from test_api_backfill import _MONOTONIC_NOW, _testPageProcessor
 from test_recently_played_loop import _pushLastPlayed, makePlayingState, pushedCluster
 from test_spotify_client_contract import buildClient
 
@@ -23,10 +23,11 @@ class TestDatabaseConfirmedBackfill(unittest.TestCase):
             self.listener = Listener(
                 "dummy", email="alice@example.test",
                 get_credentials=lambda: {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt"},
-                get_recorded_play_times=self.lookup)
+                process_backfill_page=None)
         self.items = [{"track": {"id": "track1", "duration_ms": TRACK_DURATION_MS}, "played_at": PLAYED_AT}]
 
     def _poll(self, callback):
+        self.listener.process_backfill_page = _testPageProcessor(self.lookup, callback)
         self.listener._lastWebApiPollTime = 0
         with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api",
                    return_value={"id": "alice", "email": "alice@example.test"}), \
@@ -58,6 +59,24 @@ class TestDatabaseConfirmedBackfill(unittest.TestCase):
         callback = MagicMock()
         self._poll(callback)
         callback.assert_called_once()
+
+    def test_processor_failure_does_not_fall_back_to_cache_acknowledgement(self):
+        self.listener.webApiRecentlyPlayed_Z1 = list(self.items)
+        self.listener.process_backfill_page = MagicMock(side_effect=RuntimeError("page failed"))
+        callback = MagicMock()
+
+        self.listener._lastWebApiPollTime = 0
+        with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api",
+                   return_value={"id": "alice", "email": "alice@example.test"}), \
+             patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api",
+                   return_value=self.items), \
+             patch("Database.Listeners.spotifyListener._refresh_spotify_access_token",
+                   return_value="token"), \
+             patch("Database.Listeners.spotifyListener.time.monotonic",
+                   return_value=_MONOTONIC_NOW):
+            self.listener._checkWebApiBackfill(callback)
+
+        callback.assert_not_called()
 
 
 class TestMetadataFailurePlayback(unittest.TestCase):

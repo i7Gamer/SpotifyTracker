@@ -144,7 +144,7 @@ def exportEntryToDict(entry) -> dict:
         "master_metadata_album_artist_name": artists[0].get("name") if artists else None,
         "master_metadata_album_album_name": album.get("name") if album else None,
         "spotify_track_uri": f"spotify:track:{entry['id']}",
-        "played_from": entry.get("playedFrom"),   #< extra field; the importer ignores it
+        "played_from": entry.get("playedFrom"),   #< app extension preserved by the importer
     }
     extras = entry.get("extras") or {}
     for column in EXPORT_TEXT_EXTRAS:

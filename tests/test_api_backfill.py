@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from Database.repository import Repository
+from Database.database import Database
 from Database.Listeners.spotifyListener import (
     Listener,
     WEB_API_POLL_INTERVAL_SECONDS,
@@ -38,22 +39,67 @@ def _isoFromTimestamp(ts):
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _richEvidence(rows):
+    """Convert only legacy synthetic triples into the C5b repository row shape."""
+    if rows is None:
+        return None
+    if all(isinstance(row, dict) for row in rows):
+        return rows
+    rich = []
+    for index, (trackId, playedAt, listenerCreatedAt) in enumerate(rows):
+        rich.append({
+            "rowId": f"synthetic-row-{index}",
+            "trackId": trackId,
+            "aliases": {trackId},
+            "playedAt": playedAt,
+            "listenerCreatedAt": listenerCreatedAt,
+            "createdReason": (
+                "listener_play (user: alice)" if listenerCreatedAt is not None else None
+            ),
+            "isSkip": 0,
+        })
+    return rich
+
+
+def _testPageProcessor(getRecordedPlayTimes, callback):
+    """Build the real Database page seam around a test-only evidence source."""
+    if getRecordedPlayTimes is None:
+        return None
+
+    db = Database.__new__(Database)
+    db.user = "alice"
+    db.repo = MagicMock()
+
+    def getRecorded(username, startTs, endTs, *, page=None):
+        if username != db.user:
+            raise AssertionError(f"unexpected evidence user: {username!r}")
+        del page
+        return _richEvidence(getRecordedPlayTimes(startTs, endTs))
+
+    db.repo.getTrackPlayTimesInRange.side_effect = getRecorded
+    def addToDatabase(data, **kwargs):
+        callback(data, **kwargs)
+
+    db._addToDatabaseFromListener = addToDatabase
+    return db.process_backfill_page
+
+
 def _runBackfillPoll(getRecordedPlayTimes, items):
-    """One _checkWebApiBackfill poll against `items`, with the dedup's database
-    lookup wired to `getRecordedPlayTimes`. Returns the announce callback, so a
-    test can assert what (if anything) was declared missing."""
+    """One _checkWebApiBackfill poll against `items`, with the moved page seam
+    wired to `getRecordedPlayTimes`. Returns the announce callback, so a test
+    can assert what (if anything) was declared missing."""
     getCredentials = MagicMock(return_value={
         "client_id": "cid", "client_secret": "cs", "refresh_token": "rt",
     })
+    callback = MagicMock()
     with patch("Database.Listeners.spotifyListener.Spotify") as mockSpotifyCls:
         mockSp = MagicMock()
         mockSp.current_user_recently_played.return_value = []
         mockSpotifyCls.return_value = mockSp
         listener = Listener("dummy_cookie", email="alice@example.com",
                             get_credentials=getCredentials,
-                            get_recorded_play_times=getRecordedPlayTimes)
+                            process_backfill_page=_testPageProcessor(getRecordedPlayTimes, callback))
     listener._lastWebApiPollTime = 0
-    callback = MagicMock()
     with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api",
                return_value={"id": "alice", "display_name": "Alice", "email": "alice@example.com"}):
         with patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api",
@@ -542,12 +588,10 @@ class ApiBackfillTestCase(unittest.TestCase):
 
     @patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api")
     @patch("Database.Listeners.spotifyListener._refresh_spotify_access_token")
-    def test_check_web_api_backfill_does_not_resurface_play_reported_as_end_time(self, mock_refresh, mock_fetch):
-        """Same as above, but this time the Web API reports played_at as an
-        END time (true_start + duration) for the SAME already-recorded play -
-        Spotify is documented as inconsistent about which it reports
-        (spotify/web-api#1083), so is_recorded must check both
-        interpretations, not just a direct match."""
+    def test_check_web_api_backfill_reoffers_play_reported_as_end_time(self, mock_refresh, mock_fetch):
+        """Cache-only matching reoffers a duration-derived end-time reading.
+        Only an exact API-cache timestamp is a confirmation; a live-cache
+        duration guess cannot suppress a possible listen."""
         mock_refresh.return_value = "token123"
         true_start = "2026-07-13T10:00:00Z"
         end_time = "2026-07-13T10:03:00Z"  # true_start + 180s duration
@@ -572,7 +616,7 @@ class ApiBackfillTestCase(unittest.TestCase):
         with patch("Database.Listeners.spotifyListener.time.monotonic", return_value=_MONOTONIC_NOW):
             listener._checkWebApiBackfill(callback)
 
-        callback.assert_not_called()
+        callback.assert_called_once()
 
     @patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api")
     @patch("Database.Listeners.spotifyListener._refresh_spotify_access_token")
@@ -1010,14 +1054,10 @@ class BackfillDatabaseDedupTestCase(unittest.TestCase):
 
         callback.assert_not_called()
 
-    def test_a_paused_plays_backfill_copy_is_recognised_by_the_recorded_end_time(self):
-        """The 2026-08-04 incident: a play paused for ~3 minutes mid-track. The
-        listener row holds the START time, and Spotify's played_at reported the
-        END - which sits duration PLUS pause after the start, so both existing
-        interpretations (start matches start, start = end - duration) miss and
-        the same listen was recorded twice. The listener inserts its row at the
-        track-change moment, so the row's created_at IS the observed end,
-        pauses included - that is the anchor that recognises the copy."""
+    def test_a_paused_plays_end_only_match_is_reoffered_for_page_claiming(self):
+        """An end-only listener match is ambiguous: C5b reoffers it so page
+        claiming can make the one-to-one decision instead of suppressing it in
+        the listener prefilter."""
         pauseSeconds = 186
         insertLagSeconds = 1  #< callback-to-insert latency observed live
         endTs = timeToInt(self.SECOND_PLAYED_AT)
@@ -1028,53 +1068,7 @@ class BackfillDatabaseDedupTestCase(unittest.TestCase):
 
         callback = self._runBackfill(MagicMock(return_value=recorded), items=items)
 
-        callback.assert_not_called()
-
-    def test_end_time_arm_suppression_is_logged_under_flask_debug(self):
-        """Live validation for the 2026-08-04 fix: when the end-time arm ALONE
-        suppresses an item, say so - the other two arms' suppressions are
-        routine and stay silent. Gated like the other backfill progress lines."""
-        pauseSeconds = 186
-        endTs = timeToInt(self.SECOND_PLAYED_AT)
-        startTs = endTs - self.DURATION_MS // 1000 - pauseSeconds
-        items = [{"track": {"id": "track1", "duration_ms": self.DURATION_MS},
-                  "played_at": self.SECOND_PLAYED_AT}]
-        recorded = [("track1", startTs, endTs + 1)]
-
-        with patch.dict(os.environ, {"FLASK_DEBUG": "1"}):
-            with self.assertLogs("Database.Listeners.spotifyListener", level="INFO") as cm:
-                self._runBackfill(MagicMock(return_value=recorded), items=items)
-
-        self.assertTrue(any("end-time arm" in m and "track1" in m for m in cm.output))
-
-    def test_end_time_arm_log_is_silent_when_a_start_time_arm_already_matched(self):
-        """An item the 2s arms recognise is old news - the line must only fire
-        when the end-time arm is what made the difference."""
-        items = [{"track": {"id": "track1", "duration_ms": self.DURATION_MS},
-                  "played_at": self.SECOND_PLAYED_AT}]
-        endTs = timeToInt(self.SECOND_PLAYED_AT)
-        #< matches arm 1 exactly AND carries a matching recorded end
-        recorded = [("track1", endTs, endTs + 1)]
-
-        with patch.dict(os.environ, {"FLASK_DEBUG": "1"}):
-            with self.assertLogs("Database.Listeners.spotifyListener", level="INFO") as cm:
-                callback = self._runBackfill(MagicMock(return_value=recorded), items=items)
-
-        callback.assert_not_called()
-        self.assertFalse(any("end-time arm" in m for m in cm.output))
-
-    def test_end_time_arm_log_is_silent_without_flask_debug(self):
-        pauseSeconds = 186
-        endTs = timeToInt(self.SECOND_PLAYED_AT)
-        startTs = endTs - self.DURATION_MS // 1000 - pauseSeconds
-        items = [{"track": {"id": "track1", "duration_ms": self.DURATION_MS},
-                  "played_at": self.SECOND_PLAYED_AT}]
-        recorded = [("track1", startTs, endTs + 1)]
-
-        envWithoutDebug = {k: v for k, v in os.environ.items() if k != "FLASK_DEBUG"}
-        with patch.dict(os.environ, envWithoutDebug, clear=True):
-            with self.assertNoLogs("Database.Listeners.spotifyListener", level="INFO"):
-                self._runBackfill(MagicMock(return_value=recorded), items=items)
+        self.assertEqual(self._backfilledTrackIds(callback), ["track1"])
 
     def test_a_recorded_end_outside_the_tolerance_does_not_suppress(self):
         """The end-time arm must stay a point match, not a window: a recorded
@@ -1216,10 +1210,9 @@ class BackfillCrossReleaseDedupTestCase(unittest.TestCase):
 
         callback.assert_not_called()
 
-    def test_the_end_time_reading_of_the_same_listen_is_dropped_too(self):
-        """The Web API's played_at may be the end of the play, putting it one
-        track-length after the listener's row - the arm that reading needs must
-        see the aliased row as well."""
+    def test_the_end_time_reading_of_the_same_listener_play_is_reoffered(self):
+        """A listener row's duration-derived end-time match is ambiguous, so
+        page claiming must reoffer it instead of suppressing a possible repeat."""
         playedAt = timeToInt(self.FIRST_PLAYED_AT)
         self._recordListenerPlay(playedAt)
         items = [{"track": {"id": self.WEB_API_ID, "duration_ms": self.DURATION_MS},
@@ -1227,7 +1220,7 @@ class BackfillCrossReleaseDedupTestCase(unittest.TestCase):
 
         callback = self._runAgainstRepo(items)
 
-        callback.assert_not_called()
+        callback.assert_called_once()
 
     def test_a_genuinely_missing_play_of_the_sibling_id_still_comes_through(self):
         """Aliasing must not turn one recorded listen into a blanket amnesty for

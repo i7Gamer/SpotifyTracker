@@ -266,8 +266,175 @@ class TestPreMigrationSnapshot(MigrationChainTestCase):
         #  pre-migration snapshot exactly like the scheduled ones (off-disk
         #  protection at the riskiest write of the boot). Passing an explicit
         #  path here would silently pin it back beside the database.
-        worker.assert_called_once_with(dbPath=self.dbPath)
+        worker.assert_called_once_with(
+            dbPath=self.dbPath,
+            intervalHours=backupModule.DEFAULT_BACKUP_INTERVAL_HOURS,
+            retentionCount=backupModule.DEFAULT_BACKUP_RETENTION_COUNT,
+        )
         worker.return_value.runBackup.assert_called_once()
+
+    def test_saved_settings_control_the_snapshot_without_stamping_schema(self):
+        self._seedDatabase()
+        conn = sqlite3.connect(self.dbPath)
+        try:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_interval_hours", "0"),
+            )
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_retention_count", "30"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        worker = MagicMock()
+
+        self._snapshotWith(worker)
+
+        worker.assert_called_once_with(
+            dbPath=self.dbPath,
+            intervalHours=0,
+            retentionCount=30,
+        )
+        self.assertEqual(dbversion.readDbVersion(self.dbPath), OLDEST_DB_ERA_VERSION)
+
+    def test_missing_settings_table_uses_environment_fallback_without_creating_schema(self):
+        sqlite3.connect(self.dbPath).close()
+        worker = MagicMock()
+
+        with patch.dict(os.environ, {
+            backupModule.BACKUP_INTERVAL_ENV_VAR: "999",
+            backupModule.BACKUP_RETENTION_ENV_VAR: "999",
+        }):
+            self._snapshotWith(worker)
+
+        worker.assert_called_once_with(
+            dbPath=self.dbPath,
+            intervalHours=999,
+            retentionCount=999,
+        )
+        conn = sqlite3.connect(self.dbPath)
+        try:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='schema_version'"
+            ).fetchone())
+        finally:
+            conn.close()
+
+    def test_a_settings_read_failure_skips_the_optional_snapshot(self):
+        self._seedDatabase()
+        worker = MagicMock()
+
+        with patch.object(migrateModule.dbversion, "openMigrationConnection",
+                          side_effect=sqlite3.OperationalError("database is locked")), \
+             patch("Database.backup.BackupWorker", worker), \
+             self.assertLogs(migrateModule.logger, level="ERROR") as logs:
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        worker.assert_not_called()
+        self.assertTrue(any("backup settings" in message.lower() for message in logs.output))
+
+    def test_a_permission_error_reading_settings_skips_the_optional_snapshot(self):
+        self._seedDatabase()
+        worker = MagicMock()
+
+        with patch.object(migrateModule.dbversion, "openMigrationConnection",
+                          side_effect=PermissionError("settings file is unreadable")), \
+             patch("Database.backup.BackupWorker", worker), \
+             self.assertLogs(migrateModule.logger, level="ERROR") as logs:
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        worker.assert_not_called()
+        self.assertTrue(any("backup settings" in message.lower() for message in logs.output))
+
+    def test_settings_probe_is_read_only_and_closes_its_connection(self):
+        self._seedDatabase()
+        worker = MagicMock()
+
+        class Result:
+            def __init__(self, *, row=None, rows=None):
+                self.row = row
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return self.rows
+
+        class ProbeConnection:
+            def __init__(self):
+                self.closed = False
+                self.sql = []
+
+            def execute(self, statement, parameters=()):
+                self.sql.append((statement, parameters))
+                if "sqlite_master" in statement:
+                    return Result(row=(1,))
+                return Result(rows=[
+                    ("backup_interval_hours", "12"),
+                    ("backup_retention_count", "30"),
+                ])
+
+            def close(self):
+                self.closed = True
+
+        connection = ProbeConnection()
+        with patch.object(migrateModule.dbversion, "openMigrationConnection",
+                          return_value=connection) as openConnection, \
+             patch("Database.backup.BackupWorker", worker):
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        openConnection.assert_called_once_with(self.dbPath, readOnly=True)
+        self.assertTrue(connection.closed)
+        worker.assert_called_once_with(dbPath=self.dbPath, intervalHours=12, retentionCount=30)
+
+    def test_probe_execute_failure_closes_the_read_only_connection(self):
+        self._seedDatabase()
+        worker = MagicMock()
+
+        class FailingConnection:
+            closed = False
+
+            def execute(self, statement, parameters=()):
+                raise sqlite3.OperationalError("WAL read failed")
+
+            def close(self):
+                self.closed = True
+
+        connection = FailingConnection()
+        with patch.object(migrateModule.dbversion, "openMigrationConnection",
+                          return_value=connection), \
+             patch("Database.backup.BackupWorker", worker), \
+             self.assertLogs(migrateModule.logger, level="ERROR"):
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        self.assertTrue(connection.closed)
+        worker.assert_not_called()
+
+    def test_committed_wal_settings_are_visible_to_the_read_only_probe(self):
+        self._seedDatabase()
+        conn = sqlite3.connect(self.dbPath)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_interval_hours", "12"),
+            )
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_retention_count", "30"),
+            )
+            conn.commit()
+            worker = MagicMock()
+
+            self._snapshotWith(worker)
+
+            worker.assert_called_once_with(dbPath=self.dbPath, intervalHours=12, retentionCount=30)
+        finally:
+            conn.close()
 
     def test_a_fresh_install_with_no_database_is_a_silent_no_op(self):
         """Nothing to protect yet (a fresh install, or the pre-1.7.0 JSON era).
@@ -372,6 +539,85 @@ class TestPreMigrationSnapshotSkippedWhenBackupsAreDisabled(MigrationChainTestCa
         self.assertTrue(backupDir.exists())
         snapshots = [p for p in backupDir.iterdir() if p.is_file()]
         self.assertEqual(len(snapshots), 1, snapshots)
+
+    def test_saved_retention_keeps_ten_existing_snapshots_plus_the_new_one(self):
+        self._seedDatabase()
+        backupDir = self.dbPath.parent / backupModule.BACKUP_DIR_NAME
+        backupDir.mkdir()
+        for index in range(10):
+            (backupDir / f"{backupModule.BACKUP_FILENAME_PREFIX}20260101_0000{index}.db").write_bytes(b"old")
+        conn = sqlite3.connect(self.dbPath)
+        try:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_interval_hours", "24"),
+            )
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_retention_count", "30"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.dict(os.environ, {backupModule.BACKUP_DIR_ENV_VAR: ""}):
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        snapshots = [p for p in backupDir.iterdir() if p.is_file() and p.suffix == ".db"]
+        self.assertEqual(len(snapshots), 11, snapshots)
+
+    def test_saved_zero_interval_skips_a_real_snapshot(self):
+        self._seedDatabase()
+        backupDir = self.dbPath.parent / backupModule.BACKUP_DIR_NAME
+        backupDir.mkdir()
+        existing = backupDir / f"{backupModule.BACKUP_FILENAME_PREFIX}20260101_000000.db"
+        existing.write_bytes(b"old")
+        conn = sqlite3.connect(self.dbPath)
+        try:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_interval_hours", "0"),
+            )
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_retention_count", "30"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.dict(os.environ, {backupModule.BACKUP_DIR_ENV_VAR: ""}):
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        self.assertEqual([p.name for p in backupDir.iterdir()], [existing.name])
+
+    def test_saved_zero_retention_skips_snapshot_and_rotation(self):
+        self._seedDatabase()
+        backupDir = self.dbPath.parent / backupModule.BACKUP_DIR_NAME
+        backupDir.mkdir()
+        existing = []
+        for index in range(10):
+            path = backupDir / f"{backupModule.BACKUP_FILENAME_PREFIX}20260101_00000{index}.db"
+            path.write_bytes(b"old")
+            existing.append(path.name)
+        conn = sqlite3.connect(self.dbPath)
+        try:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_interval_hours", "24"),
+            )
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)",
+                ("backup_retention_count", "0"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch.dict(os.environ, {backupModule.BACKUP_DIR_ENV_VAR: ""}):
+            migrateModule._snapshotBeforeMigrating(self.runtimeDir)
+
+        self.assertEqual(sorted(path.name for path in backupDir.iterdir()), sorted(existing))
 
 
 class TestTheRealRuntimeDirectoryIsNeverTouched(MigrationChainTestCase):

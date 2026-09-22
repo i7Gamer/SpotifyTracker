@@ -28,6 +28,23 @@ import time
 from pathlib import Path
 
 try:
+    from Database.backup_settings import (
+        BACKUP_INTERVAL_ENV_VAR, BACKUP_RETENTION_ENV_VAR,
+        DEFAULT_BACKUP_INTERVAL_HOURS, DEFAULT_BACKUP_RETENTION_COUNT,
+        BACKUP_INTERVAL_HOURS_KEY, BACKUP_INTERVAL_HOURS_MIN, BACKUP_INTERVAL_HOURS_MAX,
+        BACKUP_RETENTION_COUNT_KEY, BACKUP_RETENTION_COUNT_MIN, BACKUP_RETENTION_COUNT_MAX,
+        envInt as _leafEnvInt,
+    )
+except ModuleNotFoundError:
+    from backup_settings import (
+        BACKUP_INTERVAL_ENV_VAR, BACKUP_RETENTION_ENV_VAR,
+        DEFAULT_BACKUP_INTERVAL_HOURS, DEFAULT_BACKUP_RETENTION_COUNT,
+        BACKUP_INTERVAL_HOURS_KEY, BACKUP_INTERVAL_HOURS_MIN, BACKUP_INTERVAL_HOURS_MAX,
+        BACKUP_RETENTION_COUNT_KEY, BACKUP_RETENTION_COUNT_MIN, BACKUP_RETENTION_COUNT_MAX,
+        envInt as _leafEnvInt,
+    )
+
+try:
     import Database.db as db
     from Database.utils import parseError
     from Database.telemetry import WorkerTelemetryMixin
@@ -38,8 +55,6 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
-BACKUP_INTERVAL_ENV_VAR = "BACKUP_INTERVAL_HOURS"
-BACKUP_RETENTION_ENV_VAR = "BACKUP_RETENTION_COUNT"
 # Where snapshots go. Unset means Backups/ beside the database, which is the
 # right default (it is inside the one directory the compose file already
 # persists) and also the reason this variable exists: the snapshots then share
@@ -51,8 +66,6 @@ BACKUP_RETENTION_ENV_VAR = "BACKUP_RETENTION_COUNT"
 # copy somewhere else" was not something an operator could just do. Point it at
 # another disk, or at a mount of somewhere off the machine entirely.
 BACKUP_DIR_ENV_VAR = "BACKUP_DIR"
-DEFAULT_BACKUP_INTERVAL_HOURS = 24
-DEFAULT_BACKUP_RETENTION_COUNT = 7
 BACKUP_DIR_NAME = "Backups"                 #< created next to the database file, inside the persisted Data/ volume
 BACKUP_FILENAME_PREFIX = "spotify_stats_backup_"
 BACKUP_STARTUP_MIN_DELAY_SECONDS = 60       #< random startup-offset bounds: don't race app startup (migrations
@@ -92,14 +105,7 @@ _BACKUP_LOCK = threading.Lock()
 
 
 def _envInt(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        logger.warning("Ignoring non-numeric %s=%r, using default %d", name, raw, default)
-        return default
+    return _leafEnvInt(name, default, warningLogger=logger)
 
 
 def _discardPartial(partialPath: Path) -> None:

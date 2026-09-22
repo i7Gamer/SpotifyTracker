@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from Database.metadata_repair import TrackRepairImpact, WrappedRepairResult
 from Database.queries._base import (
     ALBUM_ARTIST_REPAIR_RETRY_SECONDS,
     ALBUM_BACKFILL_RETRY_SECONDS,
@@ -24,7 +25,12 @@ class TrackQueries:
 
     # ---- Catalog: tracks / artists / albums ----------------------------------
 
-    def upsertTrack(self, track: dict, created_reason: str | None = None) -> None:
+    def _trackRepairRow(self, conn, trackId: str):
+        return conn.execute(
+            "SELECT name, created_reason, album_id FROM tracks WHERE id=?", (trackId,)
+        ).fetchone()
+
+    def upsertTrack(self, track: dict, created_reason: str | None = None) -> TrackRepairImpact | None:
         """Upsert a track and its nested album/artists (as produced by
         Client.formatTrack). Last write wins, matching the previous
         tracks[id] = track dict-assignment semantics - with one exception: a
@@ -39,19 +45,38 @@ class TrackQueries:
         transaction (one play = one commit; a bulk import = one commit for the
         whole batch), then call commit()/rollback() themselves."""
         conn = self._conn()
+        existing = self._trackRepairRow(conn, track["id"])
+        return self._upsertTrackWithExisting(conn, track, created_reason, existing)
+
+    def _upsertTrackWithExisting(self, conn, track: dict,
+                                 created_reason: str | None, existing):
+        """Write one catalog row using the owner's already-locked old row."""
 
         # Defense in depth: the importer normally prevents a fallback record
         # from ever targeting a track with real metadata (its known-track index
         # resolves those first), but no caller may rely on that - degraded data
         # must never clobber good catalog data at this level either.
-        if track.get("created_reason") in (SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON):
-            existing = conn.execute(
-                "SELECT name, created_reason FROM tracks WHERE id=?", (track["id"],)
-            ).fetchone()
+        fallbackReasons = (SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON)
+        incomingReason = track.get("created_reason") or created_reason
+        if incomingReason in fallbackReasons:
             if existing and existing["name"] and existing["created_reason"] not in (
                 SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON,
             ):
-                return
+                return None
+
+        repairsFallback = (
+            existing is not None
+            and existing["created_reason"] in fallbackReasons
+            and incomingReason not in fallbackReasons
+        )
+        oldArtistIds = frozenset()
+        if repairsFallback:
+            oldArtistIds = frozenset(
+                row["artist_id"] for row in conn.execute(
+                    "SELECT artist_id FROM track_artists WHERE track_id=?",
+                    (track["id"],),
+                ).fetchall()
+            )
 
         album = track.get("album")
         if not album:
@@ -152,7 +177,18 @@ class TrackQueries:
                     (track["id"], artist["id"], position),
                 )
 
-    def repairFallbackTracks(self, tracks: list[dict]) -> int:
+        if not repairsFallback:
+            return None
+        newArtistIds = frozenset(artist["id"] for artist in artists) if artists else oldArtistIds
+        return TrackRepairImpact(
+            trackId=track["id"],
+            oldAlbumId=existing["album_id"],
+            newAlbumId=album["id"],
+            oldArtistIds=oldArtistIds,
+            newArtistIds=newArtistIds,
+        )
+
+    def repairFallbackTracks(self, tracks: list[dict]) -> WrappedRepairResult | None:
         """Replace existing fallback catalog rows with formatted real metadata.
 
         Owns a short write transaction, like the catalog backfiller's other
@@ -161,26 +197,28 @@ class TrackQueries:
         or writes plays, including their historical skip classification.
         """
         if not tracks:
-            return 0
+            return None
         conn = self._conn()
-        repaired = 0
+        impacts = []
         with conn:
             if not conn.in_transaction:
                 conn.execute("BEGIN IMMEDIATE")
             for track in tracks:
-                if track.get("created_reason") in (SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON):
+                if (not isinstance(track, dict) or not track.get("id")
+                        or track.get("created_reason") in (
+                            SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON)):
                     continue
-                row = conn.execute("SELECT created_reason FROM tracks WHERE id=?", (track["id"],)).fetchone()
-                if row is None or row["created_reason"] not in (SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON):
+                row = self._trackRepairRow(conn, track["id"])
+                if row is None or row["created_reason"] not in (
+                        SYNTHETIC_FALLBACK_REASON, RESTRICTED_FALLBACK_REASON):
                     continue
-                self.upsertTrack(track)
-                repaired += 1
-            if repaired:
-                # Shared album/artist metadata and discovery years can change
-                # beyond these tracks' play years. Invalidate once per actual
-                # repair batch, atomically with the catalog and fallback markers.
-                self._deleteAllWrapped(conn)
-        return repaired
+                impact = self._upsertTrackWithExisting(conn, track, None, row)
+                if impact is not None:
+                    impacts.append(impact)
+            if not impacts:
+                return None
+            result = self._invalidateWrappedForRepairs(conn, impacts)
+        return result
 
     def getTrack(self, trackId: str) -> dict | None:
         conn = self._conn()

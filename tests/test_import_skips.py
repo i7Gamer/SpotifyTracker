@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from conftest import DatabaseTestCase, normalizeTrackForTest
 from Database.db import BEHAVIORAL_COLUMNS
+from Database.database import _ImportRunState
+from Database.repository import SKIP_MODE_SECONDS
 
 EXTRAS_FULL = {
     "platform": "ios", "conn_country": "CH", "reason_start": "clickrow",
@@ -21,12 +23,13 @@ EXTRAS_FULL = {
 }
 
 
-def _meta(trackId, playedAt, timePlayed=60000, isSkip=False, extras=None, duration=0):
+def _meta(trackId, playedAt, timePlayed=60000, isSkip=False, extras=None, duration=0,
+          playedFrom=None):
     track = normalizeTrackForTest({"id": trackId, "name": f"Song {trackId}", "artists": [],
                                    "duration": duration})
     track["playedAt"] = playedAt
     track["timePlayed"] = timePlayed
-    track["playedFrom"] = None
+    track["playedFrom"] = playedFrom
     track["isSkip"] = isSkip
     if extras:
         track["importExtras"] = extras
@@ -221,13 +224,20 @@ class TestSkipNearTimeDedup(_ImportTestBase):
         self._seedListenerSkip(db, "track_x", 1000)
 
         def gen():
-            yield _meta("track_x", 1001, timePlayed=400, isSkip=True)   #< the recorded one
-            yield _meta("track_x", 1006, timePlayed=400, isSkip=True)   #< the one it missed
+            yield _meta("track_x", 1001, timePlayed=400, isSkip=True,
+                        playedFrom="playlist:recorded", extras={"platform": "ios"})
+            yield _meta("track_x", 1006, timePlayed=400, isSkip=True,
+                        playedFrom="playlist:missed", extras={"platform": "android"})
 
         self._import(db, gen)
 
         #< the claimed row plus the genuinely missing second skip
-        self.assertEqual(len(self._skipRows(db)), 2)
+        rows = {row["played_at"]: dict(row) for row in self._skipRows(db)}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1000]["played_from"], "playlist:recorded")
+        self.assertEqual(rows[1000]["platform"], "ios")
+        self.assertEqual(rows[1006]["played_from"], "playlist:missed")
+        self.assertEqual(rows[1006]["platform"], "android")
 
     def test_the_nearest_recorded_skip_is_the_one_claimed(self):
         """With two recorded rows in range, pairing has to be deterministic, or
@@ -401,6 +411,243 @@ class TestImportEnrichment(_ImportTestBase):
         plays = self._playRows(db)
         self.assertEqual(plays[0]["platform"], "ios")
         self.assertEqual(plays[0]["conn_country"], "DE")
+
+
+class TestC4ExistingRowMetadata(_ImportTestBase):
+    """C4 regression cases for context and behavioral enrichment on matches."""
+
+    WRAPPED_INSERT = """
+        INSERT INTO user_wrapped (
+            username, year, calculated_at, max_played_at, total_plays, total_ms,
+            longest_streak, unique_songs, unique_artists, discovered_songs, discovered_artists,
+            time_series_day, time_series_week, time_series_month,
+            top_songs, top_artists, top_albums,
+            discovered_songs_list, discovered_artists_list, discovered_albums_list
+        ) VALUES (?, ?, 0, 0, 1, 1, 1, 1, 1, 0, 0,
+                  '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]', '[]')
+    """
+
+    def _seedWrapped(self, db, year=2024):
+        with db.repo.connection() as conn:
+            conn.execute(self.WRAPPED_INSERT, (db.user, year))
+
+    def _seedExisting(self, db, isSkip=0, playedFrom="playlist:old", extras=None,
+                      playedAt=1000, timePlayed=5000):
+        db.repo.upsertTrack(normalizeTrackForTest(
+            {"id": "track_x", "name": "Song", "artists": [], "duration": 200000}))
+        db.repo.insertPlay(db.user, "track_x", playedAt, timePlayed,
+                           playedFrom=playedFrom, extras=extras or {}, is_skip=isSkip)
+        db.repo.commit()
+
+    def _singleRow(self, db, isSkip=None):
+        clause = "" if isSkip is None else " AND is_skip=?"
+        params = [db.user]
+        if isSkip is not None:
+            params.append(isSkip)
+        return dict(db.repo.connection().execute(
+            f"SELECT * FROM plays WHERE username=?{clause}", params).fetchone())
+
+    def test_context_only_real_play_enriches_without_wrapped_invalidation(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, extras={"platform": "web", "shuffle": 1})
+        self._seedWrapped(db)
+        generation = db.repo.getWrappedInvalidationGeneration()
+
+        def gen():
+            yield _meta("track_x", 1000, timePlayed=5000,
+                        playedFrom="", extras={"platform": "web", "shuffle": 1})
+
+        with self.assertLogs("Database.database", level="INFO") as logs:
+            self._import(db, gen)
+
+        row = self._singleRow(db)
+        self.assertEqual(row["played_from"], "")
+        self.assertEqual(row["platform"], "web")
+        self.assertEqual(row["shuffle"], 1)
+        self.assertEqual(db.repo.getWrappedInvalidationGeneration(), generation)
+        self.assertIsNotNone(db.repo.getCachedWrapped(db.user, 2024))
+        self.assertFalse(any("Updated import play" in line for line in logs.output))
+        self.assertIn("1 enriched", db.readProgress()["message"])
+
+    def test_repeated_context_and_behavioral_data_is_a_noop(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, extras={"platform": "web", "shuffle": 1})
+        meta = _meta("track_x", 1000, timePlayed=5000,
+                     playedFrom="playlist:new", extras={"platform": "ios", "shuffle": 0})
+        self._import(db, lambda: iter([meta]))
+        before = self._singleRow(db)
+
+        self._import(db, lambda: iter([meta]))
+
+        self.assertEqual(self._singleRow(db), before)
+        self.assertIn("0 enriched", db.readProgress()["message"])
+        self.assertEqual(len(self._playRows(db)), 1)
+
+    def test_null_context_and_behavioral_values_preserve_existing_metadata(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, extras={"platform": "web", "offline": 1})
+
+        def gen():
+            yield _meta("track_x", 1000, timePlayed=5000,
+                        playedFrom=None, extras={"platform": None, "offline": None})
+
+        self._import(db, gen)
+
+        row = self._singleRow(db)
+        self.assertEqual(row["played_from"], "playlist:old")
+        self.assertEqual(row["platform"], "web")
+        self.assertEqual(row["offline"], 1)
+        self.assertIn("0 enriched", db.readProgress()["message"])
+
+    def test_timestamp_correction_with_context_keeps_normal_cache_invalidation(self):
+        db = self._makeDb({}, [])
+        playedAt = 1704067200.0  # 2024-01-01 UTC, matching the cached year below
+        self._seedExisting(db, extras={"platform": "old"}, playedAt=playedAt)
+        self._seedWrapped(db)
+
+        def gen():
+            yield _meta("track_x", playedAt + 5, timePlayed=6000,
+                        playedFrom="playlist:new", extras={"platform": "ios"})
+
+        self._import(db, gen)
+
+        row = self._singleRow(db)
+        self.assertEqual(row["played_at"], playedAt + 5)
+        self.assertEqual(row["time_played"], 6000)
+        self.assertEqual(row["played_from"], "playlist:new")
+        self.assertEqual(row["platform"], "ios")
+        self.assertIsNone(db.repo.getCachedWrapped(db.user, 2024))
+
+    def test_subfloor_claim_enriches_skip_context_and_false_zero_values(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, isSkip=1, extras={"offline": 1, "shuffle": 1})
+
+        def gen():
+            yield _meta("track_x", 1004, timePlayed=400, isSkip=True,
+                        playedFrom="", extras={"offline": False, "shuffle": False})
+
+        self._import(db, gen)
+
+        row = self._singleRow(db, isSkip=1)
+        self.assertEqual(row["played_from"], "")
+        self.assertEqual(row["offline"], 0)
+        self.assertEqual(row["shuffle"], 0)
+        self.assertIn("1 enriched", db.readProgress()["message"])
+        self.assertIn("0 skips saved", db.readProgress()["message"])
+
+    def test_competing_skip_entries_enrich_the_nearest_rows_only(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, isSkip=1, playedFrom="old-a",
+                           extras={"platform": "a"}, playedAt=1000)
+        db.repo.insertPlay(db.user, "track_x", 1008, 400, playedFrom="old-b",
+                           extras={"platform": "b"}, is_skip=1)
+        db.repo.commit()
+
+        def gen():
+            yield _meta("track_x", 1001, timePlayed=400, isSkip=True,
+                        playedFrom="new-a", extras={"platform": "new-a"})
+            yield _meta("track_x", 1007, timePlayed=400, isSkip=True,
+                        playedFrom="new-b", extras={"platform": "new-b"})
+
+        self._import(db, gen)
+
+        rows = {row["played_at"]: dict(row) for row in self._skipRows(db)}
+        self.assertEqual(rows[1000]["played_from"], "new-a")
+        self.assertEqual(rows[1000]["platform"], "new-a")
+        self.assertEqual(rows[1008]["played_from"], "new-b")
+        self.assertEqual(rows[1008]["platform"], "new-b")
+        self.assertIn("2 enriched", db.readProgress()["message"])
+
+    def test_above_floor_skip_claim_enriches_before_returning(self):
+        db = self._makeDb({}, [])
+        db.repo.setSkipThreshold(SKIP_MODE_SECONDS, 30)
+        self._seedExisting(db, isSkip=1, extras={"platform": "web"})
+
+        def gen():
+            yield _meta("track_x", 1003, timePlayed=10_000, duration=200_000,
+                        playedFrom="playlist:raised", extras={"platform": "ios"})
+
+        self._import(db, gen)
+
+        row = self._singleRow(db, isSkip=1)
+        self.assertEqual(row["played_from"], "playlist:raised")
+        self.assertEqual(row["platform"], "ios")
+        self.assertIn("1 enriched", db.readProgress()["message"])
+        self.assertIn("0 skips saved", db.readProgress()["message"])
+
+    def test_correction_collision_preserves_old_metadata(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, extras={"platform": "old"}, playedAt=100, timePlayed=5000)
+        db.repo.insertPlay(db.user, "track_x", 110, 400, is_skip=1)
+        db.repo.commit()
+
+        def gen():
+            yield _meta("track_x", 110, timePlayed=6000,
+                        playedFrom="playlist:new", extras={"platform": "new"})
+
+        self._import(db, gen)
+
+        row = self._singleRow(db, isSkip=0)
+        self.assertEqual(row["played_at"], 100)
+        self.assertEqual(row["time_played"], 5000)
+        self.assertEqual(row["played_from"], "playlist:old")
+        self.assertEqual(row["platform"], "old")
+
+    def test_metadata_enrichment_rolls_back_with_later_apply_failure(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, extras={"platform": "old"})
+        self._seedWrapped(db)
+        generation = db.repo.getWrappedInvalidationGeneration()
+
+        def failingInsert(*args, **kwargs):
+            raise RuntimeError("synthetic apply failure")
+
+        def gen():
+            yield _meta("track_x", 1000, timePlayed=5000,
+                        playedFrom="playlist:new", extras={"platform": "new"})
+            yield _meta("track_y", 2000, timePlayed=5000)
+
+        with patch.object(db.repo, "insertPlay", side_effect=failingInsert):
+            with self.assertRaisesRegex(RuntimeError, "synthetic apply failure"):
+                self._import(db, gen)
+
+        row = self._singleRow(db, isSkip=0)
+        self.assertEqual(row["played_from"], "playlist:old")
+        self.assertEqual(row["platform"], "old")
+        self.assertEqual(len(self._playRows(db)), 1)
+        self.assertEqual(db.repo.getWrappedInvalidationGeneration(), generation)
+        self.assertIsNotNone(db.repo.getCachedWrapped(db.user, 2024))
+
+    def test_deferred_multifile_apply_rolls_back_enrichment(self):
+        db = self._makeDb({}, [])
+        self._seedExisting(db, extras={"platform": "old"})
+        self._seedWrapped(db)
+        state = _ImportRunState()
+        trackX = normalizeTrackForTest(
+            {"id": "track_x", "name": "Song X", "artists": [], "duration": 200000})
+        trackY = normalizeTrackForTest(
+            {"id": "track_y", "name": "Song Y", "artists": [], "duration": 200000})
+        staged = [
+            (({"track_x": trackX}, [_meta("track_x", 1000, timePlayed=5000,
+                                           playedFrom="playlist:new",
+                                           extras={"platform": "new"})], 1, {}),
+             "first", "", False),
+            (({"track_y": trackY}, [_meta("track_y", 2000)], 1, {}),
+             "second", "", True),
+        ]
+
+        def failingInsert(*args, **kwargs):
+            raise RuntimeError("synthetic deferred failure")
+
+        with patch.object(db.repo, "insertPlay", side_effect=failingInsert):
+            self.assertFalse(db._applyStagedBatch(staged, state, None, None, set(), 2))
+
+        row = self._singleRow(db, isSkip=0)
+        self.assertEqual(row["played_from"], "playlist:old")
+        self.assertEqual(row["platform"], "old")
+        self.assertEqual(len(self._playRows(db)), 1)
+        self.assertIsNotNone(db.repo.getCachedWrapped(db.user, 2024))
+        self.assertFalse(db.repo.connection().in_transaction)
 
 
 class TestWrappedInvalidationOnCorrection(_ImportTestBase):

@@ -1239,7 +1239,7 @@ class TestWebApiIdentityCheckReplacesTheBrowserEndpoint(unittest.TestCase):
         listener.get_credentials = MagicMock(return_value={
             "client_id": "cid", "client_secret": "cs", "refresh_token": "rt"})
         listener.get_backfill_enabled = None
-        listener.get_recorded_play_times = None
+        listener.process_backfill_page = None
         listener._lastWebApiPollTime = None
         listener._consecutiveScopeErrors = 0
         listener.on_scope_status_change = None

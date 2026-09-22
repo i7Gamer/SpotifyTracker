@@ -427,7 +427,7 @@ class MetadataBackfillMixin:
             # transition, even if another worker observed the same revocation.
             self.setSpotifyNeedsReauth(True)
 
-    def _repairFallbackTrackMetadata(self, rawTracks: list[dict]) -> int:
+    def _repairFallbackTrackMetadata(self, rawTracks: list[dict], source: str = "catalog") -> int:
         """Reuse full catalog/history responses without fetching or recording plays.
 
         Incomplete responses must leave the marker intact so the existing
@@ -455,7 +455,9 @@ class MetadataBackfillMixin:
             except (KeyError, TypeError, ValueError, AttributeError) as error:
                 _dbmod.logger.warning("Cannot repair fallback metadata for track %s: %s",
                                       raw["id"], _dbmod.parseError(error))
-        return self.repo.repairFallbackTracks(tracks)
+        result = self.repo.repairFallbackTracks(tracks)
+        self._logCommittedMetadataRepair(source, result)
+        return result.repaired if result is not None else 0
 
     def _backfillTrackIsrcs(self, getAccessToken, stop_event: threading.Event) -> None:
         """Fill ISRCs and repair fallback tracks from one catalog batch per cycle.
@@ -562,7 +564,7 @@ class MetadataBackfillMixin:
                                             stop_event, _recordIsrc)
 
             self.repo.updateTrackIsrcs(isrcByTrackId)
-            self._repairFallbackTrackMetadata(trackMetadata)
+            self._repairFallbackTrackMetadata(trackMetadata, source="catalog")
             self.repo.markTracksIsrcAttempted(batch.attempted)
 
             if batch.firstFailure is not None:

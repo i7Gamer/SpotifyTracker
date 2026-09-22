@@ -112,12 +112,12 @@ Every variable below is optional unless marked otherwise, and every one is prese
 | `SKIP_EMAIL_VERIFICATION` | `0` | Disables the "do these cookies belong to this email" check. It is what stops one user claiming another's account and what stops `/reset-password` setting a password on any account — only for an instance where you trust everyone who can reach it. |
 | `SMTP_SKIP_TLS_VERIFY` | `0` | For a self-hosted relay with a self-signed certificate only; notification mail then skips certificate and hostname verification. |
 | `ALLOW_INSTANCE_RESTART` | `0` | Shows the admin console's **"Restart app to apply"** button. See [Restarting the app](#restarting-the-app). |
-| `BACKUP_INTERVAL_HOURS` | `24` | How often to snapshot the database; `0` disables automatic backups. |
-| `BACKUP_RETENTION_COUNT` | `7` | How many snapshots to keep; `0` disables automatic backups. |
+| `BACKUP_INTERVAL_HOURS` | `24` | Fallback snapshot interval when the saved admin setting is missing or invalid; `0` disables automatic backups. |
+| `BACKUP_RETENTION_COUNT` | `7` | Fallback retention when the saved admin setting is missing or invalid; `0` disables automatic backups. |
 | `BACKUP_DIR` | `Backups/` beside the database | Where snapshots go. Point it at another disk or an off-machine mount — see [Backup and recovery](docs/backup-and-recovery.md). |
 | `FLASK_DEBUG` | `0` | Verbose Flask logging. Enable when reporting an issue. |
 | `SPOTIFY_TOTP_SECRET` | pinned in-app | Emergency override if Spotify rotates its TOTP secret and logins fail instance-wide before a fixed release is out; the log says so when that happens. Format `"<version>:<comma-separated bytes>"`. |
-| `SPOTIFY_TOTP_AUTO_RECOVER` | `1` | After 3 consecutive session-token failures, adopts the current secret from Spotify's own web player, retrying at most every 15 minutes. Set to `0` to keep anything from touching authentication on its own. |
+| `SPOTIFY_TOTP_AUTO_RECOVER` | `1` | After 3 explicit TOTP rejections, tries to recover a newer secret from Spotify's own web player, at most every 15 minutes. Transport failures are counted separately. Set to `0` to disable automatic secret discovery. |
 
 ### Upgrading from an older version
 
@@ -136,7 +136,7 @@ The admin console's **"Restart app to apply"** button (hidden unless `ALLOW_INST
 
 Listening history, tracks, images and login sessions all live in one SQLite file at `Database/Data/spotify_stats.db`. The cover and artist images sit beside it in `Database/Data/Media/` and belong in the same backup — a database restored without them still works, but every image is re-downloaded on demand.
 
-**Automatic backups are on by default**: a snapshot every 24 hours into `Database/Data/Backups/`, newest 7 kept. Tune them with `BACKUP_INTERVAL_HOURS`, `BACKUP_RETENTION_COUNT` and `BACKUP_DIR` above. `BACKUP_RETENTION_COUNT=0` also skips the safety snapshot taken before a version upgrade migrates the database, so take a manual one from `/admin` first if you rely on it.
+**Automatic backups are on by default**: a snapshot every 24 hours into `Database/Data/Backups/`, newest 7 kept. Saved interval and retention settings in `/admin` take precedence over the environment defaults above; restart after changing them. Startup, the admin form and pre-upgrade snapshots use the same effective values. Setting either effective value to `0` disables automatic backups and the pre-upgrade snapshot, while **Create Backup Now** remains available. Take a manual snapshot before upgrading if automatic backups are disabled. `BACKUP_DIR` selects the destination.
 
 By default those snapshots share a disk with the database: they protect against corruption and accidental deletion, not against losing the disk.
 
@@ -153,7 +153,7 @@ Backfills plays the live listener missed. Requires `SPOTIFY_CALLBACK_URL`:
 3. Set `SPOTIFY_CALLBACK_URL` to that exact URL.
 4. Link your account under Profile > Connections, which appears once the variable is set.
 
-Fallback `Unknown track` metadata is repaired when a later history response or catalog backfill supplies the real track — history repair reuses the response already fetched, and catalog repair stays inside the existing cadence, cooldown and batch budget. Historical play and skip fields are preserved; to reclassify old skips after durations are repaired, save the admin skip settings to run the bulk reclassification.
+Fallback `Unknown track` metadata is repaired when a later live play, history import, history response or catalog backfill supplies the real track. Repairs invalidate affected cached Wrapped results in the same transaction; large repair scopes clear the whole Wrapped cache, which rebuilds normally. History repair reuses the response already fetched, and catalog repair keeps its existing cadence and batch budget. Historical play and skip fields are preserved; to reclassify old skips after durations are repaired, save the admin skip settings to run the bulk reclassification.
 
 ### Genre data (Last.fm)
 

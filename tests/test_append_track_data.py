@@ -1,155 +1,86 @@
-"""Tests for Database.appendTrackData's insert-time dedup guard.
+# SPDX-FileCopyrightText: 2026 i7Gamer
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
-A wide, defense-in-depth guard (duration + BACKFILL_INSERT_GUARD_EXTRA_SECONDS)
-applied ONLY to Web API backfill-sourced inserts (source="web_api_backfill"),
-never to the live listener's own inserts (source="listener") - see
-appendTrackData's inline comment for why. This is symmetric and catches a
-duplicate regardless of whether Spotify reported an entry's played_at as a
-start or end time (spotify/web-api#1083 - the field is documented as
-inconsistent about this).
-"""
-import sys
+"""API insert guards run atomically; live listener writes bypass them."""
+
 import os
-import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-if isinstance(sys.modules.get("Database.database"), MagicMock):
-    del sys.modules["Database.database"]
-
+from conftest import DatabaseTestCase, rawSpotifyTrackForTest
 from Database.database import Database
 
 
-def _bareDatabase():
-    db = Database.__new__(Database)
-    db.user = "alice"
-    db.repo = MagicMock()
-    db.appendMetadata = MagicMock(return_value=True)
-    return db
+PLAYED_AT = 1_700_000_000
+DURATION_MS = 180_000
+MILLISECONDS_PER_SECOND = 1_000
 
 
-TRACK = {"id": "t1", "name": "Song One", "duration_ms": 180000}
+class TestAppendTrackDataDedupGuard(DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.db = self._makeDb({}, [], username="alice")
+        self.db.saveImagesFromTrack = MagicMock()
+        self.db.updatePlaylists = MagicMock()
+        self.track = rawSpotifyTrackForTest("t1", name="Song One")
+        self.track["duration_ms"] = DURATION_MS
 
+    def _append(self, *, source="web_api_backfill", timestamp=PLAYED_AT):
+        return self.db.appendTrackData(timestamp, self.track,
+                                       self.track.get("duration_ms") or 0, source=source)
 
-class TestAppendTrackDataDedupGuard(unittest.TestCase):
-    @patch("Database.database.Client")
-    def test_backfill_with_nearby_play_is_skipped(self, mock_client):
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = True
+    def test_backfill_with_confirmed_play_is_skipped(self):
+        self.assertTrue(self._append(source="listener"))
+        self.assertFalse(self._append())
+        self.assertEqual(self.db.repo.connection().execute("SELECT COUNT(*) FROM plays").fetchone()[0], 1)
 
-        result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
+    def test_backfill_with_no_confirmed_play_is_inserted(self):
+        self.assertTrue(self._append())
+        row = self.db.repo.connection().execute("SELECT played_at, created_reason FROM plays").fetchone()
+        self.assertEqual(tuple(row), (PLAYED_AT, "web_api_backfill_play (user: alice)"))
 
-        self.assertFalse(result)
-        db.appendMetadata.assert_not_called()
+    def test_live_listener_repeats_bypass_the_api_guard(self):
+        self.assertTrue(self._append(source="listener"))
+        with patch.object(self.db.repo, "findMatchingBackfillPlay") as guard:
+            self.assertTrue(self._append(source="listener", timestamp=PLAYED_AT + 1))
+        guard.assert_not_called()
+        self.assertEqual(self.db.repo.connection().execute("SELECT COUNT(*) FROM plays").fetchone()[0], 2)
 
-    @patch("Database.database.Client")
-    def test_backfill_with_no_nearby_play_is_inserted(self, mock_client):
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = False
+    def test_backfill_guard_retains_duration_plus_margin_for_legacy_rows(self):
+        with patch.object(self.db.repo, "findMatchingBackfillPlay", return_value=None) as guard:
+            self.assertTrue(self._append())
+        guard.assert_called_once_with(
+            "alice", "t1", PLAYED_AT,
+            DURATION_MS // MILLISECONDS_PER_SECOND + Database.BACKFILL_INSERT_GUARD_EXTRA_SECONDS,
+            skipToleranceSeconds=Database.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS,
+            page=ANY)
 
-        result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
+    def test_backfill_guard_handles_missing_duration(self):
+        self.track.pop("duration_ms")
+        with patch.object(self.db.repo, "findMatchingBackfillPlay", return_value=None) as guard:
+            self.assertTrue(self._append())
+        guard.assert_called_once_with(
+            "alice", "t1", PLAYED_AT, Database.BACKFILL_INSERT_GUARD_EXTRA_SECONDS,
+            skipToleranceSeconds=Database.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS,
+            page=ANY)
 
-        self.assertTrue(result)
-        db.appendMetadata.assert_called_once()
+    def test_backfill_skipped_logs_when_debug_enabled(self):
+        self.assertTrue(self._append(source="listener"))
+        for value in ("1", "true"):
+            with self.subTest(debug=value), patch.dict(os.environ, {"FLASK_DEBUG": value}), \
+                    patch("Database.database.logger") as logger:
+                self.assertFalse(self._append())
+                messages = [call.args[0] for call in logger.info.call_args_list]
+                self.assertTrue(any("Skipping backfilled play" in message for message in messages))
+                self.assertFalse(any("Recording play" in message for message in messages))
 
-    @patch("Database.database.Client")
-    def test_listener_source_with_nearby_play_is_still_inserted(self, mock_client):
-        """Locks in the design decision: the guard must never apply to the
-        live listener's own insert path. A genuine short-track replay within
-        duration+60s is normal listener behavior and must not be dropped."""
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = True  # even if a "nearby" play exists
-
-        result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="listener")
-
-        self.assertTrue(result)
-        db.appendMetadata.assert_called_once()
-        db.repo.hasPlayNearTime.assert_not_called()  # guard isn't even consulted for listener source
-
-    @patch("Database.database.Client")
-    def test_backfill_guard_uses_duration_plus_extra_seconds_tolerance(self, mock_client):
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = False
-
-        db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
-
-        db.repo.hasPlayNearTime.assert_called_once_with(
-            "alice", "t1", 1000.0, 180 + Database.BACKFILL_INSERT_GUARD_EXTRA_SECONDS,
-            listenerEndToleranceSeconds=Database.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS,
-            skipToleranceSeconds=Database.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS
-        )
-
-    @patch("Database.database.Client")
-    def test_backfill_guard_handles_missing_duration(self, mock_client):
-        """A track dict with no duration_ms must not crash the guard - falls
-        back to just the extra-seconds margin."""
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = False
-
-        db.appendTrackData("2026-07-13T10:00:00Z", {"id": "t1", "name": "No Duration"}, 0, source="web_api_backfill")
-
-        db.repo.hasPlayNearTime.assert_called_once_with(
-            "alice", "t1", 1000.0, Database.BACKFILL_INSERT_GUARD_EXTRA_SECONDS,
-            listenerEndToleranceSeconds=Database.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS,
-            skipToleranceSeconds=Database.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS
-        )
-
-    @patch("Database.database.Client")
-    @patch("Database.database.logger")
-    def test_backfill_skipped_logs_when_debug_enabled(self, mock_logger, mock_client):
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = True
-
-        with patch.dict(os.environ, {"FLASK_DEBUG": "1"}):
-            result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
-        
-        self.assertFalse(result)
-        # Check logger.info was called with the skip message
-        info_calls = [args[0] for args, _ in mock_logger.info.call_args_list if "Skipping backfilled play" in args[0]]
-        self.assertTrue(len(info_calls) > 0)
-
-        mock_logger.reset_mock()
-
-        with patch.dict(os.environ, {"FLASK_DEBUG": "true"}):
-            result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
-        
-        self.assertFalse(result)
-        info_calls = [args[0] for args, _ in mock_logger.info.call_args_list if "Skipping backfilled play" in args[0]]
-        self.assertTrue(len(info_calls) > 0)
-
-    @patch("Database.database.Client")
-    @patch("Database.database.logger")
-    def test_backfill_skipped_does_not_log_when_debug_disabled(self, mock_logger, mock_client):
-        mock_client.formatTrack.return_value = {"id": "t1", "playedAt": 1000.0}
-        db = _bareDatabase()
-        db.repo.hasPlayNearTime.return_value = True
-
-        with patch.dict(os.environ, {"FLASK_DEBUG": "0"}):
-            result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
-        
-        self.assertFalse(result)
-        # Check logger.info was NOT called with the skip message
-        info_calls = [args[0] for args, _ in mock_logger.info.call_args_list if "Skipping backfilled play" in args[0]]
-        self.assertEqual(len(info_calls), 0)
-
-        mock_logger.reset_mock()
-
-        with patch.dict(os.environ, {}):
-            if "FLASK_DEBUG" in os.environ:
-                del os.environ["FLASK_DEBUG"]
-            result = db.appendTrackData("2026-07-13T10:00:00Z", TRACK, 180000, source="web_api_backfill")
-            
-        self.assertFalse(result)
-        info_calls = [args[0] for args, _ in mock_logger.info.call_args_list if "Skipping backfilled play" in args[0]]
-        self.assertEqual(len(info_calls), 0)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_backfill_skipped_does_not_log_when_debug_disabled(self):
+        self.assertTrue(self._append(source="listener"))
+        for value in ("0", None):
+            with self.subTest(debug=value), patch.dict(os.environ), patch("Database.database.logger") as logger:
+                if value is None:
+                    os.environ.pop("FLASK_DEBUG", None)
+                else:
+                    os.environ["FLASK_DEBUG"] = value
+                self.assertFalse(self._append())
+                messages = [call.args[0] for call in logger.info.call_args_list]
+                self.assertFalse(any("Skipping backfilled play" in message for message in messages))

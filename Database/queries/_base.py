@@ -50,6 +50,17 @@ except ModuleNotFoundError:
                               keyFingerprint)
     from utils import SECONDS_PER_DAY
 
+try:
+    from Database.backup_settings import (
+        BACKUP_INTERVAL_HOURS_KEY, BACKUP_INTERVAL_HOURS_MIN, BACKUP_INTERVAL_HOURS_MAX,
+        BACKUP_RETENTION_COUNT_KEY, BACKUP_RETENTION_COUNT_MIN, BACKUP_RETENTION_COUNT_MAX,
+    )
+except ModuleNotFoundError:
+    from backup_settings import (
+        BACKUP_INTERVAL_HOURS_KEY, BACKUP_INTERVAL_HOURS_MIN, BACKUP_INTERVAL_HOURS_MAX,
+        BACKUP_RETENTION_COUNT_KEY, BACKUP_RETENTION_COUNT_MIN, BACKUP_RETENTION_COUNT_MAX,
+    )
+
 IMAGE_KIND_TRACK = "track"
 IMAGE_KIND_ARTIST = "artist"
 IMAGE_STATUS_PENDING = "pending"
@@ -198,16 +209,6 @@ COMPLETION_COMPLETE_PERCENT_KEY = "completion_complete_percent"
 COMPLETION_COMPLETE_PERCENT_MIN = 50
 COMPLETION_COMPLETE_PERCENT_MAX = 100
 COMPLETION_COMPLETE_PERCENT_DEFAULT = 80
-
-# Backup schedule (was env-only: BACKUP_INTERVAL_HOURS / BACKUP_RETENTION_COUNT).
-# 0 disables. Read once when the BackupWorker is constructed -> applies after a
-# restart. The env vars remain the fallback default when the setting is unset.
-BACKUP_INTERVAL_HOURS_KEY = "backup_interval_hours"
-BACKUP_INTERVAL_HOURS_MIN = 0
-BACKUP_INTERVAL_HOURS_MAX = 168        #< one week
-BACKUP_RETENTION_COUNT_KEY = "backup_retention_count"
-BACKUP_RETENTION_COUNT_MIN = 0
-BACKUP_RETENTION_COUNT_MAX = 365
 
 # Whether login enforces the "do these cookies belong to this email" check
 # (was env-only: SKIP_EMAIL_VERIFICATION disabled it). Absent row = enabled;

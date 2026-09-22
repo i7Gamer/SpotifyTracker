@@ -26,6 +26,8 @@ from Database.dbmodule import dbmod as _dbmod
 #< a direct import, unlike _dbmod above: Database.utils imports nothing but the
 #  standard library, so it cannot take part in the cycle _dbmod exists to break
 from Database.utils import flaskDebugEnabled
+from Database.metadata_repair import WrappedRepairResult
+from Database.backfill_matching import BackfillPage
 
 # Drop counters (see StreamingHistoryImporter._processPlay) whose plays WOULD
 # import on a later attempt: the lookup failed, the data didn't. An overwrite
@@ -150,7 +152,23 @@ class ImportMixin:
 
     # ---- writing plays ---------------------------------------------------------------
 
-    def appendMetadata(self, meta: dict, created_reason: str | None = None) -> bool:
+    def _beginMetadataWrite(self):
+        """Reserve the writer before reading catalog state used by repair decisions."""
+        conn = self.repo.connection()
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    def _logCommittedMetadataRepair(self, source: str, result: WrappedRepairResult | None) -> None:
+        if result is not None:
+            _dbmod.logger.info(
+                "Metadata repair committed: source=%s user=%s repaired=%d repair_deleted=%d "
+                "history_deleted=%d mode=%s reason=%s",
+                source, self.user, result.repaired, result.repairDeleted, result.historyDeleted,
+                result.mode, result.reason or "within_limits")
+
+    def appendMetadata(self, meta: dict, created_reason: str | None = None,
+                       *, backfillPage: BackfillPage | None = None) -> bool:
         self.saveImagesFromTrack(meta)
         entry, track = self._splitEntryAndTrack(meta)
         # These two are ONE transaction that this method owns: neither commits
@@ -167,67 +185,56 @@ class ImportMixin:
         # upsertPlaylistName's `with conn:`) and runs only once the play is
         # durably committed, so it has no part in this transaction.
         try:
-            self.repo.upsertTrack(track, created_reason=created_reason)
+            conn = self._beginMetadataWrite()
+            impact = self.repo.upsertTrack(track, created_reason=created_reason)
             # Classify against the current threshold + the track's duration (percent
             # mode needs it); a sub-threshold event now lands as is_skip=1 in plays
             # rather than in a separate table.
             is_skip = self.repo.computeIsSkip(entry["timePlayed"], track.get("duration"))
-            was_inserted = self.repo.insertPlay(self.user, entry["id"], entry["playedAt"], entry["timePlayed"], entry.get("playedFrom"),
-                                  created_reason=created_reason, is_skip=is_skip)
+            matched = None
+            if backfillPage is not None:
+                # The catalog write exposes newly discovered recording aliases.
+                # Recheck while holding the same writer reservation as the insert:
+                # another worker cannot insert an alias copy between these steps.
+                legacyTolerance = (track.get("duration") or 0) // 1000 + self.BACKFILL_INSERT_GUARD_EXTRA_SECONDS
+                matched = self.repo.findMatchingBackfillPlay(
+                    self.user, entry["id"], entry["playedAt"], legacyTolerance,
+                    skipToleranceSeconds=self.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS,
+                    page=backfillPage)
+            was_inserted = False
+            if matched is None:
+                was_inserted = self.repo.insertPlay(
+                    self.user, entry["id"], entry["playedAt"], entry["timePlayed"], entry.get("playedFrom"),
+                    created_reason=created_reason, is_skip=is_skip)
+            repairResult = self.repo._invalidateWrappedForRepairs(conn, [impact]) if impact is not None else None
             self.repo.commit()
         except Exception:
             self.repo.rollbackQuietly()
             raise
+        if matched is not None:
+            # A rollback must never consume this row for the rest of the page.
+            backfillPage.claim(matched, entry["playedAt"])
+            if flaskDebugEnabled():
+                _dbmod.logger.info(
+                    "Skipping backfilled play for track %s (%s): a confirmed recording already exists "
+                    "for played_at=%s", entry["id"], track.get("name", "unknown"), entry["playedAt"])
+        self._logCommittedMetadataRepair("live", repairResult)
         self.updatePlaylists(entry.get("playedFrom"))
         return was_inserted
 
-    def appendTrackData(self, timestamp, track, timePlayed, context=None, source="listener"):
+    def appendTrackData(self, timestamp, track, timePlayed, context=None, source="listener",
+                        *, backfillPage: BackfillPage | None = None):
         formatted_track = _dbmod.Client.formatTrack(track, timestamp, timePlayed, context=context)
         track_id = track.get("id", "unknown")
         track_name = track.get("name", "unknown")
-
+        kwargs = {}
         if source == self.WEB_API_BACKFILL_SOURCE:
-            # Wide, defense-in-depth guard: skip if this exact track already has a
-            # play within (duration + 60s) of this one. Deliberately NOT applied to
-            # the live listener's own inserts (source == "listener") - the listener
-            # is the primary, trusted source, and a genuine short-track replay
-            # within this window is normal listening behavior that must not be
-            # silently dropped. Backfill is a catch-up mechanism and should be
-            # conservative about re-adding something a trusted source may already
-            # have captured - this window is symmetric so it catches a duplicate
-            # regardless of whether Spotify reported this entry's played_at as a
-            # start or end time (see _checkWebApiBackfill for why that can't be
-            # assumed one way or the other).
-            #
-            # The listener-end tolerance covers the case the duration window
-            # cannot: a mid-track pause stretches start-to-end by an unbounded
-            # amount, but a listener row's created_at is its observed end (the
-            # listener inserts at the track-change moment), so an entry whose
-            # played_at sits at that stamp is the same listen however long the
-            # pause was (see BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS).
-            #
-            # Both of those only ever look at real plays, and this source can
-            # never produce one that matches a SKIP: with no ms_played from the
-            # Web API the row below stamps the track's whole duration, so it is
-            # is_skip=0 by construction and a skipped listen was invisible to
-            # the guard entirely (2026-08-14: a 3.6s skip came back as a full
-            # 220s play recorded 15s away). The skip tolerance is that third
-            # arm, and is tight for the reason its constant explains.
-            durationSeconds = (track.get("duration_ms", 0) or 0) // 1000
-            tolerance = durationSeconds + self.BACKFILL_INSERT_GUARD_EXTRA_SECONDS
-            if self.repo.hasPlayNearTime(self.user, track_id, formatted_track["playedAt"], tolerance,
-                                         listenerEndToleranceSeconds=self.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS,
-                                         skipToleranceSeconds=self.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS):
-                if flaskDebugEnabled():
-                    _dbmod.logger.info(
-                        "Skipping backfilled play for track %s (%s): an existing play already exists "
-                        "within %ds (duration+60s) of played_at=%s",
-                        track_id, track_name, tolerance, formatted_track["playedAt"],
-                    )
-                return False
-
+            # Page claims never enter Listener. A direct API insert still gets
+            # a private one-item page, so every API path uses the atomic guard.
+            kwargs["backfillPage"] = backfillPage if backfillPage is not None else BackfillPage([
+                {"track": track, "played_at": timestamp}])
         created_reason = f"{source}_play (user: {self.user})"
-        was_inserted = self.appendMetadata(formatted_track, created_reason=created_reason)
+        was_inserted = self.appendMetadata(formatted_track, created_reason=created_reason, **kwargs)
         if was_inserted:
             _dbmod.logger.info(
                 "Recording play for user %s: track=%s (%s), timestamp=%s, duration=%dms, source=%s",
@@ -270,6 +277,8 @@ class ImportMixin:
             # same run-state fields itself (see _applyImportData's except).
             claimedRowIdsBefore = set(runState.claimedRowIds)
             insertedPlayKeysBefore = set(runState.insertedPlayKeys)
+            pendingRepairImpactsBefore = list(runState.pendingRepairImpacts)
+            correctedYearsBefore = set(runState.correctedYears)
             try:
                 staged = self._stageImportData(importer, exportedHistory, progressPrefix,
                                                hasPriorError, self.writeProgress, runState, deferCommit=False)
@@ -280,6 +289,9 @@ class ImportMixin:
                 self.repo.rollbackQuietly()
                 runState.claimedRowIds = claimedRowIdsBefore
                 runState.insertedPlayKeys = insertedPlayKeysBefore
+                runState.pendingRepairImpacts = pendingRepairImpactsBefore
+                runState.correctedYears = correctedYearsBefore
+                runState.committedRepairResult = None
                 self.writeProgress("failed", 0, 0, f"{progressPrefix}Import failed: {_dbmod.parseError(e)}", error=True)
                 raise
             if staged is None:
@@ -390,7 +402,7 @@ class ImportMixin:
 
         return stagedTracks, stagedPlays, total, importStats
 
-    def _claimNearbySkip(self, track_id, played_at, runState) -> bool:
+    def _claimNearbySkip(self, track_id, played_at, runState) -> dict | None:
         """Claim the nearest existing skip row (is_skip=1) of this track
         within SKIP_NEAR_TIME_TOLERANCE_SECONDS of played_at, if there is
         one - the one physical event the live listener already recorded
@@ -399,8 +411,8 @@ class ImportMixin:
         start-vs-end ambiguity), so one skip landed twice and inflated
         skip counts.
 
-        Returns True when a row was claimed (the entry is already
-        recorded; insert nothing), False when there is nothing to claim.
+        Returns the claimed row when one exists (the entry is already
+        recorded; insert nothing), or None when there is nothing to claim.
         Shared by the two callers that store an entry as a skip: the
         sub-floor skip path (_applySkipEntry) and the real-play path once
         it has found nothing to correct - see the dispatch comment in
@@ -414,7 +426,7 @@ class ImportMixin:
             if not runState.isOwnWrite(track_id, skip)
         ]
         if not nearbySkips:
-            return False
+            return None
         # Claim it, exactly as the real-play path does. An
         # unclaimed match stayed a candidate for every LATER
         # entry too, so a second genuine skip inside the same
@@ -424,10 +436,10 @@ class ImportMixin:
         # depend on the order the query returned them in.
         closest = min(nearbySkips, key=lambda skip: abs(skip["played_at"] - played_at))
         runState.claimedRowIds.add(closest["id"])
-        return True
+        return closest
 
     def _applySkipEntry(self, track_id, played_at, time_played, extras, runState,
-                        playedFrom=None) -> int:
+                        playedFrom=None) -> tuple[int, int]:
         """Sub-5s events (entry["isSkip"], the fixed import floor) never
         claim or correct a real play row - they match only against
         other skips (see _claimNearbySkip for why matching against
@@ -435,11 +447,15 @@ class ImportMixin:
 
         The apply loop's per-entry dispatch calls this and always
         `continue`s afterward - this branch fully owns the entry once
-        isSkip fires. Returns 1 when a new skip play was inserted, 0 when
-        an existing nearby skip was claimed instead (so the caller's
-        skipsSavedCount only counts genuine new rows)."""
-        if self._claimNearbySkip(track_id, played_at, runState):
-            return 0
+        isSkip fires. Returns (skipsSaved, enriched) so the caller's
+        skipsSavedCount only counts genuine new rows while metadata enrichment
+        remains visible in the import summary."""
+        extras = extras or {}
+        extrasValues = [extras.get(column) for column in _dbmod.BEHAVIORAL_COLUMNS]
+        claimedSkip = self._claimNearbySkip(track_id, played_at, runState)
+        if claimedSkip is not None:
+            enriched = self._enrichMatchedPlay(claimedSkip, playedFrom, extras, extrasValues)
+            return 0, int(enriched)
         #< playedFrom passed through exactly as the real-play insert passes
         #  it: this path used to drop the playlist context of every sub-floor
         #  skip on the way in
@@ -447,8 +463,8 @@ class ImportMixin:
                                 created_reason=f"history_import (user: {self.user})",
                                 extras=extras, is_skip=1):
             runState.insertedPlayKeys.add((track_id, played_at))
-            return 1
-        return 0
+            return 1, 0
+        return 0, 0
 
     def _nearTimeMatches(self, track_id, played_at, durationSeconds, runState):
         """Existing play rows within (duration + 60s) tolerance of one import
@@ -472,8 +488,22 @@ class ImportMixin:
                 matches.append(m)
         return matches
 
+    def _enrichMatchedPlay(self, existing_play, playedFrom, extras, extrasValues) -> bool:
+        """Apply supplied context/behavioral values and report actual changes."""
+        contextDiffers = (
+            playedFrom is not None and playedFrom != existing_play.get("played_from")
+        )
+        extrasDiffers = any(
+            extras.get(column) is not None and extras.get(column) != existing_play.get(column)
+            for column in _dbmod.BEHAVIORAL_COLUMNS
+        )
+        if not (contextDiffers or extrasDiffers):
+            return False
+        self.repo.enrichPlayBehavioralColumns(existing_play["id"], playedFrom, extrasValues)
+        return True
+
     def _reconcileSingleMatch(self, existing_play, track_id, played_at, time_played, isSkip,
-                              extras, extrasValues):
+                              playedFrom, extras, extrasValues):
         """The apply loop's exactly-one-match arm: safe to update the
         existing row in place rather than insert a duplicate. Returns
         (updated, enriched, correctedYears, earliestTouchedTimestamp) -
@@ -488,14 +518,6 @@ class ImportMixin:
             existing_play["played_at"] != played_at or
             existing_play["is_skip"] != isSkip
         )
-        # Behavioral columns the import can fill/correct on the
-        # matched row - a non-null import value wins, a None
-        # never clobbers a stored one (COALESCE below).
-        extras_differ = any(
-            extras.get(column) is not None and extras.get(column) != existing_play.get(column)
-            for column in _dbmod.BEHAVIORAL_COLUMNS
-        )
-
         if data_differs:
             # Update both fields with imported data (more accurate source).
             # A corrected time_played can cross the skip threshold, so
@@ -503,7 +525,7 @@ class ImportMixin:
             corrected_is_skip = isSkip
             try:
                 self.repo.correctPlay(existing_play["id"], played_at, time_played,
-                                       corrected_is_skip, extrasValues)
+                                       corrected_is_skip, playedFrom, extrasValues)
             except sqlite3.IntegrityError:
                 # Correcting played_at would collide with an existing
                 # (username, track_id, played_at) row the near-time
@@ -539,10 +561,9 @@ class ImportMixin:
             }
             earliestTouchedTimestamp = _minTimestamp(None, existing_play["played_at"], played_at)
             return True, False, correctedYears, earliestTouchedTimestamp
-        elif extras_differ:
+        elif self._enrichMatchedPlay(existing_play, playedFrom, extras, extrasValues):
             # Same play, but this import carries behavioral
             # metadata the row lacks - backfill it in place.
-            self.repo.enrichPlayBehavioralColumns(existing_play["id"], extrasValues)
             return False, True, set(), None
         else:
             # Data matches - skip, no update needed
@@ -565,9 +586,16 @@ class ImportMixin:
         # Rolled-back writes must not stay claimed in a batch-shared run state
         claimedRowIdsBefore = set(runState.claimedRowIds)
         insertedPlayKeysBefore = set(runState.insertedPlayKeys)
+        pendingRepairImpactsBefore = list(runState.pendingRepairImpacts)
+        correctedYearsBefore = set(runState.correctedYears)
+        if not deferCommit:
+            runState.committedRepairResult = None
         try:
+            conn = self._beginMetadataWrite()
             for track in stagedTracks.values():
-                self.repo.upsertTrack(track, created_reason=f"history_import (user: {self.user})")
+                impact = self.repo.upsertTrack(track, created_reason=f"history_import (user: {self.user})")
+                if impact is not None:
+                    runState.pendingRepairImpacts.append(impact)
 
             insertedCount = 0
             updatedCount = 0
@@ -627,9 +655,11 @@ class ImportMixin:
                 # _applySkipEntry for why a sub-5s event never claims or
                 # corrects a real play row.
                 if entry.get("isSkip") and isSkip:
-                    skipsSavedCount += self._applySkipEntry(track_id, played_at, time_played,
-                                                            entry.get("importExtras"), runState,
-                                                            playedFrom=played_from)
+                    skipsSaved, skipsEnriched = self._applySkipEntry(
+                        track_id, played_at, time_played, entry.get("importExtras"), runState,
+                        playedFrom=played_from)
+                    skipsSavedCount += skipsSaved
+                    enrichedCount += skipsEnriched
                     continue
 
                 # Check if a play for this track already exists within (duration + 60s) tolerance -
@@ -645,7 +675,8 @@ class ImportMixin:
                         existing_play = matches[0]
                         runState.claimedRowIds.add(existing_play["id"])
                         updated, enriched, matchCorrectedYears, matchTouchedTimestamp = self._reconcileSingleMatch(
-                            existing_play, track_id, played_at, time_played, isSkip, extras, extrasValues)
+                            existing_play, track_id, played_at, time_played, isSkip,
+                            played_from, extras, extrasValues)
                         if updated:
                             updatedCount += 1
                             correctedYears |= matchCorrectedYears
@@ -692,8 +723,12 @@ class ImportMixin:
                 # real-play path's own tight second look, not a widening of
                 # the matcher: the duration-wide window above would swallow a
                 # genuine second abandon of the same track later in a session.
-                if isSkip and self._claimNearbySkip(track_id, played_at, runState):
-                    continue
+                if isSkip:
+                    claimedSkip = self._claimNearbySkip(track_id, played_at, runState)
+                    if claimedSkip is not None:
+                        if self._enrichMatchedPlay(claimedSkip, played_from, extras, extrasValues):
+                            enrichedCount += 1
+                        continue
 
                 # Otherwise insert as usual, with the is_skip computed above
                 # from the batch threshold + this track's duration.
@@ -720,71 +755,58 @@ class ImportMixin:
             if track_file_hash and not retryableDropped:
                 self.repo.markFileImported(self.user, _exportContentHash(exportedHistory))
 
+            # Both corrections and new earlier listens can move discoveries
+            # in later years. A metadata-only repair has no history scope.
+            touchedYears = set(correctedYears)
+            if earliestTouchedTimestamp is not None:
+                touchedYears.add(_dbmod.convertToDatetime(earliestTouchedTimestamp, tz=self.tz).year)
             if deferCommit:
-                # Atomic overwrite batch: the caller commits once for the
-                # whole batch. deleteUserWrappedFromYear self-commits
-                # (INVARIANT above), so invalidating now would flush this
-                # transaction's still-uncommitted writes early - the caller
-                # invalidates these years itself after its own commit succeeds.
+                # The outer batch owns invalidation and commit after all
+                # files, including their final catalog membership, are known.
                 runState.correctedYears |= correctedYears
             else:
+                historyScopes = ((self.user, min(touchedYears)),) if touchedYears else ()
+                repairResult = (self.repo._invalidateWrappedForRepairs(
+                    conn, runState.pendingRepairImpacts, historyScopes)
+                    if runState.pendingRepairImpacts else None)
                 self.repo.commit()
-
-                # INVARIANT-safe only here: the Wrapped deletes self-commit, so
-                # they must never run while import rows are staged.
-                #
-                # Two ways a cached year goes wrong, and _wrappedCacheNeedsRecalc
-                # sees neither. A CORRECTION can move a play without changing its
-                # year's play count or max timestamp. And an INSERT into any year
-                # can move a later year's discoveries, which are anchored on
-                # all-time first listens - so the years to drop start at the
-                # oldest play written, not at the years written to.
-                touchedYears = set(correctedYears)
-                if earliestTouchedTimestamp is not None:
-                    touchedYears.add(
-                        _dbmod.convertToDatetime(earliestTouchedTimestamp, tz=self.tz).year)
-                self._invalidateWrappedFromEarliestOf(touchedYears, "Import")
-
-                # Only reached once this file's write has actually committed
-                # (an exception above jumps straight to the except below and
-                # never gets here), so a file whose commit itself fails is
-                # never double-counted here and again on a later re-import.
-                # A multi-file append batch (_importHistoryBatchLocked) sums
-                # this across every file for its own final progress line,
-                # which otherwise overwrites this per-file line in
-                # import_progress before the user's browser ever polls it -
-                # the overwrite batch never reaches this branch with a
-                # nonzero count (_guardStagedDrops aborts it first), so this
-                # accumulator stays 0 there.
-                runState.retryableDroppedTotal += retryableDropped
-                runState.unreadableDroppedTotal += unreadableDropped
-
-            droppedNoTrack = importStats.get("droppedNoTrack", 0)
-            summary = (f"{insertedCount} new, {updatedCount} corrected, {enrichedCount} enriched, "
-                       f"{skipsSavedCount} skips saved")
-            if droppedNoTrack:
-                summary += f", {droppedNoTrack} without track info dropped"
-            if unreadableDropped:
-                #< reached only the server log before; the file is still
-                #  hash-marked above, because a row the parser cannot read is
-                #  dropped again by any re-import, so no advice to retry
-                summary += f", {unreadableDropped} unreadable entries skipped"
-            if retryableDropped:
-                #< the same count that withheld the hash mark above - named
-                #  here because until now these drops reached only the server
-                #  log, and the user was told "Import complete" over them
-                summary += (f", {retryableDropped} could not be looked up "
-                            "(re-import this file to retry them)")
-            _dbmod.logger.info("Imported %d tracks for user %s: %s", len(stagedTracks), self.user, summary)
-
-            status = "complete" if isFinalFile else "running"
-            reportProgress(status, total, total, f"{progressPrefix}Import complete: {summary}", error=hasPriorError)
+                runState.pendingRepairImpacts.clear()
+                runState.committedRepairResult = repairResult
         except Exception as e:
             self.repo.rollbackQuietly()
             runState.claimedRowIds = claimedRowIdsBefore
             runState.insertedPlayKeys = insertedPlayKeysBefore
+            runState.pendingRepairImpacts = pendingRepairImpactsBefore
+            runState.correctedYears = correctedYearsBefore
+            runState.committedRepairResult = None
             self.writeProgress("failed", index, total, f"{progressPrefix}Import failed: {_dbmod.parseError(e)}", error=True)
             raise
+
+        # Reporting and legacy non-repair cache cleanup happen after the
+        # commit boundary. An error here must never pretend durable writes
+        # were rolled back or put committed repair impacts back into the run.
+        if not deferCommit:
+            if runState.committedRepairResult is not None:
+                self._logCommittedMetadataRepair("append", runState.committedRepairResult)
+            else:
+                self._invalidateWrappedFromEarliestOf(touchedYears, "Import")
+            runState.retryableDroppedTotal += retryableDropped
+            runState.unreadableDroppedTotal += unreadableDropped
+
+        droppedNoTrack = importStats.get("droppedNoTrack", 0)
+        summary = (f"{insertedCount} new, {updatedCount} corrected, {enrichedCount} enriched, "
+                   f"{skipsSavedCount} skips saved")
+        if droppedNoTrack:
+            summary += f", {droppedNoTrack} without track info dropped"
+        if unreadableDropped:
+            summary += f", {unreadableDropped} unreadable entries skipped"
+        if retryableDropped:
+            summary += (f", {retryableDropped} could not be looked up "
+                        "(re-import this file to retry them)")
+        _dbmod.logger.info("Imported %d tracks for user %s: %s", len(stagedTracks), self.user, summary)
+
+        status = "complete" if isFinalFile else "running"
+        reportProgress(status, total, total, f"{progressPrefix}Import complete: {summary}", error=hasPriorError)
 
     def importHistoryBatch(self, fileContents: list[str], overwriteRange: bool = False,
                            unreadableFileCount: int = 0) -> list[str]:
@@ -1005,9 +1027,10 @@ class ImportMixin:
         # imported files to FAILED/ and importHistoryBatch never raised the
         # milestone recalc flag. Each loop is guarded on its own so a Wrapped
         # hiccup still lets the cover art queue.
-        rewrittenYears = self._wrappedYearsToInvalidate(minStart, maxEnd, coveredYears,
-                                                        runState.correctedYears)
-        self._invalidateWrappedFromEarliestOf(rewrittenYears, "Overwrite import")
+        if runState.committedRepairResult is None:
+            rewrittenYears = self._wrappedYearsToInvalidate(minStart, maxEnd, coveredYears,
+                                                            runState.correctedYears)
+            self._invalidateWrappedFromEarliestOf(rewrittenYears, "Overwrite import")
         for track in runState.pendingImageTracks.values():
             try:
                 self.saveImagesFromTrack(track)
@@ -1117,8 +1140,11 @@ class ImportMixin:
         def noProgress(*args, **kwargs):
             return None
 
+        runState.committedRepairResult = None
+        runState.pendingRepairImpacts.clear()
         try:
             self.writeProgress("running", 0, total, f"Overwrite: applying {total} file(s)")
+            conn = self._beginMetadataWrite()
             deletedPlays, deletedSkips, skippedYears = self._deletePlaysInCoveredRange(minStart, maxEnd, coveredYears)
             message = f"Overwrite: staged deletion of {deletedPlays} plays and {deletedSkips} skip events in the covered range"
             if skippedYears:
@@ -1134,20 +1160,36 @@ class ImportMixin:
                                       progressPrefix, isFinalFile, False, True,
                                       runState, True, noProgress)
 
+            repairResult = None
+            if runState.pendingRepairImpacts:
+                rewrittenYears = self._wrappedYearsToInvalidate(minStart, maxEnd, coveredYears,
+                                                                runState.correctedYears)
+                historyScopes = ((self.user, min(rewrittenYears)),) if rewrittenYears else ()
+                repairResult = self.repo._invalidateWrappedForRepairs(conn, runState.pendingRepairImpacts,
+                                                                     historyScopes)
             self.repo.commit()
-            return True
+            runState.pendingRepairImpacts.clear()
+            runState.committedRepairResult = repairResult
         except Exception as e:
             # _applyImportData's except already rolled back the whole
             # transaction (the delete plus every prior file's staged writes)
             # when the failure came from an apply; call it again defensively
             # (a no-op if nothing is pending) in case it came from the delete.
             self.repo.rollbackQuietly()
+            runState.pendingRepairImpacts.clear()
+            runState.committedRepairResult = None
+            runState.correctedYears.clear()
+            runState.claimedRowIds.clear()
+            runState.insertedPlayKeys.clear()
             _dbmod.logger.error("Overwrite import aborted after a failure - no changes were applied, "
                         "original data is intact: %s", _dbmod.parseError(e))
             self.writeProgress("failed", 0, total,
                                f"Overwrite import aborted: no changes were applied, original data is intact - {_dbmod.parseError(e)}",
                                error=True)
             return False
+
+        self._logCommittedMetadataRepair("overwrite", runState.committedRepairResult)
+        return True
 
     @staticmethod
     def _sumImportStats(stagedFiles: list) -> dict:

@@ -5,6 +5,14 @@ automatic snapshots on or off. This is the rest: getting snapshots off the
 machine, the encryption key they are useless without, taking one by hand, and
 proving a restore actually works before you need it to.
 
+`BACKUP_INTERVAL_HOURS` and `BACKUP_RETENTION_COUNT` are environment fallbacks.
+Saved interval and retention values from the `/admin` backup settings take
+precedence after restart, and the same effective values are used by the admin
+form, scheduled worker and pre-upgrade snapshot. If either effective value is
+`0`, automatic scheduled and pre-upgrade snapshots are disabled; **Create
+Backup Now** remains available. `BACKUP_DIR` remains the environment-controlled
+destination.
+
 ## Getting snapshots off the machine
 
 `BACKUP_DIR` is how you fix that without any scripting of your own: point it at a path on another disk, or at a mount of somewhere off the machine entirely (a NAS, an SMB/NFS share, a cloud-storage mount). Mount that location into the container and name it here:

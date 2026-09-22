@@ -49,6 +49,7 @@ except ModuleNotFoundError:
 #  run, utils' own sys.path fix (see Database/utils.py) is what makes the
 #  repo-root config module importable at all
 from config import WEEKDAY_NAMES, IMPORT_KEYWORD_ENV_VAR
+from Database.metadata_repair import TrackRepairImpact, WrappedRepairResult
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,8 @@ class _ImportRunState:
     def __init__(self):
         self.claimedRowIds: set[int] = set()      #< existing rows updated or confirmed identical by this run
         self.insertedPlayKeys: set[tuple] = set() #< (track_id, played_at) of rows inserted by this run
+        self.pendingRepairImpacts: list[TrackRepairImpact] = []
+        self.committedRepairResult: WrappedRepairResult | None = None
         self.correctedYears: set[int] = set()     #< years to drop from Wrapped cache once a deferred-commit
                                                    #  batch (atomic overwrite) actually commits - see
                                                    #  _importHistoryLocked's deferCommit
@@ -2098,18 +2101,6 @@ class Database(MediaFetchMixin, ImportMixin, WorkerLifecycleMixin):
         knowing anything about it (see _dropUrisAlreadyInDatabase)."""
         return self.repo.getRecentlyRecordedTrackIds(
             self.user, trackIds, CONNECT_STATE_MISSED_TRACK_LOOKBACK_SECONDS)
-
-    def getRecordedPlayTimes(self, startTs: float, endTs: float) -> list[tuple[str, float, float | None]]:
-        """The (track_id, played_at, listener_created_at) triples this user
-        already has in a time window. Bound to this user and handed to the
-        Listener as a callback (like getRecentlyRecordedTrackIds above), so the
-        Web API backfill can tell a genuine gap from an empty in-memory cache
-        without the listener knowing anything about the database.
-
-        Triples, not bare times - see getTrackPlayTimesInRange for why the
-        dedup cannot be sound without the track id, and for what the third
-        element (a listener row's observed play end) is for."""
-        return self.repo.getTrackPlayTimesInRange(self.user, startTs, endTs)
 
     def getUserLastfmApiKey(self) -> str | None:
         return self.repo.getUserLastfmApiKey(self.user)

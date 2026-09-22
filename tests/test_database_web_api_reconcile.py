@@ -1,28 +1,10 @@
-"""Tests for Database._reconcileWithWebApiHistory.
+"""Only a one-to-one primary-source match can delete an API copy.
 
-Deletion requires TWO proofs, both anchored on provable double-recording:
-- proximity: another local row for the exact same track within
-  DUPLICATE_RECORDING_TOLERANCE_SECONDS, AND
-- mixed sources: the cluster contains a Web API backfill row plus at least
-  one row from another source (listener / import / legacy). Only the
-  backfill copies are ever deleted - backfill is the only secondary
-  recorder, so it can only ever re-capture a play some other source already
-  recorded.
-
-Same-source clusters are never touched: real exports genuinely contain a
-short skip immediately followed by a restart of the same track seconds
-later, so proximity alone is NOT proof of duplication. Absence from the Web
-API response is NEVER by itself grounds for deletion either - Spotify's
-recently-played endpoint isn't a complete log (item-count cap, its own
-play-duration threshold, track relinking), so a lone play with no
-same-track sibling is always left alone.
-
-Motivated in part by a real prior cross-user contamination incident (see
-CONTAMINATION_FIX.md) that left bad plays recorded for users who have since
-configured API credentials, and by repeated back-and-forth in this file's
-history over how aggressive deletion should be (see git log) - this test
-suite exists specifically to lock in the "never delete without proof"
-guarantee.
+Exact API events reserve their primary rows before proximity matching. One
+physical primary row cannot explain two distinct timestamps, including aliases.
+Merge groups and ISRCs prove recording identity; title/artist/duration does not
+justify deleting history. Same-source rows and absent API events remain safe.
+Listener end-only matches are ambiguous at truncated page boundaries and stay.
 """
 import sys
 import os
@@ -47,6 +29,7 @@ def _bareDatabase():
     db.user = "alice"
     db.repo = MagicMock()
     db.repo.deletePlay.return_value = True
+    db.repo._sameRecordingTrackIds.return_value = {}
     return db
 
 
@@ -60,7 +43,7 @@ END_TOLERANCE = Database.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS
 def _backfillRow(trackId, playedAt, canonicalId=None, isrc=None):
     #< canonicalId/isrc: the track's identity, which is what decides whether two
     #  DIFFERENT release ids describe the same recording (see _identityKeyOf)
-    return {"id": trackId, "playedAt": playedAt, "createdAt": None,
+    return {"rowId": (trackId, playedAt), "id": trackId, "playedAt": playedAt, "createdAt": None,
             "canonicalId": canonicalId, "isrc": isrc,
             "createdReason": "web_api_backfill_play (user: alice)"}
 
@@ -69,18 +52,18 @@ def _listenerRow(trackId, playedAt, createdAt=None, canonicalId=None, isrc=None)
     #< createdAt: the row's insert-time stamp - for listener rows this is the
     #  observed END of the play (the listener inserts at the track-change
     #  moment). getPlaysWithSourceInRange returns it for listener rows only.
-    return {"id": trackId, "playedAt": playedAt, "createdAt": createdAt,
+    return {"rowId": (trackId, playedAt), "id": trackId, "playedAt": playedAt, "createdAt": createdAt,
             "canonicalId": canonicalId, "isrc": isrc,
             "createdReason": "listener_play (user: alice)"}
 
 
 def _importRow(trackId, playedAt):
-    return {"id": trackId, "playedAt": playedAt,
+    return {"rowId": (trackId, playedAt), "id": trackId, "playedAt": playedAt,
             "createdReason": "history_import (user: alice)"}
 
 
 def _legacyRow(trackId, playedAt):
-    return {"id": trackId, "playedAt": playedAt, "createdReason": None}
+    return {"rowId": (trackId, playedAt), "id": trackId, "playedAt": playedAt, "createdReason": None}
 
 
 def _track(trackId):
@@ -210,7 +193,7 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
             _backfillRow("t1", API_TS + 2),
         ]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_TS + 2}])
 
         db.repo.deletePlay.assert_called_once_with("alice", "t1", API_TS + 2)
 
@@ -222,7 +205,7 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
             _backfillRow("t1", API_TS + 2),
         ]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_TS + 2}])
 
         db.repo.deletePlay.assert_called_once_with("alice", "t1", API_TS + 2)
 
@@ -265,7 +248,7 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
 
         db.repo.deletePlay.assert_not_called()
 
-    def test_multiple_backfill_copies_are_all_deleted(self):
+    def test_exact_page_event_reserves_primary_and_preserves_later_api_repeats(self):
         db = _bareDatabase()
         db.repo.getPlaysWithSourceInRange.return_value = [
             _listenerRow("t1", API_TS),
@@ -275,16 +258,11 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
 
         db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
 
-        deletedTimes = sorted(call.args[2] for call in db.repo.deletePlay.call_args_list)
-        self.assertEqual(deletedTimes, [API_TS + 2, API_TS + 4])
+        db.repo.deletePlay.assert_not_called()
 
     def test_clustering_is_independent_of_row_return_order(self):
-        """getPlaysWithSourceInRange() has no ORDER BY, so SQLite can return
-        same-track plays in any order. The clustering below picks an "anchor"
-        via list order (remaining.pop(0)) - it must process rows in a fixed
-        (chronological) order internally so the same underlying data always
-        produces the same deletions, regardless of what order the DB
-        happened to hand the rows back in."""
+        """The closest API event claims the primary row in chronological order,
+        independent of the order in which SQLite supplies physical rows."""
         db = _bareDatabase()
         listenerRow = _listenerRow("t1", API_TS)
         closeBackfill = _backfillRow("t1", API_TS + 3)   #< within tolerance of the listener row
@@ -293,7 +271,7 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
         # Deliberately not in chronological order.
         db.repo.getPlaysWithSourceInRange.return_value = [farBackfill, listenerRow, closeBackfill]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_TS + 3}])
 
         deletedTimes = [call.args[2] for call in db.repo.deletePlay.call_args_list]
         self.assertEqual(deletedTimes, [API_TS + 3])
@@ -336,7 +314,7 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
         ]
         db.repo.deletePlay.return_value = False
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_TS + 1}])
 
         db.repo.commit.assert_not_called()
 
@@ -353,13 +331,9 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
 
         db.repo.deletePlay.assert_not_called()
 
-    def test_pause_stretched_backfill_copy_is_deleted_via_the_recorded_end(self):
-        """The 2026-08-04 incident: a ~3-minute mid-track pause put the
-        backfill copy's played_at (Spotify's end-time reading) 474s after the
-        listener row's start - far outside the proximity tolerance. The
-        listener row's created_at IS the observed end (it was inserted at the
-        track-change moment), so pairing the backfill's played_at against it
-        recognises the double-recording regardless of how long the pause was."""
+    def test_listener_end_only_pair_preserves_a_possible_repeat(self):
+        """A paused copy and a new repeat at the observed end look identical.
+        Preserve the possible listen when the earlier API event is absent."""
         db = _bareDatabase()
         pausedElapsed = 474
         db.repo.getPlaysWithSourceInRange.return_value = [
@@ -369,7 +343,7 @@ class TestReconcileWithWebApiHistory(unittest.TestCase):
 
         db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
 
-        db.repo.deletePlay.assert_called_once_with("alice", "t1", API_TS)
+        db.repo.deletePlay.assert_not_called()
 
     def test_end_pairing_outside_the_tolerance_deletes_nothing(self):
         """A recorded end well away from the backfill row's played_at is
@@ -437,7 +411,7 @@ class TestReconcileAcrossReleases(unittest.TestCase):
             _backfillRow("t_api", API_TS + 1, canonicalId="t_live"),
         ]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t_api"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t_api"}, "played_at": API_TS + 1}])
 
         db.repo.deletePlay.assert_called_once_with("alice", "t_api", API_TS + 1)
 
@@ -449,7 +423,7 @@ class TestReconcileAcrossReleases(unittest.TestCase):
             _backfillRow("t_api", API_TS + 1, isrc="GBAYE0601498"),
         ]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t_api"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t_api"}, "played_at": API_TS + 1}])
 
         db.repo.deletePlay.assert_called_once_with("alice", "t_api", API_TS + 1)
 
@@ -463,7 +437,7 @@ class TestReconcileAcrossReleases(unittest.TestCase):
             _backfillRow("t_api", API_TS + 1, isrc="GBAYE0601498"),
         ]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t_api"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t_api"}, "played_at": API_TS + 1}])
 
         db.repo.deletePlay.assert_called_once_with("alice", "t_api", API_TS + 1)
 
@@ -500,13 +474,13 @@ class TestReconcileAcrossReleases(unittest.TestCase):
         behave exactly as it did before - grouped by its own track id."""
         db = _bareDatabase()
         db.repo.getPlaysWithSourceInRange.return_value = [
-            {"id": "t1", "playedAt": API_TS, "createdAt": None,
+            {"rowId": 1, "id": "t1", "playedAt": API_TS, "createdAt": None,
              "createdReason": "listener_play (user: alice)"},
-            {"id": "t1", "playedAt": API_TS + 1, "createdAt": None,
+            {"rowId": 2, "id": "t1", "playedAt": API_TS + 1, "createdAt": None,
              "createdReason": "web_api_backfill_play (user: alice)"},
         ]
 
-        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
+        db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_TS + 1}])
 
         db.repo.deletePlay.assert_called_once_with("alice", "t1", API_TS + 1)
 
@@ -695,10 +669,9 @@ class TestReconcileWindowBoundary(unittest.TestCase):
         #< the backfill copy goes, the listener row that proved it stays
         self.assertEqual(self._remainingPlayTimes(), [API_TS + TOLERANCE - 1])
 
-    def test_a_listener_row_that_ended_just_before_the_oldest_item_still_proves_one(self):
-        # The end-time arm at the low boundary: the listener row's created_at
-        # (its observed end) is what pairs with the backfill copy's played_at,
-        # and it can sit a few seconds before the oldest stamp in the page.
+    def test_listener_end_near_oldest_item_does_not_prove_a_copy(self):
+        # An observed end near the page boundary cannot distinguish a paused
+        # copy from a genuine repeat whose earlier API event fell off the page.
         with patch("Database.queries.plays.time") as mockTime:
             mockTime.time.return_value = API_TS - 2   #< the listener row's created_at
             self.repo.insertPlay("alice", "t1", API_TS - 300, 200000,
@@ -709,7 +682,7 @@ class TestReconcileWindowBoundary(unittest.TestCase):
 
         self.db._reconcileWithWebApiHistory([{"track": {"id": "t1"}, "played_at": API_PLAYED_AT}])
 
-        self.assertEqual(self._remainingPlayTimes(), [API_TS - 300])
+        self.assertEqual(self._remainingPlayTimes(), [API_TS - 300, API_TS])
 
     def test_padding_does_not_delete_a_lone_play_outside_the_span(self):
         """Widening the candidate set must not widen what counts as proof: a

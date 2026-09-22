@@ -19,8 +19,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from Database.database import Database
 from Database.backup import (
-    BackupWorker, _envInt, BACKUP_INTERVAL_ENV_VAR, BACKUP_RETENTION_ENV_VAR,
-    DEFAULT_BACKUP_INTERVAL_HOURS, DEFAULT_BACKUP_RETENTION_COUNT,
+    BackupWorker,
+)
+from Database.backup_settings import (
+    resolveBackupSettings, BACKUP_INTERVAL_HOURS_KEY, BACKUP_RETENTION_COUNT_KEY,
 )
 from routes._htmx import isHtmxSwap
 from routes._xhr import declaresItselfXhr as _declaresItselfXhr
@@ -299,11 +301,13 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
         # a manual backup command in the README protects nobody who doesn't run it.
         # Interval/retention come from admin settings, falling back to the env
         # vars then the code defaults; read once here, so changes apply on restart.
+        backupSettings = resolveBackupSettings(
+            self.repo.getAppSetting(BACKUP_INTERVAL_HOURS_KEY),
+            self.repo.getAppSetting(BACKUP_RETENTION_COUNT_KEY),
+        )
         self.backupWorker = BackupWorker(
-            intervalHours=self.repo.getBackupIntervalHours(
-                _envInt(BACKUP_INTERVAL_ENV_VAR, DEFAULT_BACKUP_INTERVAL_HOURS)),
-            retentionCount=self.repo.getBackupRetentionCount(
-                _envInt(BACKUP_RETENTION_ENV_VAR, DEFAULT_BACKUP_RETENTION_COUNT)),
+            intervalHours=backupSettings.intervalHours,
+            retentionCount=backupSettings.retentionCount,
         )
         # The workers themselves are constructed here (BackupWorker reads its
         # schedule from admin settings, and /admin's Worker Health panel reads

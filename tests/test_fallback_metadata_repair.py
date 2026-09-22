@@ -72,7 +72,7 @@ class TestFallbackMetadataRepair(DatabaseTestCase):
             spotify.return_value.current_user_recently_played.return_value = []
             listener = Listener("dummy", email="alice@example.test",
                                 get_credentials=lambda: {"client_id": "cid", "client_secret": "cs", "refresh_token": "rt"},
-                                get_recorded_play_times=self.db.getRecordedPlayTimes)
+                                process_backfill_page=self.db.process_backfill_page)
         callback = MagicMock(wraps=self.db._addToDatabaseFromListener)
         items = [{"track": catalogTrack(), "played_at": PLAYED_AT}]
         with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api", return_value={"id": "alice", "email": "alice@example.test"}), \
@@ -165,7 +165,7 @@ class TestFallbackMetadataRepair(DatabaseTestCase):
         before = self.conn.total_changes
         assert self.db._repairFallbackTrackMetadata([]) == 0
         assert self.db.repo.repairFallbackTracks([
-            Client.formatTrack(fallbackTrackRecord(REAL_ID), embedPlaybackInfo=False)]) == 0
+            Client.formatTrack(fallbackTrackRecord(REAL_ID), embedPlaybackInfo=False)]) is None
         assert self.conn.total_changes == before
 
     def test_repeated_metadata_repairs_the_track_once(self):
@@ -180,8 +180,13 @@ class TestFallbackMetadataRepair(DatabaseTestCase):
                                TRACK_DURATION_MS, created_reason=self.db.WEB_API_BACKFILL_SOURCE)
         self.db.repo.commit()
         assert len(self._plays()) == len(original) + 1
-        with patch.object(self.db.repo, "repairFallbackTracks", side_effect=RuntimeError("write interrupted")):
-            self.db._reconcileWithWebApiHistory([{"track": catalogTrack(), "played_at": PLAYED_AT}])
+        # Present the actual API copy. A different exact page event would
+        # reserve the primary row and correctly preserve this later timestamp.
+        copyTimestamp = timeToInt(PLAYED_AT) + BACKFILL_COPY_OFFSET_SECONDS
+        with patch.object(self.db.repo, "repairFallbackTracks",
+                          side_effect=RuntimeError("write interrupted")) as repair:
+            self.db._reconcileWithWebApiHistory([{"track": catalogTrack(), "played_at": copyTimestamp}])
+        repair.assert_called_once()
         assert self._plays() == original
 
     def test_repair_rechecks_fallback_under_write_lock_and_rolls_back_whole_batch(self):
@@ -190,15 +195,16 @@ class TestFallbackMetadataRepair(DatabaseTestCase):
         before = [dict(row) for row in self.conn.execute("SELECT * FROM tracks ORDER BY id")]
         statements = []
         recording = RecordingConnection(self.conn, statements)
-        upsert = self.db.repo.upsertTrack
+        privateWriter = self.db.repo._upsertTrackWithExisting
 
-        def failSecond(track):
-            upsert(track)
+        def failSecond(conn, track, createdReason, existing):
+            impact = privateWriter(conn, track, createdReason, existing)
             if track["id"] == REAL_ID_2:
                 raise RuntimeError("write interrupted")
+            return impact
 
         with patch.object(self.db.repo, "_conn", return_value=recording), \
-             patch.object(self.db.repo, "upsertTrack", side_effect=failSecond):
+             patch.object(self.db.repo, "_upsertTrackWithExisting", side_effect=failSecond):
             with self.assertRaisesRegex(RuntimeError, "write interrupted"):
                 self.db._repairFallbackTrackMetadata([catalogTrack(), catalogTrack(REAL_ID_2)])
         reads = [(sql, locked) for sql, locked in statements if sql.startswith("SELECT") and "FROM tracks" in sql]

@@ -380,6 +380,42 @@ class TestExportRoundTrip(DatabaseTestCase, _AppTestBase):
         expected = {(e["id"], e["playedAt"], e["timePlayed"]) for e in _ENTRIES}
         self.assertEqual(imported, expected)
 
+    def test_export_reimport_enriches_existing_rows_without_duplicates(self):
+        dash = self._makeApp()
+        sourceDb = self._makeDb(_TRACKS, _ENTRIES, username="alice")
+        sourceDb.repo.connection().execute(
+            "UPDATE plays SET played_from=?, platform=?, conn_country=?, reason_start=?, "
+            "reason_end=?, shuffle=?, skipped=?, offline=?, incognito=? "
+            "WHERE username=? AND track_id=?",
+            ("playlist:source", "ios", "CH", "clickrow", "trackdone", 0, 0, 0, 0,
+             "alice", "t1"),
+        )
+        sourceDb.repo.commit()
+        exportedJson = self._get(
+            dash, sourceDb, "/export-history?format=json").get_data(as_text=True)
+
+        # Existing target rows deliberately lack the source context and extras.
+        targetEntries = [{"id": entry["id"], "playedAt": entry["playedAt"],
+                          "timePlayed": entry["timePlayed"]} for entry in _ENTRIES]
+        targetDb = self._makeDb(_TRACKS, targetEntries, username="bob")
+        bareImporter = Importer.__new__(Importer)
+        bareImporter.sp = MagicMock()
+        with patch("Database.database.Importer", return_value=bareImporter):
+            targetDb.importHistory(exportedJson)
+            targetDb.importHistory(exportedJson)
+
+        rows = targetDb.repo.connection().execute(
+            "SELECT * FROM plays WHERE username=? ORDER BY played_at", ("bob",)).fetchall()
+        self.assertEqual(len(rows), len(_ENTRIES))
+        first = dict(rows[0])
+        self.assertEqual(first["played_from"], "playlist:source")
+        self.assertEqual(first["platform"], "ios")
+        self.assertEqual(first["conn_country"], "CH")
+        self.assertEqual(first["reason_end"], "trackdone")
+        self.assertEqual(first["shuffle"], 0)
+        self.assertEqual(first["offline"], 0)
+        self.assertEqual(first["incognito"], 0)
+
 
 class TestKeysetPagerTermination(unittest.TestCase):
     """The pager advances on the composite (played_at, playId) key the

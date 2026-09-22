@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+from Database.metadata_repair import TrackRepairImpact, WrappedRepairResult
 from Database.queries._base import WRAPPED_INVALIDATION_GENERATION_KEY, WRAPPED_YEAR_TZ_SLACK_SECONDS, json
+
+
+WRAPPED_REPAIR_MAX_EXPANDED_TRACKS = 128
+WRAPPED_REPAIR_MAX_MATCHED_PLAYS = 4096
 
 
 class WrappedQueries:
@@ -99,10 +104,15 @@ class WrappedQueries:
         conn = self._conn()
         with conn:
             self._bumpWrappedGeneration(conn)
-            return conn.execute(
-                "DELETE FROM user_wrapped WHERE username = ? AND year >= ?",
-                (username, year)
-            ).rowcount
+            return self._deleteUserWrappedFromYear(conn, username, year)
+
+    @staticmethod
+    def _deleteUserWrappedFromYear(conn, username: str, year: int) -> int:
+        """Compose a history scope into a transaction whose owner bumps the generation."""
+        return conn.execute(
+            "DELETE FROM user_wrapped WHERE username = ? AND year >= ?",
+            (username, year)
+        ).rowcount
 
     def deleteAllUserWrapped(self, username: str) -> int:
         """Drop every cached year for one user, for a change that invalidates
@@ -231,6 +241,78 @@ class WrappedQueries:
             "SELECT value FROM app_settings WHERE key = ?",
             (WRAPPED_INVALIDATION_GENERATION_KEY,)).fetchone()
         return int(row["value"]) if row else 0
+
+    def _expandWrappedRepairTracks(self, conn, impacts: list[TrackRepairImpact]) -> list[str] | None:
+        """Return a complete small dependency set, or None as soon as it is too large.
+
+        Keep old/new membership and the repaired tracks' final membership: a
+        later file may have rewritten one again before the batch commits.
+        Each SQL expansion stops at limit+1; broad invalidation never needs
+        the rest of a prolific album, artist or merge group enumerated.
+        """
+        trackIds = {impact.trackId for impact in impacts}
+        if len(trackIds) > WRAPPED_REPAIR_MAX_EXPANDED_TRACKS:
+            return None
+        repairedJson = json.dumps(sorted(trackIds))
+        albumIds = {album for impact in impacts for album in (impact.oldAlbumId, impact.newAlbumId)
+                    if album is not None}
+        artistIds = {artist for impact in impacts for artist in impact.oldArtistIds | impact.newArtistIds}
+        probeLimit = WRAPPED_REPAIR_MAX_EXPANDED_TRACKS + 1
+        trackIds.update(row["id"] for row in conn.execute(
+            """SELECT id FROM tracks WHERE album_id IN (
+                   SELECT value FROM json_each(?) UNION
+                   SELECT album_id FROM tracks WHERE id IN (SELECT value FROM json_each(?))
+               ) LIMIT ?""", (json.dumps(sorted(albumIds)), repairedJson, probeLimit)))
+        if len(trackIds) > WRAPPED_REPAIR_MAX_EXPANDED_TRACKS:
+            return None
+        trackIds.update(row["track_id"] for row in conn.execute(
+            """SELECT DISTINCT track_id FROM track_artists WHERE artist_id IN (
+                   SELECT value FROM json_each(?) UNION
+                   SELECT artist_id FROM track_artists WHERE track_id IN (SELECT value FROM json_each(?))
+               ) LIMIT ?""", (json.dumps(sorted(artistIds)), repairedJson, probeLimit)))
+        if len(trackIds) > WRAPPED_REPAIR_MAX_EXPANDED_TRACKS:
+            return None
+        expanded = self._mergeGroupTrackIds(conn, sorted(trackIds), limit=probeLimit)
+        return expanded if len(expanded) <= WRAPPED_REPAIR_MAX_EXPANDED_TRACKS else None
+
+    @staticmethod
+    def _countWrappedRepairPlays(conn, trackIds: list[str]) -> int:
+        """Count at most limit+1 indexed matches, only for users with cached years."""
+        return conn.execute(
+            """SELECT COUNT(*) FROM (
+                   SELECT 1 FROM plays p
+                   WHERE p.username IN (SELECT DISTINCT username FROM user_wrapped)
+                     AND p.track_id IN (SELECT value FROM json_each(?))
+                   LIMIT ?
+               )""", (json.dumps(trackIds), WRAPPED_REPAIR_MAX_MATCHED_PLAYS + 1)).fetchone()[0]
+
+    def _invalidateWrappedForRepairs(self, conn, impacts: list[TrackRepairImpact],
+                                     historyScopes=()) -> WrappedRepairResult | None:
+        """Invalidate repair and history scopes together, with one generation bump.
+
+        Never commits. Call only after all catalog/play writes while their
+        owning transaction still holds the writer reservation.
+        """
+        if not impacts:
+            return None
+        expanded = self._expandWrappedRepairTracks(conn, impacts)
+        reason = None
+        if expanded is None:
+            reason = "expanded_tracks"
+        elif self._countWrappedRepairPlays(conn, expanded) > WRAPPED_REPAIR_MAX_MATCHED_PLAYS:
+            reason = "matched_plays"
+        if reason is not None:
+            repairDeleted = self._deleteAllWrapped(conn)
+        else:
+            repairDeleted = self._deleteCachedWrappedForTracks(conn, expanded)
+        historyYears = {}
+        for username, year in historyScopes:
+            historyYears[username] = min(historyYears.get(username, year), year)
+        historyDeleted = sum(self._deleteUserWrappedFromYear(conn, username, year)
+                             for username, year in historyYears.items())
+        return WrappedRepairResult(
+            repaired=len({impact.trackId for impact in impacts}), repairDeleted=repairDeleted,
+            historyDeleted=historyDeleted, mode="broad" if reason else "targeted", reason=reason)
 
     @staticmethod
     def _bumpWrappedGeneration(conn) -> None:

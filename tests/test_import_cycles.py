@@ -37,7 +37,11 @@ FIRST_IMPORTS = (
     "Database.workers.wrapped_worker",
     "Database.workers",
     "Database.backup",          #< the migrators import this one standalone
+    "Database.backup_settings", #< the migrators' dependency-light resolver
+    "Database.Migrators.migrate1_32_0", #< settings seeding imports the leaf directly
     "Database.telemetry",
+    "Database.metadata_repair",
+    "Database.backfill_matching",
     "Database.import_service",
     "Database.media_fetch",
     "Database.queries.merges",
@@ -115,6 +119,17 @@ class TestDocumentedScriptEntryPointsStillRun(unittest.TestCase):
                 self.assertEqual(
                     result.returncode, 0,
                     f"`python {relativePath}` exited {result.returncode}:\n{result.stderr}")
+
+    def test_backup_settings_supports_the_migrator_style_standalone_import(self):
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import backup_settings; assert backup_settings.DEFAULT_BACKUP_INTERVAL_HOURS > 0"],
+            cwd=REPO_ROOT / "Database", capture_output=True, text=True,
+            timeout=IMPORT_TIMEOUT_SECONDS,
+            env={**os.environ, "TZ": "UTC"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TestModulesImportInAnyOrder(unittest.TestCase):
