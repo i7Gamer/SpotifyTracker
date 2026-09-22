@@ -210,6 +210,141 @@ def test_finish_without_pool_releases_claims_without_creating_an_entry(clock):
     assert not workers._LASTFM_CANDIDATE_POOLS
 
 
+def test_owner_cleanup_retires_only_its_kinds_scopes_and_database(clock):
+    worker = PoolHarness()
+    worker.user = "owner"
+    ownArtist = worker._pooledCandidates("artist", "owner", lambda _: rows("own-artist"))
+    worker._finishPooledCandidates("artist", "owner", ownArtist, [])
+    ownGlobal = worker._pooledCandidates("artist", None, lambda _: rows("own-global"))
+    worker._finishPooledCandidates("artist", None, ownGlobal, [])
+    otherKind = worker._pooledCandidates("album", "owner", lambda _: rows("other-kind"))
+    worker._finishPooledCandidates("album", "owner", otherKind, [])
+    otherUser = worker._pooledCandidates("artist", "other", lambda _: rows("other-user"))
+    worker._finishPooledCandidates("artist", "other", otherUser, [])
+    otherDbWorker = PoolHarness("database-b")
+    otherDbWorker._pooledCandidates("artist", "owner", lambda _: rows("other-db"))
+
+    worker._retireLastfmPools(("artist",))
+
+    assert ("artist", "owner", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
+    assert ("artist", None, "database-a") not in workers._LASTFM_CANDIDATE_POOLS
+    assert ("album", "owner", "database-a") in workers._LASTFM_CANDIDATE_POOLS
+    assert ("artist", "other", "database-a") in workers._LASTFM_CANDIDATE_POOLS
+    assert ("artist", "owner", "database-b") in workers._LASTFM_CANDIDATE_POOLS
+
+
+def test_owner_cleanup_marks_inflight_then_finish_retires_without_losing_claim(clock):
+    worker = PoolHarness()
+    worker.user = "owner"
+    claimed = worker._pooledCandidates("artist", "owner", lambda _: rows())
+    key = ("artist", "owner", "database-a")
+    pool = workers._LASTFM_CANDIDATE_POOLS[key]
+
+    worker._retireLastfmPools(("artist",))
+
+    assert workers._LASTFM_CANDIDATE_POOLS[key] is pool
+    assert pool.retire_when_idle
+    worker._finishPooledCandidates("artist", "owner", claimed, claimed)
+    assert key not in workers._LASTFM_CANDIDATE_POOLS
+    assert not Database._lastfm_active
+
+
+def test_marked_lease_does_not_remove_replacement_pool(clock):
+    worker = PoolHarness()
+    worker.user = "owner"
+    key = ("artist", "owner", "database-a")
+    with worker._lastfmPoolAccess("artist", "owner") as pool:
+        worker._retireLastfmPools(("artist",))
+        replacement = workers._LastfmCandidatePool([], clock[0])
+        workers._LASTFM_CANDIDATE_POOLS[key] = replacement
+        assert pool.retire_when_idle
+    assert workers._LASTFM_CANDIDATE_POOLS[key] is replacement
+
+
+@pytest.mark.parametrize("exitMode", ["startup", "disabled", "missing-key"])
+def test_worker_exit_retires_owned_pools(clock, exitMode):
+    worker = PoolHarness()
+    worker.user = "owner"
+    claimed = worker._pooledCandidates("artist", "owner", lambda _: rows())
+    worker._finishPooledCandidates("artist", "owner", claimed, [])
+    event = threading.Event()
+    enabled = lambda: True
+    if exitMode == "startup":
+        event.set()
+    elif exitMode == "disabled":
+        def enabled():
+            event.set()
+            return False
+    else:
+        worker.repo.getUserLastfmApiKey = lambda _: None
+
+    worker._runLastfmLoop(
+        stop_event=event,
+        eventAttr="lastfm_stop_event",
+        minStartDelay=0,
+        maxStartDelay=0,
+        idleWaitSeconds=0,
+        enabled=enabled,
+        runWork=Mock(return_value=False),
+        logPrefix="test",
+        errorLabel="test",
+        telemetryKey="test",
+        poolKinds=("artist",),
+    )
+    assert ("artist", "owner", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
+
+
+@pytest.mark.parametrize("method,kinds", [
+    ("_lastfmGenreBackfillLoop", ("artist", "album", "track")),
+    ("_lastfmBiographyBackfillLoop", ("bio",)),
+    ("_lastfmAlbumBiographyBackfillLoop", ("album_bio",)),
+])
+def test_real_worker_entrypoints_release_every_owned_kind_on_exit(clock, method, kinds):
+    worker = Database.__new__(Database)
+    worker.user = "owner"
+    worker.repo = SimpleNamespace(
+        connectionManager=SimpleNamespace(dbPath="database-a"),
+        isLastfmGenreBackfillEnabled=lambda: True,
+        isArtistBioEnabled=lambda: True,
+        isAlbumBioEnabled=lambda: True,
+    )
+    for kind in kinds:
+        for scope in ("owner", None):
+            with worker._lastfmPoolAccess(kind, scope):
+                pass
+    stop = threading.Event()
+    stop.set()
+
+    getattr(worker, method)(stop)
+
+    assert not workers._LASTFM_CANDIDATE_POOLS
+
+
+def test_disabled_worker_retires_before_its_idle_wait(clock):
+    worker = PoolHarness()
+    worker.user = "owner"
+    with worker._lastfmPoolAccess("artist", "owner"):
+        pass
+    key = ("artist", "owner", "database-a")
+    waits = []
+
+    def wait(delay):
+        if waits:
+            assert key not in workers._LASTFM_CANDIDATE_POOLS
+            return True
+        waits.append(delay)
+        return False
+
+    worker._runLastfmLoop(
+        stop_event=SimpleNamespace(wait=wait, is_set=lambda: False),
+        eventAttr="unused", minStartDelay=0, maxStartDelay=0,
+        idleWaitSeconds=0, enabled=lambda: False, runWork=Mock(),
+        logPrefix="test", errorLabel="test", telemetryKey="test",
+        poolKinds=("artist",),
+    )
+    assert key not in workers._LASTFM_CANDIDATE_POOLS
+
+
 def test_ttl_refill_waits_for_old_inflight_and_retry_capacity(clock):
     worker = TinyPoolHarness()
     oldRows = [{"id": f"old-{index}", "name": f"Old {index}"}

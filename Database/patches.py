@@ -1640,6 +1640,7 @@ _spotapiBundleLock = threading.Lock()
 _spotapiHashUse = threading.local()
 _spotapiAuthByClient = {}
 _spotapiAuthLock = threading.Lock()
+_spotapiAuthRequestContext = threading.local()
 _SPOTAPI_AUTH_FIELDS = (
     "access_token", "client_id", "access_token_expires_at_ms",
     "client_token", "client_version", "device_id",
@@ -1805,11 +1806,28 @@ def patch_spotapi_cache():
             # TLSClient._send calls on_auth_failure only for its first failed
             # response. Evict before parsing so a terminal retry, including a
             # danger=True parser exception, cannot leave rejected auth cached.
-            if _isSpotapiAuthFailure(response):
+            context = getattr(_spotapiAuthRequestContext, "active", None)
+            authenticated = (context is not None and context[0] is self
+                             and context[1])
+            if authenticated and _isSpotapiAuthFailure(response):
                 _evictSpotapiAuthClient(self)
             return originalParseResponse(self, response, method, danger)
         parseResponse._spotapiCached = True
         TLSClient.parse_response = parseResponse
+
+    if not getattr(TLSClient._send, "_spotapiCached", False):
+        originalSend = TLSClient._send
+
+        def send(self, method, url, *, authenticate, danger, **kwargs):
+            previous = getattr(_spotapiAuthRequestContext, "active", None)
+            _spotapiAuthRequestContext.active = (self, authenticate)
+            try:
+                return originalSend(self, method, url, authenticate=authenticate,
+                                    danger=danger, **kwargs)
+            finally:
+                _spotapiAuthRequestContext.active = previous
+        send._spotapiCached = True
+        TLSClient._send = send
 
     if not getattr(baseClass._auth_rule, "_spotapiCached", False):
         originalAuth = baseClass._auth_rule

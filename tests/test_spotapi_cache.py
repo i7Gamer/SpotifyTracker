@@ -24,6 +24,8 @@ import Database.Spotify.client as owned
 
 OPERATIONS = ("getTrack", "getAlbum", "queryArtistOverview", "fetchPlaylist", "searchDesktop", "extraMutation")
 POOL_CONCURRENCY = 14
+AUTH_CONTEXT_CONCURRENCY = 2
+AUTH_CONTEXT_TIMEOUT_SECONDS = 5
 NOW = 1000
 TOKEN_EXPIRY_MS = 2000000
 PACK_URL = "https://open.spotifycdn.com/cdn/build/web-player/web-player.test.js"
@@ -197,11 +199,13 @@ def test_installer_is_idempotent_per_method(script):
     methods = ("get_sha256_hash", "part_hash", "_auth_rule", "_handle_auth_failure")
     before = [getattr(upstream.BaseClient, name) for name in methods]
     beforeParse = TLSClient.parse_response
+    beforeSend = TLSClient._send
     patches.patch_spotapi_cache()
     patches.patch_totp_secret()
     patches.patch_spotapi_cache()
     assert [getattr(upstream.BaseClient, name) for name in methods] == before
     assert TLSClient.parse_response is beforeParse
+    assert TLSClient._send is beforeSend
 
 
 def test_auth_same_transport_reused_different_transport_isolated(script):
@@ -300,7 +304,29 @@ def test_transport_failure_keeps_valid_auth_cache(script, monkeypatch):
 
 
 @pytest.mark.parametrize("status,headers", [case[:2] for case in TERMINAL_AUTH_FAILURE_CASES])
-def test_danger_parse_exception_evicts_terminal_auth_cache(script, status, headers):
+def test_unauthenticated_terminal_status_keeps_valid_auth_cache(
+        script, monkeypatch, status, headers):
+    client = base(script)
+    client._auth_rule({})
+    tls = client.client
+    response = SimpleNamespace(
+        status_code=status,
+        text="not-json",
+        headers=headers,
+        url="https://spotify.test/",
+        json=lambda: {},
+    )
+    monkeypatch.setattr(tls, "build_request", lambda *args, **kwargs: response)
+
+    parsed = tls._send("GET", response.url, authenticate=False, danger=False)
+
+    assert parsed.fail
+    assert id(tls) in patches._spotapiAuthByClient
+
+
+@pytest.mark.parametrize("status,headers", [case[:2] for case in TERMINAL_AUTH_FAILURE_CASES])
+def test_danger_parse_exception_evicts_authenticated_terminal_auth_cache(
+        script, monkeypatch, status, headers):
     client = base(script)
     client._auth_rule({})
     tls = client.client
@@ -312,9 +338,97 @@ def test_danger_parse_exception_evicts_terminal_auth_cache(script, status, heade
         url="https://spotify.test/",
         json=lambda: {},
     )
+    monkeypatch.setattr(tls, "build_request", lambda *args, **kwargs: response)
+    monkeypatch.setattr(tls, "on_auth_failure", None)
     with pytest.raises(spotapi.exceptions.ParentException):
-        tls.parse_response(response, "GET", True)
+        tls._send("GET", response.url, authenticate=True, danger=True)
     assert id(tls) not in patches._spotapiAuthByClient
+
+
+def test_nested_unauthenticated_bootstrap_restores_outer_auth_context(script, monkeypatch):
+    client = base(script)
+    client._auth_rule({})
+    tls = client.client
+    tls.fail_exception = spotapi.exceptions.ParentException
+    nested = SimpleNamespace(
+        status_code=401,
+        text="not-json",
+        headers={},
+        url="https://spotify.test/nested",
+        json=lambda: {},
+    )
+    outer = SimpleNamespace(
+        status_code=401,
+        text="not-json",
+        headers={},
+        url="https://spotify.test/outer",
+        json=lambda: {},
+    )
+    nested_cache_seen = []
+
+    def build_request(_method, url, **_kwargs):
+        if url == nested.url:
+            nested_cache_seen.append(id(tls) in patches._spotapiAuthByClient)
+            return nested
+        tls._send("GET", nested.url, authenticate=False, danger=False)
+        return outer
+
+    monkeypatch.setattr(tls, "build_request", build_request)
+    monkeypatch.setattr(tls, "on_auth_failure", None)
+
+    with pytest.raises(spotapi.exceptions.ParentException):
+        tls._send("GET", outer.url, authenticate=True, danger=True)
+
+    assert nested_cache_seen == [True]
+    assert id(tls) not in patches._spotapiAuthByClient
+
+
+def test_send_context_restores_after_exception(script, monkeypatch):
+    client = base(script)
+    client._auth_rule({})
+    tls = client.client
+    tls.fail_exception = spotapi.exceptions.ParentException
+    monkeypatch.setattr(tls, "build_request", Mock(side_effect=RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        tls._send("GET", "https://spotify.test/", authenticate=True, danger=True)
+
+    assert getattr(patches._spotapiAuthRequestContext, "active", None) is None
+
+
+def test_concurrent_send_contexts_are_client_local(script, monkeypatch):
+    first = base(script)
+    second = base(script)
+    first._auth_rule({})
+    second._auth_rule({})
+    firstTls, secondTls = first.client, second.client
+    barrier = threading.Barrier(AUTH_CONTEXT_CONCURRENCY)
+
+    def build_request(client, _method, _url, **_kwargs):
+        barrier.wait(timeout=AUTH_CONTEXT_TIMEOUT_SECONDS)
+        return SimpleNamespace(
+            status_code=401,
+            text="not-json",
+            headers={},
+            url="https://spotify.test/",
+            json=lambda: {},
+        )
+
+    monkeypatch.setattr(TLSClient, "build_request", build_request)
+    monkeypatch.setattr(firstTls, "on_auth_failure", None)
+    monkeypatch.setattr(secondTls, "on_auth_failure", None)
+
+    def send(tls, authenticated):
+        return tls._send("GET", "https://spotify.test/", authenticate=authenticated, danger=False)
+
+    with ThreadPoolExecutor(max_workers=AUTH_CONTEXT_CONCURRENCY) as executor:
+        futures = [executor.submit(send, firstTls, True),
+                   executor.submit(send, secondTls, False)]
+        for future in futures:
+            future.result(timeout=AUTH_CONTEXT_TIMEOUT_SECONDS)
+
+    assert id(firstTls) not in patches._spotapiAuthByClient
+    assert id(secondTls) in patches._spotapiAuthByClient
 
 
 def test_weak_identity_is_checked_and_does_not_retain_client(script):
