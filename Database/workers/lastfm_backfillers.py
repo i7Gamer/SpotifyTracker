@@ -10,6 +10,7 @@ from __future__ import annotations
 # (stdlib, or Database/lastfm.py, which imports nothing of ours), so a real
 # import costs nothing and cannot cycle.
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from Database.lastfm import LastfmClient
 
@@ -30,10 +31,14 @@ LASTFM_WORKER_STOP_JOIN_TIMEOUT_SECONDS = WORKER_STOP_JOIN_TIMEOUT_SECONDS
 @dataclass
 class _LastfmCandidatePool:
     rows: list[dict]
-    fetched_at: float
+    fetched_at: float | None
     cursor: int = 0
     retry_rows: list[dict] = field(default_factory=list)
     drained_until: float | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    last_used: float | None = None
+    leases: int = 0
+    in_flight: set[str] = field(default_factory=set)
 
 
 _LASTFM_CANDIDATE_POOLS: dict[tuple[str, str | None, str | None], _LastfmCandidatePool] = {}
@@ -431,6 +436,42 @@ class LastfmBackfillMixin:
     def _lastfmBoundedRetryRows(self, rows: list[dict]) -> list[dict]:
         return self._lastfmUniqueRows(rows)[:self.LASTFM_QUEUE_POOL_SIZE]
 
+    @contextmanager
+    def _lastfmPoolAccess(self, kind: str, scopeUsername: str | None, *, create: bool = True):
+        """Lease a stable pool without holding the registry lock over its work.
+
+        Idle scopes are retired on later accesses. Waiting/refilling callers
+        hold leases; returned batches pin the pool until their finish call.
+        Unattempted retry rows remain eligible in the database after eviction.
+        """
+        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
+        key = (kind, scopeUsername, dbPath)
+        now = _dbmod.time.monotonic()
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            for oldKey, oldPool in list(_LASTFM_CANDIDATE_POOLS.items()):
+                lastUsed = oldPool.last_used if oldPool.last_used is not None else oldPool.fetched_at
+                if (oldKey != key and not oldPool.leases and not oldPool.in_flight
+                        and lastUsed is not None
+                        and now - lastUsed >= self.LASTFM_QUEUE_POOL_TTL_SECONDS):
+                    del _LASTFM_CANDIDATE_POOLS[oldKey]
+            pool = _LASTFM_CANDIDATE_POOLS.get(key)
+            if pool is None and create:
+                pool = _LastfmCandidatePool([], None)
+                _LASTFM_CANDIDATE_POOLS[key] = pool
+            if pool is not None:
+                pool.leases += 1
+                pool.last_used = now
+        if pool is None:
+            yield None
+            return
+        try:
+            with pool.lock:
+                yield pool
+        finally:
+            with _LASTFM_CANDIDATE_POOLS_LOCK:
+                pool.last_used = _dbmod.time.monotonic()
+                pool.leases -= 1
+
     def _pooledCandidates(self, kind: str, scopeUsername: str | None, fetch) -> list[dict]:
         """Claim one bounded batch from a cached, scope-specific candidate pool.
 
@@ -438,26 +479,29 @@ class LastfmBackfillMixin:
         consumed by an ordered cursor; rows that were held, stopped, or failed
         transiently form a bounded retry prefix for the next invocation.
         """
-        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
-        key = (kind, scopeUsername, dbPath)
-        now = _dbmod.time.monotonic()
         batchSize = self._lastfmPoolBatchSize(kind)
         poolWasRefilled = False
 
-        with _LASTFM_CANDIDATE_POOLS_LOCK:
-            pool = _LASTFM_CANDIDATE_POOLS.get(key)
-            if (pool is not None and pool.drained_until is not None
+        with self._lastfmPoolAccess(kind, scopeUsername) as pool:
+            now = _dbmod.time.monotonic()
+            if (pool.drained_until is not None
                     and now < pool.drained_until and not pool.retry_rows):
                 return []
-            expired = (pool is None or
+            expired = (pool.fetched_at is None or
                        now - pool.fetched_at >= self.LASTFM_QUEUE_POOL_TTL_SECONDS)
-            if expired:
+
+            def refill() -> None:
+                # Publish only a complete fetch, preserving this pool's lock,
+                # outstanding batches and retry prefix. TTL starts on success.
                 fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
-                preservedRetries = list(pool.retry_rows) if pool is not None else []
-                pool = _LastfmCandidatePool(
-                    fetched, now, retry_rows=preservedRetries,
-                    drained_until=None if fetched else now + self.LASTFM_QUEUE_DRAINED_MEMO_SECONDS)
-                _LASTFM_CANDIDATE_POOLS[key] = pool
+                fetchedAt = _dbmod.time.monotonic()
+                pool.rows = fetched
+                pool.fetched_at = fetchedAt
+                pool.cursor = 0
+                pool.drained_until = None if fetched else fetchedAt + self.LASTFM_QUEUE_DRAINED_MEMO_SECONDS
+
+            if expired:
+                refill()
                 poolWasRefilled = True
 
             selected: list[dict] = []
@@ -493,44 +537,38 @@ class LastfmBackfillMixin:
 
             if (not selected and not retryPrefix and pool.cursor >= len(pool.rows)
                     and not poolWasRefilled):
-                fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
-                preservedRetries = list(pool.retry_rows)
-                pool = _LastfmCandidatePool(
-                    fetched, now, retry_rows=preservedRetries,
-                    drained_until=None if fetched else now + self.LASTFM_QUEUE_DRAINED_MEMO_SECONDS)
-                _LASTFM_CANDIDATE_POOLS[key] = pool
+                refill()
                 poolWasRefilled = True
                 while len(selected) < batchSize and pool.cursor < len(pool.rows):
                     row = pool.rows[pool.cursor]
                     consider(row, True)
 
             pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows)
+            pool.in_flight.update(row["id"] for row in selected)
 
         if not selected:
             return []
         try:
             eligible = self._lastfmRevalidateRows(kind, scopeUsername, selected)
         except Exception:
-            with _LASTFM_CANDIDATE_POOLS_LOCK:
-                pool = _LASTFM_CANDIDATE_POOLS.get(key)
-                if pool is not None:
-                    pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows + selected)
-            self._releaseLastfmEntities(kind, selected)
+            self._finishPooledCandidates(kind, scopeUsername, selected, selected)
             raise
         eligibleIds = {row["id"] for row in eligible}
         stale = [row for row in selected if row["id"] not in eligibleIds]
-        self._releaseLastfmEntities(kind, stale)
+        if stale:
+            self._finishPooledCandidates(kind, scopeUsername, stale, [])
         return eligible
 
     def _finishPooledCandidates(self, kind: str, scopeUsername: str | None,
                                 claimed: list[dict], retryRows: list[dict]) -> None:
-        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
-        key = (kind, scopeUsername, dbPath)
-        with _LASTFM_CANDIDATE_POOLS_LOCK:
-            pool = _LASTFM_CANDIDATE_POOLS.get(key)
-            if pool is not None and retryRows:
-                pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows + retryRows)
-        self._releaseLastfmEntities(kind, claimed)
+        try:
+            with self._lastfmPoolAccess(kind, scopeUsername, create=False) as pool:
+                if pool is not None:
+                    if retryRows:
+                        pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows + retryRows)
+                    pool.in_flight.difference_update(row["id"] for row in claimed)
+        finally:
+            self._releaseLastfmEntities(kind, claimed)
 
     @staticmethod
     def _lastfmOutcomeGenres(outcome) -> tuple[bool, list[str]]:

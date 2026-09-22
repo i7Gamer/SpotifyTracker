@@ -53,7 +53,7 @@ class HttpScript:
         elif url.endswith("/api/token"):
             status = self.tokenStatus
             body = {"accessToken": self.token, "clientId": "cid", "accessTokenExpirationTimestampMs": TOKEN_EXPIRY_MS}
-        elif "clienttoken.spotify.com" in url:
+        elif url == "https://clienttoken.spotify.com/v1/clienttoken":
             body = {"response_type": "RESPONSE_GRANTED_TOKEN_RESPONSE", "granted_token": {"token": self.clientToken}}
         elif url == PACK_URL:
             body = "bootstrap"

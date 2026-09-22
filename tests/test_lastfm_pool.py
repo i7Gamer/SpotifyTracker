@@ -95,9 +95,11 @@ class LastfmPoolContractTests(unittest.TestCase):
             [{"id": "a2", "name": "A2"}],
         ])
 
-        with patch("Database.workers.lastfm_backfillers._dbmod.time.monotonic", side_effect=[0, 1801]):
+        clock = [0]
+        with patch("Database.workers.lastfm_backfillers._dbmod.time.monotonic", side_effect=lambda: clock[0]):
             first = db._pooledCandidates("artist", "user1", fetch)
             db._finishPooledCandidates("artist", "user1", first, ())
+            clock[0] = db.LASTFM_QUEUE_POOL_TTL_SECONDS
             second = db._pooledCandidates("artist", "user1", fetch)
             db._finishPooledCandidates("artist", "user1", second, ())
 
