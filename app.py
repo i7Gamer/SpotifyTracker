@@ -73,6 +73,9 @@ from Database.Spotify.cookies import saveSession, parseCookieString
 
 logger = logging.getLogger(__name__)
 
+SLOW_REQUEST_LOG_THRESHOLD_SECONDS = 1.0  #< warn only when a request takes over one second
+SLOW_REQUEST_UNMATCHED_ROUTE = "<unmatched>"
+
 # Instance-wide display/behavior constants live in config.py; imported * here so
 # app.py and the test suite (`from app import <CONST>`) reach them through
 # `app`. Route modules import them from config directly.
@@ -226,6 +229,7 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
         self.app.config["WTF_CSRF_TIME_LIMIT"] = None
         if os.environ.get("PYTEST_CURRENT_TEST") or self.app.config.get("TESTING"):
             self.app.config["WTF_CSRF_ENABLED"] = False
+        self._registerSlowRequestLogging()
         CSRFProtect(self.app)
         # Users, emails and Spotify session cookies live in the shared database
         # (see Database/repository.py) instead of secrets/users_map.json and
@@ -832,6 +836,28 @@ class SpotifyDashboardApp(ViewModelMixin, PaginationMixin, DateRangeMixin, Wrapp
             diskVersion = (self.baseDir / "Database" / "VERSION").read_text(encoding="utf-8").strip()
         return deployMismatch(self.currentVersion, diskVersion,
                               self._bootFingerprint, sourceFingerprint(self.baseDir))
+
+    def _registerSlowRequestLogging(self) -> None:
+        @self.app.before_request
+        def _stampSlowRequest():
+            """Capture a monotonic start time before any other request hook."""
+            g._slowRequestStartedAt = time.monotonic()
+
+        @self.app.teardown_request
+        def _logSlowRequest(error):
+            """Log slow requests without exposing paths, query strings, or tokens."""
+            startedAt = getattr(g, "_slowRequestStartedAt", None)
+            if startedAt is None:
+                return
+            del g._slowRequestStartedAt
+
+            duration = time.monotonic() - startedAt
+            if duration <= SLOW_REQUEST_LOG_THRESHOLD_SECONDS:
+                return
+
+            urlRule = getattr(request.url_rule, "rule", None) or SLOW_REQUEST_UNMATCHED_ROUTE
+            logger.warning("Slow request method=%s route=%s duration=%.3fs",
+                           request.method, urlRule, duration)
 
     def registerRoutes(self) -> None:
         @self.app.url_defaults
