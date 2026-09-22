@@ -17,7 +17,7 @@ from pathlib import Path
 
 # Python's sqlite3 connections wait five seconds for a lock by default.
 # Allow thirty seconds here for a checkpoint, VACUUM, or concurrent writer,
-# matching the explicit waits used by the app and backup connections.
+# The app and backup connections also set their lock timeouts explicitly.
 MIGRATION_BUSY_TIMEOUT_MS = 30_000
 
 
