@@ -25,7 +25,9 @@ listener) - see Database/Spotify/formatting.py for the mapping itself.
 import atexit
 import json
 import logging
+import re
 import time
+from collections.abc import Mapping
 from collections import deque
 from contextlib import contextmanager
 
@@ -63,14 +65,14 @@ TRACK_INFO_UNAVAILABLE_REASON = "TRACK_INFO_UNAVAILABLE"
 
 # How many extra attempts an incomplete song_info response gets before the
 # caller degrades to a fallback record. Kept low and on a SHORT FIXED delay
-# rather than the transient ladder's 1/2/4s exponential backoff: this runs
+# rather than the transient ladder's 1/2s exponential backoff: this runs
 # inside the poll loop's callback, so during a burst every affected track pays
 # the wait. One extra attempt is enough to ride out the sub-second gap that
 # produced the observed cluster without making a genuinely-gone track slow.
 INCOMPLETE_TRACK_INFO_RETRIES = 1
 INCOMPLETE_TRACK_INFO_RETRY_DELAY_SECONDS = 2
 
-TRACK_FETCH_MAX_RETRIES = 3            #< transient-failure ladder: 1s, 2s, 4s
+TRACK_FETCH_MAX_RETRIES = 3            #< transient-failure ladder: 1s, 2s
 RECENTLY_PLAYED_BUFFER_SIZE = 50       #< matches the Web API's own recently-played page size
 SEARCH_DEFAULT_LIMIT = 10              #< spotapi query_songs' own default, and spotipy search's
 
@@ -159,6 +161,38 @@ def fallbackTrackRecord(trackId: str) -> dict:
     }
 
 
+class PersistedQueryError(spotapi.exceptions.SongError):
+    """A successful HTTP response rejected the persisted GraphQL operation."""
+
+
+def _isPersistedQueryError(payload):
+    """Recognize the GraphQL marker, including spotapi's status/body exception text."""
+    if isinstance(payload, PersistedQueryError):
+        return True
+    if isinstance(payload, spotapi.exceptions.SongError):
+        # ParentException.__str__ only contains the generic message. Exclude
+        # 5xx even if an intermediary echoed a GraphQL error in its body.
+        detail = payload.error
+        if not isinstance(detail, str) or not re.match(r"Status Code: 4\d\d, Response:", detail):
+            return False
+        return bool(re.search(r"persisted[_\s]?query[_\s]?not[_\s]?found", detail, re.IGNORECASE))
+    if not isinstance(payload, Mapping):
+        return False
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return False
+    for error in errors:
+        if not isinstance(error, Mapping):
+            continue
+        extensions = error.get("extensions")
+        code = extensions.get("code") if isinstance(extensions, Mapping) else None
+        for marker in (error.get("message"), code):
+            if isinstance(marker, str) and re.fullmatch(
+                    r"persisted[_\s]?query[_\s]?not[_\s]?found", marker, re.IGNORECASE):
+                return True
+    return False
+
+
 def getTrackInfoWithRetry(trackId: str, max_retries: int = TRACK_FETCH_MAX_RETRIES):
     """Fetch track info from spotapi with retry logic for transient failures.
 
@@ -170,9 +204,13 @@ def getTrackInfoWithRetry(trackId: str, max_retries: int = TRACK_FETCH_MAX_RETRI
     # Two failure modes, two separate budgets. An incomplete response early in a
     # fetch must not eat the transient ladder's attempts, or a Spotify blip would
     # silently shorten the recovery window for an unrelated rate limit.
+    # Local import: Database.patches itself imports the Spotify package.
+    from Database.patches import beginSpotapiHashAttempt, invalidateUsedSpotapiHash
+    hashRefreshUsed = False
     incompleteAttempts = 0
     attempt = 0
     while attempt < max_retries:
+        beginSpotapiHashAttempt()
         try:
             # Waits out a whole penalty window rather than the short polling
             # timeout the loops use - see SPOTIFY_TRACK_ACQUIRE_TIMEOUT_SECONDS
@@ -180,7 +218,11 @@ def getTrackInfoWithRetry(trackId: str, max_retries: int = TRACK_FETCH_MAX_RETRI
             if not SPOTIFY_LIMITER.acquire(timeout=SPOTIFY_TRACK_ACQUIRE_TIMEOUT_SECONDS):
                 raise SpotifyLocallyRateLimitedError(
                     f"Spotify rate limit backoff in progress - skipped {ENDPOINT_TRACK_INFO} for {trackId}")
-            return extractTrackUnion(spotapi.Public.song_info(trackId), trackId)
+            payload = spotapi.Public.song_info(trackId)
+            if _isPersistedQueryError(payload):
+                # Use the same typed branch as a 4xx reported by spotapi.
+                raise PersistedQueryError("Persisted query rejected")
+            return extractTrackUnion(payload, trackId)
         except IncompleteTrackInfoError as e:
             if incompleteAttempts >= INCOMPLETE_TRACK_INFO_RETRIES:
                 raise
@@ -193,6 +235,13 @@ def getTrackInfoWithRetry(trackId: str, max_retries: int = TRACK_FETCH_MAX_RETRI
             time.sleep(INCOMPLETE_TRACK_INFO_RETRY_DELAY_SECONDS)
             continue  #< deliberately does not advance `attempt`
         except Exception as e:
+            if _isPersistedQueryError(e):
+                if hashRefreshUsed:
+                    raise
+                hashRefreshUsed = True
+                invalidateUsedSpotapiHash()
+                # A dedicated retry, including on the last ordinary attempt.
+                continue
             error_str = str(e).lower()
             # Our own limiter refusing a slot: nothing was sent, so this is the
             # most transient failure there is - matched by type rather than by
@@ -230,12 +279,12 @@ def getTrackInfoWithRetry(trackId: str, max_retries: int = TRACK_FETCH_MAX_RETRI
 
             if is_rate_limit:
                 # Spotify said so explicitly: hold the whole process, not just
-                # this call's private 1/2/4s ladder.
+                # this call's private 1/2s ladder.
                 SPOTIFY_LIMITER.applyBackoff(SPOTIFY_RATE_LIMIT_BACKOFF_SECONDS,
                                              reason=ENDPOINT_TRACK_INFO)
 
             if attempt < max_retries - 1:
-                backoff_secs = 2 ** attempt  # 1, 2, 4 seconds
+                backoff_secs = 2 ** attempt  # 1, 2 seconds
                 logger.warning("Track fetch failed (attempt %d/%d), backing off %ds: %s", attempt + 1, max_retries, backoff_secs, e)
                 time.sleep(backoff_secs)
                 attempt += 1

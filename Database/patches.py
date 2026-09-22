@@ -10,6 +10,7 @@ import re
 import signal
 import threading
 import time
+import weakref
 import websockets.sync.client
 import websockets.exceptions
 import spotapi.exceptions
@@ -1579,5 +1580,183 @@ def patch_totp_secret() -> bool:
     return True
 
 
+# Public web-player assets can be shared process-wide. Cookies and tokens cannot:
+# spotapi builds a new BaseClient for every lookup on a borrowed TLS transport.
+SPOTAPI_HASH_CACHE_TTL_SECONDS = 6 * 3600
+_spotapiBundle = None
+_spotapiHashByName = {}
+_spotapiJsPack = None
+_spotapiBundleFetchedAt = None
+_spotapiBundleGeneration = 0
+_spotapiBundleLock = threading.Lock()
+_spotapiHashUse = threading.local()
+_spotapiAuthByClient = {}
+_spotapiAuthLock = threading.Lock()
+_SPOTAPI_AUTH_FIELDS = (
+    "access_token", "client_id", "access_token_expires_at_ms",
+    "client_token", "client_version", "device_id",
+)
+
+
+def _clearSpotapiBundle():
+    """Clear the entire public generation while holding _spotapiBundleLock."""
+    global _spotapiBundle, _spotapiJsPack, _spotapiBundleFetchedAt, _spotapiBundleGeneration
+    _spotapiBundle = _spotapiJsPack = _spotapiBundleFetchedAt = None
+    _spotapiHashByName.clear()
+    _spotapiBundleGeneration += 1
+
+
+def invalidateSpotapiHashCache(generation=None):
+    """Evict only the generation rejected by Spotify, or unconditionally for reset."""
+    with _spotapiBundleLock:
+        if generation is not None and generation != _spotapiBundleGeneration:
+            return False
+        _clearSpotapiBundle()
+        return True
+
+
+def beginSpotapiHashAttempt():
+    """Do not attribute a failure before part_hash to a previous lookup's bundle."""
+    _spotapiHashUse.generation = None
+
+
+def invalidateUsedSpotapiHash():
+    """The thread's actual part_hash generation, not a racy pre-request snapshot."""
+    generation = getattr(_spotapiHashUse, "generation", None)
+    return generation is not None and invalidateSpotapiHashCache(generation)
+
+
+def _hydrateSpotapiAuth(base):
+    # Only a newly constructed, empty BaseClient needs hydration. A direct
+    # get_session (e.g. websocket refresh) may already have supplied newer state.
+    if any(getattr(base, field, _Undefined) is not _Undefined
+           for field in ("access_token", "client_id", "client_token")):
+        return
+    with _spotapiAuthLock:
+        entry = _spotapiAuthByClient.get(id(base.client))
+        if entry is not None and entry[0]() is base.client:
+            for field, value in entry[1].items():
+                setattr(base, field, value)
+
+
+def _publishSpotapiAuth(base):
+    key = id(base.client)
+
+    def discard(ref):
+        with _spotapiAuthLock:
+            entry = _spotapiAuthByClient.get(key)
+            if entry is not None and entry[0] is ref:
+                _spotapiAuthByClient.pop(key, None)
+
+    state = {field: getattr(base, field) for field in _SPOTAPI_AUTH_FIELDS}
+    with _spotapiAuthLock:
+        _spotapiAuthByClient[key] = (weakref.ref(base.client, discard), state)
+
+
+def _evictSpotapiAuth(base):
+    with _spotapiAuthLock:
+        _spotapiAuthByClient.pop(id(base.client), None)
+
+
+def _loadSpotapiBundle(base):
+    """Load under the bundle lock, publishing only the fully assembled string."""
+    global _spotapiBundle, _spotapiJsPack, _spotapiBundleFetchedAt, _spotapiBundleGeneration
+    import spotapi.client as upstream
+
+    if (_spotapiBundle is None or _spotapiBundleFetchedAt is None
+            or time.monotonic() - _spotapiBundleFetchedAt >= SPOTAPI_HASH_CACHE_TTL_SECONDS):
+        _clearSpotapiBundle()
+        _hydrateSpotapiAuth(base)
+        # Rediscover the pack URL on each refresh; base.js_pack may itself be old.
+        base.get_session()
+        if not base.js_pack or base.js_pack is _Undefined:
+            raise ValueError("Could not get playlist hashes")
+        response = base.client.get(str(base.js_pack))
+        if response.fail:
+            raise spotapi.exceptions.BaseClientError("Could not get general hashes", error=response.error.string)
+        chunks = [response.response]
+        strMapping, hashMapping = upstream.extract_mappings(str(chunks[0]))
+        for chunk in upstream.combine_chunks(hashMapping, strMapping):
+            response = base.client.get(f"https://open.spotifycdn.com/cdn/build/web-player/{chunk}")
+            if response.fail:
+                raise spotapi.exceptions.BaseClientError("Could not get general hashes", error=response.error.string)
+            chunks.append(response.response)
+        _spotapiBundle = "".join(chunks)
+        _spotapiJsPack = str(base.js_pack)
+        _spotapiBundleFetchedAt = time.monotonic()
+        _spotapiBundleGeneration += 1
+    base.raw_hashes = _spotapiBundle
+    base.js_pack = _spotapiJsPack
+
+
+def _extractSpotapiOperationHash(bundle, name):
+    try:
+        return bundle.split(f'"{name}","query","', 1)[1].split('"', 1)[0]
+    except IndexError:
+        return bundle.split(f'"{name}","mutation","', 1)[1].split('"', 1)[0]
+
+
+def patch_spotapi_cache():
+    """Reuse public hashes and per-transport auth without changing spotapi's expiry rules."""
+    import spotapi.client as upstream
+    baseClass = upstream.BaseClient
+
+    if not getattr(baseClass.get_sha256_hash, "_spotapiCached", False):
+        def getHashes(self):
+            with _spotapiBundleLock:
+                _loadSpotapiBundle(self)
+        getHashes._spotapiCached = True
+        baseClass.get_sha256_hash = getHashes
+
+    if not getattr(baseClass.part_hash, "_spotapiCached", False):
+        def partHash(self, name):
+            with _spotapiBundleLock:
+                # Check TTL even for an operation already in the map.
+                _loadSpotapiBundle(self)
+                if name not in _spotapiHashByName:
+                    _spotapiHashByName[name] = _extractSpotapiOperationHash(_spotapiBundle, name)
+                _spotapiHashUse.generation = _spotapiBundleGeneration
+                return _spotapiHashByName[name]
+        partHash._spotapiCached = True
+        baseClass.part_hash = partHash
+
+    if not getattr(baseClass._auth_rule, "_spotapiCached", False):
+        originalAuth = baseClass._auth_rule
+
+        def authRule(self, kwargs):
+            _hydrateSpotapiAuth(self)
+            try:
+                result = originalAuth(self, kwargs)
+            except Exception:
+                _evictSpotapiAuth(self)
+                raise
+            _publishSpotapiAuth(self)
+            return result
+        authRule._spotapiCached = True
+        baseClass._auth_rule = authRule
+
+    if not getattr(baseClass._handle_auth_failure, "_spotapiCached", False):
+        originalFailure = baseClass._handle_auth_failure
+
+        def authFailure(self, response):
+            try:
+                headers = {key.lower(): value for key, value in response.raw.headers.items()}
+            except (AttributeError, TypeError):
+                headers = {}
+            refresh = (response.status_code == 401 or (response.status_code == 400
+                       and headers.get("client-token-error") == "INVALID_CLIENTTOKEN"))
+            if refresh:
+                _evictSpotapiAuth(self)
+            result = originalFailure(self, response)
+            if refresh and result:
+                # TLS._send authenticates again immediately after this callback.
+                _publishSpotapiAuth(self)
+            return result
+        authFailure._spotapiCached = True
+        baseClass._handle_auth_failure = authFailure
+    return True
+
+
 patch_spotapi_user()
 patch_totp_secret()
+patch_spotapi_cache()

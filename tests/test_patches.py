@@ -19,9 +19,10 @@ def setUpModule():
     # other test module's mock was still in sys.modules, the real spotapi
     # would never get patched for the rest of the process. Re-applying here
     # makes this module correct regardless of import order.
-    from Database.patches import patch_spotapi_user, patch_totp_secret
+    from Database.patches import patch_spotapi_user, patch_totp_secret, patch_spotapi_cache
     patch_spotapi_user()
     patch_totp_secret()
+    patch_spotapi_cache()
 
 
 class TestPatches(unittest.TestCase):
