@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import atexit
+import ast
 import copy
 import json
 import logging
@@ -1305,6 +1306,8 @@ TOTP_RECOVERY_COOLDOWN_SECONDS = 15 * 60
 
 _totpAuthLock = threading.Lock()
 _totpConsecutiveFailures = 0
+_totpTransportFailures = 0   #< non-rejection failures since the last real mint
+_totpLastMintAt = None
 _totpFirstFailureAt = None   #< monotonic; "how long has this been going on"
 _totpAdoptedSecret = None    #< (version, bytearray) once recovery has found a newer one
 _totpLastRecoveryAt = None   #< monotonic; gates the cooldown above
@@ -1312,7 +1315,7 @@ _totpRecoveryThread = None   #< daemon running attemptTotpRecovery; tests join i
 
 
 def recordTotpAuthFailure() -> int:
-    """Count a failed session-token request. Returns the new streak length."""
+    """Count an explicit TOTP rejection. Returns the new streak length."""
     global _totpConsecutiveFailures, _totpFirstFailureAt
     with _totpAuthLock:
         if _totpConsecutiveFailures == 0:
@@ -1324,16 +1327,18 @@ def recordTotpAuthFailure() -> int:
 def recordTotpAuthSuccess() -> None:
     """Clear the streak. Whatever it was, it is over - and a stale alarm on the
     admin panel is worse than no alarm, because it trains people to ignore it."""
-    global _totpConsecutiveFailures, _totpFirstFailureAt
+    global _totpConsecutiveFailures, _totpFirstFailureAt, _totpTransportFailures, _totpLastMintAt
     with _totpAuthLock:
         _totpConsecutiveFailures = 0
         _totpFirstFailureAt = None
+        _totpTransportFailures = 0
+        _totpLastMintAt = time.monotonic()
 
 
 def resetTotpAuthState() -> None:
     """Test seam - this state is process-global, so tests must not inherit each
     other's streaks, adopted secrets, cooldowns or in-flight recoveries."""
-    global _totpAdoptedSecret, _totpLastRecoveryAt, _totpRecoveryThread
+    global _totpAdoptedSecret, _totpLastRecoveryAt, _totpRecoveryThread, _totpLastMintAt
     thread = _totpRecoveryThread
     if thread is not None and thread.is_alive():
         #< joined OUTSIDE the lock: the running recovery needs _totpAuthLock to
@@ -1344,6 +1349,42 @@ def resetTotpAuthState() -> None:
         _totpAdoptedSecret = None
         _totpLastRecoveryAt = None
         _totpRecoveryThread = None
+        _totpLastMintAt = None
+
+
+def _isTotpRejection(error):
+    """Match the token endpoint's observed rejection, not any failed HTTP request.
+
+    spotapi 1.3 retains status and the Python repr of the parsed body in .error.
+    Anonymous invalid-code/version probes (2026-09-22) returned 400 with
+    error.message='Unauthorized request', and totpVerExpired='error' for an
+    expired version. Unknown bodies remain visible as request failures.
+    """
+    detail = getattr(error, "error", None)
+    if not isinstance(error, spotapi.exceptions.BaseClientError) or not isinstance(detail, str):
+        return False
+    match = re.fullmatch(r"Status Code: 400, Response: (.*)", detail, re.DOTALL)
+    if match is None:
+        return False
+    raw = match.group(1)
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        try:
+            body = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            return False
+    if not isinstance(body, dict):
+        return False
+    rejection = body.get("error")
+    return (body.get("totpVerExpired") == "error"
+            or (isinstance(rejection, dict) and rejection.get("message") == "Unauthorized request"))
+
+
+def _recordTotpTransportFailure():
+    global _totpTransportFailures
+    with _totpAuthLock:
+        _totpTransportFailures += 1
 
 
 def _autoRecoverEnabled() -> bool:
@@ -1424,6 +1465,8 @@ def totpAuthSnapshot() -> dict:
     activeVersion, _ = _resolveTotpSecret()
     with _totpAuthLock:
         failures = _totpConsecutiveFailures
+        transportFailures = _totpTransportFailures
+        lastMintAt = _totpLastMintAt
         firstAt = _totpFirstFailureAt
         adopted = _totpAdoptedSecret
     # "Parses", not "is set": _resolveTotpSecret IGNORES a malformed override,
@@ -1448,6 +1491,8 @@ def totpAuthSnapshot() -> dict:
         "autoRecovered": not envOverride and adopted is not None,
         "overrideEnvVar": TOTP_SECRET_ENV_VAR,
         "consecutiveFailures": failures,
+        "transportFailures": transportFailures,
+        "secondsSinceLastMint": None if lastMintAt is None else time.monotonic() - lastMintAt,
         "suspectedRotation": failures >= TOTP_ROTATION_CONFIRM_THRESHOLD,
         "secondsSinceFirstFailure": None if firstAt is None else time.monotonic() - firstAt,
     }
@@ -1546,7 +1591,10 @@ def patch_totp_secret() -> bool:
                       or getattr(self, "client_id", _Undefined) is _Undefined)
         try:
             result = original_get_auth_vars(self, *args, **kwargs)
-        except spotapi.exceptions.BaseClientError:
+        except (spotapi.exceptions.BaseClientError, spotapi.exceptions.RequestError) as error:
+            if not _isTotpRejection(error):
+                _recordTotpTransportFailure()
+                raise
             failures = recordTotpAuthFailure()
             # The message spotapi raises names neither TOTP nor these
             # constants, so the pin would be undiscoverable from the symptom it
