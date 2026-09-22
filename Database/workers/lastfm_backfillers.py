@@ -10,6 +10,8 @@ from __future__ import annotations
 # (stdlib, or Database/lastfm.py, which imports nothing of ours), so a real
 # import costs nothing and cannot cycle.
 import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from Database.lastfm import LastfmClient
 
 # Module-global names (LastfmClient, requests, Importer, logger, time, Path, ...)
@@ -26,8 +28,52 @@ from Database.workers.periodic import WORKER_STOP_JOIN_TIMEOUT_SECONDS
 LASTFM_WORKER_STOP_JOIN_TIMEOUT_SECONDS = WORKER_STOP_JOIN_TIMEOUT_SECONDS
 
 
+@dataclass
+class _LastfmCandidatePool:
+    rows: list[dict]
+    fetched_at: float | None
+    cursor: int = 0
+    retry_rows: list[dict] = field(default_factory=list)
+    drained_until: float | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    last_used: float | None = None
+    leases: int = 0
+    in_flight: set[str] = field(default_factory=set)
+    retire_when_idle: bool = False
+
+
+_LASTFM_CANDIDATE_POOLS: dict[tuple[str, str | None, str | None], _LastfmCandidatePool] = {}
+_LASTFM_CANDIDATE_POOL_OWNERS: dict[tuple[str, str | None, str | None], set[object]] = {}
+_LASTFM_CANDIDATE_POOLS_LOCK = threading.Lock()
+_LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT: float | None = None
+_LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS = 60
+
+
+def _lastfmPoolMaintenanceDue(now: float, intervalSeconds: float) -> bool:
+    """Whether the idle-pool registry should be scanned at this access.
+
+    The registry is process-wide and claims/finishes are frequent, so idle
+    retirement is deliberately amortized. A backwards clock jump starts a new
+    maintenance window immediately; an empty registry resets the marker so a
+    newly created pool is not suppressed by a previous test/instance clock.
+    Caller holds _LASTFM_CANDIDATE_POOLS_LOCK.
+    """
+    global _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT
+    if not _LASTFM_CANDIDATE_POOLS:
+        _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT = None
+        return False
+    lastMaintenanceAt = _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT
+    if (lastMaintenanceAt is None or now < lastMaintenanceAt
+            or now - lastMaintenanceAt >= intervalSeconds):
+        _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT = now
+        return True
+    return False
+
+
 class LastfmBackfillMixin:
     """The three Last.fm backfillers - genre tags, artist biographies, album biographies - and their shared claim/lookup/inheritance helpers."""
+
+    LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS = _LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS
 
     def _startLastfmWorker(self, threadAttr: str, eventAttr: str, loop, threadName: str,
                             logPrefix: str) -> None:
@@ -89,15 +135,19 @@ class LastfmBackfillMixin:
     def _runLastfmLoop(self, *, stop_event: threading.Event | None, eventAttr: str,
                        minStartDelay: int, maxStartDelay: int, idleWaitSeconds: int,
                        enabled, runWork, logPrefix: str, errorLabel: str,
-                       telemetryKey: str) -> None:
+                       telemetryKey: str, poolKinds: tuple[str, ...] = ()) -> None:
         """Shared loop policy for the three Last.fm workers.
 
         The workers keep their own entrypoints, timings, telemetry names and
-        entity processors; only the repeated loop shell lives here.
+        entity processors; only the repeated loop shell lives here. The shared
+        limiter spaces lookup starts, while productive cycles also receive the
+        bounded pause configured by the worker mixin.
         """
         import random
         if stop_event is None:
             stop_event = getattr(self, eventAttr)
+        owner = object()
+        ownerRegistered = False
         try:
             startup_delay = random.randint(minStartDelay, maxStartDelay)
             _dbmod.logger.info("[%s-%s] Starting with initial delay of %d seconds",
@@ -109,10 +159,16 @@ class LastfmBackfillMixin:
             while not stop_event.is_set():
                 try:
                     if not enabled():
+                        self._releaseLastfmPoolOwner(poolKinds, owner)
+                        ownerRegistered = False
                         if stop_event.wait(idleWaitSeconds):
                             break
                         continue
 
+                    if not ownerRegistered:
+                        self._registerLastfmPoolOwner(poolKinds, owner)
+                        ownerRegistered = True
+                    cycleStarted = _dbmod.time.monotonic()
                     apiKey = self.repo.getUserLastfmApiKey(self.user)
                     if not apiKey:
                         _dbmod.logger.info("[%s-%s] No API key stored anymore - exiting",
@@ -123,6 +179,7 @@ class LastfmBackfillMixin:
                     processedAny = runWork(client, self.user, stop_event=stop_event)
                     if not processedAny and not stop_event.is_set():
                         processedAny = runWork(client, None, stop_event=stop_event)
+                    cycleDuration = _dbmod.time.monotonic() - cycleStarted
                     if not processedAny:
                         if stop_event.wait(idleWaitSeconds):
                             break
@@ -143,15 +200,22 @@ class LastfmBackfillMixin:
                         break
                 else:
                     self._recordWorkerCycle(telemetryKey, success=True)
+                    if processedAny:
+                        pause = min(self.LASTFM_WORKING_CYCLE_PAUSE_MAX_SECONDS,
+                                    cycleDuration * self.LASTFM_WORKING_CYCLE_PAUSE_RATIO)
+                        if pause > 0 and stop_event.wait(pause):
+                            break
         finally:
+            self._releaseLastfmPoolOwner(poolKinds, owner)
             _dbmod.logger.info("[%s-%s] Exited gracefully", logPrefix, self.user)
 
     def _lastfmGenreBackfillLoop(self, stop_event: threading.Event | None = None) -> None:
         """Fetches Last.fm genre tags for this user's played artists, albums
         and tracks (most-played first), then - once the own queue is drained -
         for everyone else's (the catalog is shared, so one keyed user's worker
-        converges the whole instance). Pacing comes from the process-wide rate
-        limiter inside LastfmClient, not from this loop.
+        converges the whole instance). The process-wide rate limiter inside
+        LastfmClient spaces lookup starts; productive cycles also use the
+        shared loop's bounded pause.
 
         `stop_event` is THIS run's private event (see the fresh-event note in
         startLastfmGenreBackfiller); the loop's own lifecycle checks use it
@@ -163,7 +227,8 @@ class LastfmBackfillMixin:
             idleWaitSeconds=self.LASTFM_IDLE_WAIT_SECONDS,
             enabled=self.repo.isLastfmGenreBackfillEnabled,
             runWork=self._runLastfmCycle, logPrefix="LastfmWorker",
-            errorLabel="genre", telemetryKey="lastfm_genre")
+            errorLabel="genre", telemetryKey="lastfm_genre",
+            poolKinds=("artist", "album", "track"))
 
     def _runLastfmCycle(self, client: LastfmClient, scopeUsername: str | None,
                         stop_event: threading.Event | None = None) -> bool:
@@ -232,7 +297,8 @@ class LastfmBackfillMixin:
             idleWaitSeconds=self.LASTFM_BIOGRAPHY_IDLE_WAIT_SECONDS,
             enabled=self.repo.isArtistBioEnabled,
             runWork=self._processLastfmBiographyBatch, logPrefix="LastfmBioWorker",
-            errorLabel="biography", telemetryKey="lastfm_artist_bio")
+            errorLabel="biography", telemetryKey="lastfm_artist_bio",
+            poolKinds=("bio",))
 
     def _processLastfmBiographyBatch(self, client: LastfmClient, scopeUsername: str | None,
                                      stop_event: threading.Event | None = None) -> bool:
@@ -245,9 +311,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_biography_stop_event
-        rows = self.repo.getArtistsMissingBiographies(self.LASTFM_BIOGRAPHY_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("bio", rows)
+        claimed = self._pooledCandidates(
+            "bio", scopeUsername,
+            lambda limit: self.repo.getArtistsMissingBiographies(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             for row in claimed:
                 if stop_event.is_set():
@@ -261,9 +329,11 @@ class LastfmBackfillMixin:
                     continue   #< stays unattempted, retried next cycle
                 bio = outcome.bio if outcome.status == _dbmod.OUTCOME_OK else None
                 self.repo.setArtistBio(row["id"], bio)
+                completedIds.add(row["id"])
                 processedAny = True
         finally:
-            self._releaseLastfmEntities("bio", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("bio", scopeUsername, claimed, retryRows)
         return processedAny
 
     def startLastfmAlbumBiographyBackfiller(self) -> None:
@@ -301,7 +371,7 @@ class LastfmBackfillMixin:
             enabled=self.repo.isAlbumBioEnabled,
             runWork=self._processLastfmAlbumBiographyBatch,
             logPrefix="LastfmAlbumBioWorker", errorLabel="album biography",
-            telemetryKey="lastfm_album_bio")
+            telemetryKey="lastfm_album_bio", poolKinds=("album_bio",))
 
     def _processLastfmAlbumBiographyBatch(self, client: LastfmClient, scopeUsername: str | None,
                                           stop_event: threading.Event | None = None) -> bool:
@@ -317,9 +387,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_album_biography_stop_event
-        rows = self.repo.getAlbumsMissingBiographies(self.LASTFM_ALBUM_BIOGRAPHY_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("album_bio", rows)
+        claimed = self._pooledCandidates(
+            "album_bio", scopeUsername,
+            lambda limit: self.repo.getAlbumsMissingBiographies(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             primaries = self.repo.getAlbumPrimaryArtists([row["id"] for row in claimed])
             for row in claimed:
@@ -328,6 +400,7 @@ class LastfmBackfillMixin:
                 primary = primaries.get(row["id"])
                 if primary is None:
                     self.repo.setAlbumBio(row["id"], None)
+                    completedIds.add(row["id"])
                     processedAny = True
                     continue
                 outcome = self._lastfmLookupBioOutcome(
@@ -343,10 +416,12 @@ class LastfmBackfillMixin:
 
                 bio = outcome.bio if outcome.status == _dbmod.OUTCOME_OK else None
                 self.repo.setAlbumBio(row["id"], bio)
+                completedIds.add(row["id"])
                 processedAny = True
 
         finally:
-            self._releaseLastfmEntities("album_bio", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("album_bio", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _claimLastfmEntities(self, kind: str, rows: list[dict]) -> list[dict]:
@@ -366,6 +441,247 @@ class LastfmBackfillMixin:
         with _dbmod.Database._lastfm_active_lock:
             for row in rows:
                 _dbmod.Database._lastfm_active.discard((kind, row["id"]))
+
+    def _lastfmPoolBatchSize(self, kind: str) -> int:
+        if kind in ("artist", "album", "track"):
+            return self.LASTFM_QUEUE_BATCH_SIZE
+        if kind == "bio":
+            return self.LASTFM_BIOGRAPHY_QUEUE_BATCH_SIZE
+        if kind == "album_bio":
+            return self.LASTFM_ALBUM_BIOGRAPHY_QUEUE_BATCH_SIZE
+        raise ValueError(f"unknown Last.fm pool kind: {kind}")
+
+    def _lastfmRevalidateRows(self, kind: str, scopeUsername: str | None,
+                              rows: list[dict]) -> list[dict]:
+        ids = [row["id"] for row in rows]
+        if kind in ("artist", "album", "track"):
+            eligible = self.repo.getLastfmGenreRowsByIds(kind, ids, scopeUsername)
+        else:
+            eligible = self.repo.getLastfmBiographyRowsByIds(kind, ids, scopeUsername)
+        eligibleById = {row["id"]: row for row in eligible}
+        return [eligibleById[row["id"]] for row in rows if row["id"] in eligibleById]
+
+    @staticmethod
+    def _lastfmUniqueRows(rows: list[dict]) -> list[dict]:
+        seen = set()
+        unique = []
+        for row in rows:
+            rowId = row["id"]
+            if rowId in seen:
+                continue
+            seen.add(rowId)
+            unique.append(row)
+        return unique
+
+    def _lastfmUniqueRetryRows(self, rows: list[dict]) -> list[dict]:
+        """Deduplicate retry rows; admission keeps pending IDs within pool capacity."""
+        return self._lastfmUniqueRows(rows)
+
+    def _lastfmPoolOwnerKeys(
+            self, poolKinds: tuple[str, ...]) -> set[tuple[str, str | None, str | None]]:
+        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
+        scopes = {getattr(self, "user", None), None}
+        return {(kind, scope, dbPath) for kind in poolKinds for scope in scopes}
+
+    def _registerLastfmPoolOwner(self, poolKinds: tuple[str, ...], owner: object) -> None:
+        """Register one loop token as an owner of its fixed user/global pools."""
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            for key in self._lastfmPoolOwnerKeys(poolKinds):
+                _LASTFM_CANDIDATE_POOL_OWNERS.setdefault(key, set()).add(owner)
+                pool = _LASTFM_CANDIDATE_POOLS.get(key)
+                if pool is not None:
+                    pool.retire_when_idle = False
+
+    def _releaseLastfmPoolOwner(self, poolKinds: tuple[str, ...], owner: object) -> None:
+        """Release one loop token and retire only pools without another owner."""
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            for key in self._lastfmPoolOwnerKeys(poolKinds):
+                owners = _LASTFM_CANDIDATE_POOL_OWNERS.get(key)
+                if owners is None:
+                    continue
+                owners.discard(owner)
+                if not owners:
+                    _LASTFM_CANDIDATE_POOL_OWNERS.pop(key, None)
+        self._retireLastfmPools(poolKinds, owner=owner)
+
+    def _retireLastfmPools(self, poolKinds: tuple[str, ...], owner: object | None = None) -> None:
+        """Retire user/global pools when no other loop owner still needs them."""
+        keys = self._lastfmPoolOwnerKeys(poolKinds)
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            for key in keys:
+                owners = _LASTFM_CANDIDATE_POOL_OWNERS.get(key)
+                if owners and (
+                        owner is None or any(candidate != owner for candidate in owners)):
+                    continue
+                pool = _LASTFM_CANDIDATE_POOLS.get(key)
+                if pool is None:
+                    continue
+                if pool.leases == 0 and not pool.in_flight:
+                    if _LASTFM_CANDIDATE_POOLS.get(key) is pool:
+                        _LASTFM_CANDIDATE_POOLS.pop(key, None)
+                else:
+                    pool.retire_when_idle = True
+
+    @contextmanager
+    def _lastfmPoolAccess(self, kind: str, scopeUsername: str | None, *, create: bool = True):
+        """Lease a stable pool without holding the registry lock over its work.
+
+        Idle scopes are retired on later accesses. Waiting/refilling callers
+        hold leases; returned batches pin the pool until their finish call.
+        Unattempted retry rows remain eligible in the database after eviction.
+        """
+        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
+        key = (kind, scopeUsername, dbPath)
+        now = _dbmod.time.monotonic()
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            pool = _LASTFM_CANDIDATE_POOLS.get(key)
+            if pool is None and create:
+                pool = _LastfmCandidatePool([], None)
+                _LASTFM_CANDIDATE_POOLS[key] = pool
+            if _lastfmPoolMaintenanceDue(
+                    now, self.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS):
+                for oldKey, oldPool in list(_LASTFM_CANDIDATE_POOLS.items()):
+                    lastUsed = oldPool.last_used if oldPool.last_used is not None else oldPool.fetched_at
+                    if (oldKey != key and not oldPool.leases and not oldPool.in_flight
+                            and not _LASTFM_CANDIDATE_POOL_OWNERS.get(oldKey)
+                            and lastUsed is not None
+                            and now - lastUsed >= self.LASTFM_QUEUE_POOL_TTL_SECONDS):
+                        del _LASTFM_CANDIDATE_POOLS[oldKey]
+            if pool is not None:
+                pool.leases += 1
+                pool.last_used = now
+        if pool is None:
+            yield None
+            return
+        try:
+            with pool.lock:
+                yield pool
+        finally:
+            with _LASTFM_CANDIDATE_POOLS_LOCK:
+                pool.last_used = _dbmod.time.monotonic()
+                pool.leases -= 1
+                if (pool.retire_when_idle and pool.leases == 0
+                        and not pool.in_flight
+                        and _LASTFM_CANDIDATE_POOLS.get(key) is pool):
+                    if _LASTFM_CANDIDATE_POOL_OWNERS.get(key):
+                        pool.retire_when_idle = False
+                    else:
+                        _LASTFM_CANDIDATE_POOLS.pop(key, None)
+
+    def _pooledCandidates(self, kind: str, scopeUsername: str | None, fetch) -> list[dict]:
+        """Claim one bounded batch from a cached, scope-specific candidate pool.
+
+        The database fetch is limited to one per invocation. Main-pool rows are
+        consumed by an ordered cursor; rows that were held, stopped, or failed
+        transiently form a bounded retry prefix for the next invocation.
+        """
+        batchSize = self._lastfmPoolBatchSize(kind)
+        poolWasRefilled = False
+
+        with self._lastfmPoolAccess(kind, scopeUsername) as pool:
+            now = _dbmod.time.monotonic()
+            if (pool.drained_until is not None
+                    and now < pool.drained_until and not pool.retry_rows):
+                return []
+            expired = (pool.fetched_at is None or
+                       now - pool.fetched_at >= self.LASTFM_QUEUE_POOL_TTL_SECONDS)
+
+            def refill() -> None:
+                # Publish only a complete fetch, preserving this pool's lock,
+                # outstanding batches and retry prefix. TTL starts on success.
+                fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
+                fetchedAt = _dbmod.time.monotonic()
+                pool.rows = fetched
+                pool.fetched_at = fetchedAt
+                pool.cursor = 0
+                pool.drained_until = None if fetched else fetchedAt + self.LASTFM_QUEUE_DRAINED_MEMO_SECONDS
+
+            if expired:
+                refill()
+                poolWasRefilled = True
+
+            selected: list[dict] = []
+            retryPrefix = list(pool.retry_rows)
+            pool.retry_rows = []
+            selectedIds = set()
+            outstandingIds = {row["id"] for row in retryPrefix}
+            outstandingIds.update(pool.in_flight)
+
+            def consider(row: dict, fromMain: bool) -> bool:
+                rowId = row["id"]
+                knownOutstanding = rowId in outstandingIds
+                if fromMain:
+                    if (not knownOutstanding
+                            and len(outstandingIds) >= self.LASTFM_QUEUE_POOL_SIZE):
+                        return False
+                    pool.cursor += 1
+                    if knownOutstanding:
+                        return True
+                if len(selected) >= batchSize or rowId in selectedIds:
+                    return True
+                claimed = self._claimLastfmEntities(kind, [row])
+                if claimed:
+                    selected.append(claimed[0])
+                    selectedIds.add(rowId)
+                else:
+                    pool.retry_rows.append(row)
+                outstandingIds.add(rowId)
+                return True
+
+            for retryIndex, row in enumerate(retryPrefix):
+                if len(selected) >= batchSize:
+                    pool.retry_rows.extend(retryPrefix[retryIndex:])
+                    break
+                consider(row, False)
+
+            retryIds = {row["id"] for row in retryPrefix}
+            while len(selected) < batchSize and pool.cursor < len(pool.rows):
+                row = pool.rows[pool.cursor]
+                if row["id"] in retryIds:
+                    pool.cursor += 1
+                    continue
+                if not consider(row, True):
+                    break
+
+            if (not selected and not retryPrefix and pool.cursor >= len(pool.rows)
+                    and not poolWasRefilled):
+                refill()
+                poolWasRefilled = True
+                while len(selected) < batchSize and pool.cursor < len(pool.rows):
+                    row = pool.rows[pool.cursor]
+                    if not consider(row, True):
+                        break
+
+            pool.retry_rows = self._lastfmUniqueRetryRows(pool.retry_rows)
+            pool.in_flight.update(row["id"] for row in selected)
+
+        if not selected:
+            return []
+        try:
+            eligible = self._lastfmRevalidateRows(kind, scopeUsername, selected)
+        except Exception:
+            self._finishPooledCandidates(kind, scopeUsername, selected, selected)
+            raise
+        eligibleIds = {row["id"] for row in eligible}
+        stale = [row for row in selected if row["id"] not in eligibleIds]
+        if stale:
+            self._finishPooledCandidates(kind, scopeUsername, stale, [])
+        return eligible
+
+    def _finishPooledCandidates(self, kind: str, scopeUsername: str | None,
+                                claimed: list[dict], retryRows: list[dict]) -> None:
+        try:
+            with self._lastfmPoolAccess(kind, scopeUsername, create=False) as pool:
+                if pool is not None:
+                    claimedIds = {row["id"] for row in claimed}
+                    pool.in_flight.difference_update(claimedIds)
+                    pool.retry_rows = [row for row in pool.retry_rows
+                                       if row["id"] not in claimedIds]
+                    if retryRows:
+                        pool.retry_rows = self._lastfmUniqueRetryRows(
+                            pool.retry_rows + retryRows)
+        finally:
+            self._releaseLastfmEntities(kind, claimed)
 
     @staticmethod
     def _lastfmOutcomeGenres(outcome) -> tuple[bool, list[str]]:
@@ -442,9 +758,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_stop_event
-        rows = self.repo.getArtistsMissingGenres(self.LASTFM_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("artist", rows)
+        claimed = self._pooledCandidates(
+            "artist", scopeUsername,
+            lambda limit: self.repo.getArtistsMissingGenres(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             for row in claimed:
                 if stop_event.is_set():
@@ -458,9 +776,11 @@ class LastfmBackfillMixin:
                 if genres:
                     self.repo.replaceArtistGenres(row["id"], genres)
                 self.repo.markArtistsLastfmAttempted([row["id"]])
+                completedIds.add(row["id"])
                 processedAny = True
         finally:
-            self._releaseLastfmEntities("artist", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("artist", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _processLastfmAlbumBatch(self, client: LastfmClient, scopeUsername: str | None,
@@ -468,9 +788,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_stop_event
-        rows = self.repo.getAlbumsMissingGenres(self.LASTFM_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("album", rows)
+        claimed = self._pooledCandidates(
+            "album", scopeUsername,
+            lambda limit: self.repo.getAlbumsMissingGenres(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             primaries = self.repo.getAlbumPrimaryArtists([row["id"] for row in claimed])
             for row in claimed:
@@ -481,6 +803,7 @@ class LastfmBackfillMixin:
                     # No derivable artist: album.getTopTags needs artist+album,
                     # and there's nothing to inherit from either.
                     self.repo.markAlbumsLastfmAttempted([row["id"]])
+                    completedIds.add(row["id"])
                     processedAny = True
                     continue
 
@@ -512,8 +835,10 @@ class LastfmBackfillMixin:
                         selected_primary["artist_id"], selected_primary["artist_name"],
                         stop_event=stop_event):
                     processedAny = True
+                    completedIds.add(row["id"])
         finally:
-            self._releaseLastfmEntities("album", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("album", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _processLastfmTrackBatch(self, client: LastfmClient, scopeUsername: str | None,
@@ -521,9 +846,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_stop_event
-        rows = self.repo.getTracksMissingGenres(self.LASTFM_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("track", rows)
+        claimed = self._pooledCandidates(
+            "track", scopeUsername,
+            lambda limit: self.repo.getTracksMissingGenres(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             for row in claimed:
                 if stop_event.is_set():
@@ -541,8 +868,10 @@ class LastfmBackfillMixin:
                         row["artist_id"], row["artist_name"], albumId=row["album_id"],
                         stop_event=stop_event):
                     processedAny = True
+                    completedIds.add(row["id"])
         finally:
-            self._releaseLastfmEntities("track", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("track", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _storeLastfmGenresWithInheritance(self, client: LastfmClient, kind: str,

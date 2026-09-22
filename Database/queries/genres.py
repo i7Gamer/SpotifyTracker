@@ -791,6 +791,71 @@ class GenreQueries:
             """
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
+    def getLastfmGenreRowsByIds(self, kind: str, entityIds: list[str],
+                                username: str | None = None) -> list[dict]:
+        """Revalidate a bounded Last.fm genre candidate set.
+
+        This deliberately uses the queue's eligibility predicates while
+        constraining the entity ids supplied by the in-memory candidate pool.
+        It avoids repeating the history aggregate when another worker has
+        already resolved a pooled row.
+        """
+        if not entityIds:
+            return []
+        placeholders = ",".join("?" for _ in entityIds)
+        cutoff = time.time() - self.getGenreBackfillRetrySeconds()
+        conn = self._conn()
+
+        if kind == "artist":
+            rows = conn.execute(
+                f"""
+                SELECT ar.id AS id, ar.name AS name
+                FROM artists ar
+                WHERE ar.id IN ({placeholders})
+                  AND (ar.lastfm_attempted_at IS NULL
+                       OR (ar.lastfm_attempted_at < ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM artist_genres ag
+                               WHERE ag.artist_id = ar.id)))
+                """,
+                [*entityIds, cutoff],
+            ).fetchall()
+        elif kind == "album":
+            rows = conn.execute(
+                f"""
+                SELECT al.id AS id, al.name AS name
+                FROM albums al
+                WHERE al.id IN ({placeholders})
+                  AND (al.lastfm_attempted_at IS NULL
+                       OR (al.lastfm_attempted_at < ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM album_genres ag
+                               WHERE ag.album_id = al.id AND ag.inherited = 0)))
+                """,
+                [*entityIds, cutoff],
+            ).fetchall()
+        elif kind == "track":
+            rows = conn.execute(
+                f"""
+                SELECT t.id AS id, t.name AS name, t.album_id AS album_id,
+                       ar.id AS artist_id, ar.name AS artist_name
+                FROM tracks t
+                JOIN track_artists ta ON ta.track_id = t.id AND ta.position = 0
+                JOIN artists ar ON ar.id = ta.artist_id
+                WHERE t.id IN ({placeholders})
+                  AND t.canonical_id IS NULL
+                  AND (t.lastfm_attempted_at IS NULL
+                       OR (t.lastfm_attempted_at < ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM track_genres tg
+                               WHERE tg.track_id = t.id AND tg.inherited = 0)))
+                """,
+                [*entityIds, cutoff],
+            ).fetchall()
+        else:
+            raise ValueError(f"unknown Last.fm genre kind: {kind}")
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _queueUserClause(params: list, username: str | None) -> str:
         """'p.username = ? AND ' with the bind appended, or '' for the global

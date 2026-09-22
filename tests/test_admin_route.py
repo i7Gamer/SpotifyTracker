@@ -2034,6 +2034,12 @@ class TestAdminInsightsLayout(AdminRouteTestBase):
         self.assertIn("VERSION: 62", body)
         self.assertIn("OVERRIDDEN VIA SPOTIFY_TOTP_SECRET", body)
 
+    def test_transport_failures_and_last_real_mint_are_visible(self):
+        body = self._totpBody(transportFailures=3, secondsSinceLastMint=120)
+        self.assertIn("TOKEN REQUEST FAILURES: 3", body)
+        self.assertIn("LAST TOKEN MINT: 2 MIN AGO", body)
+        self.assertNotIn("TOTP SECRET LIKELY ROTATED", body)
+
     def test_an_auto_recovered_secret_is_shown_as_temporary(self):
         """Recovery keeps the instance running but holds the secret in memory,
         so the panel has to say it will vanish on restart - otherwise the

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import atexit
+import ast
 import copy
 import json
 import logging
@@ -10,6 +11,7 @@ import re
 import signal
 import threading
 import time
+import weakref
 import websockets.sync.client
 import websockets.exceptions
 import spotapi.exceptions
@@ -1304,6 +1306,8 @@ TOTP_RECOVERY_COOLDOWN_SECONDS = 15 * 60
 
 _totpAuthLock = threading.Lock()
 _totpConsecutiveFailures = 0
+_totpTransportFailures = 0   #< non-rejection failures since the last real mint
+_totpLastMintAt = None
 _totpFirstFailureAt = None   #< monotonic; "how long has this been going on"
 _totpAdoptedSecret = None    #< (version, bytearray) once recovery has found a newer one
 _totpLastRecoveryAt = None   #< monotonic; gates the cooldown above
@@ -1311,7 +1315,7 @@ _totpRecoveryThread = None   #< daemon running attemptTotpRecovery; tests join i
 
 
 def recordTotpAuthFailure() -> int:
-    """Count a failed session-token request. Returns the new streak length."""
+    """Count an explicit TOTP rejection. Returns the new streak length."""
     global _totpConsecutiveFailures, _totpFirstFailureAt
     with _totpAuthLock:
         if _totpConsecutiveFailures == 0:
@@ -1323,16 +1327,18 @@ def recordTotpAuthFailure() -> int:
 def recordTotpAuthSuccess() -> None:
     """Clear the streak. Whatever it was, it is over - and a stale alarm on the
     admin panel is worse than no alarm, because it trains people to ignore it."""
-    global _totpConsecutiveFailures, _totpFirstFailureAt
+    global _totpConsecutiveFailures, _totpFirstFailureAt, _totpTransportFailures, _totpLastMintAt
     with _totpAuthLock:
         _totpConsecutiveFailures = 0
         _totpFirstFailureAt = None
+        _totpTransportFailures = 0
+        _totpLastMintAt = time.monotonic()
 
 
 def resetTotpAuthState() -> None:
     """Test seam - this state is process-global, so tests must not inherit each
     other's streaks, adopted secrets, cooldowns or in-flight recoveries."""
-    global _totpAdoptedSecret, _totpLastRecoveryAt, _totpRecoveryThread
+    global _totpAdoptedSecret, _totpLastRecoveryAt, _totpRecoveryThread, _totpLastMintAt
     thread = _totpRecoveryThread
     if thread is not None and thread.is_alive():
         #< joined OUTSIDE the lock: the running recovery needs _totpAuthLock to
@@ -1343,6 +1349,42 @@ def resetTotpAuthState() -> None:
         _totpAdoptedSecret = None
         _totpLastRecoveryAt = None
         _totpRecoveryThread = None
+        _totpLastMintAt = None
+
+
+def _isTotpRejection(error):
+    """Match the token endpoint's observed rejection, not any failed HTTP request.
+
+    spotapi 1.3 retains status and the Python repr of the parsed body in .error.
+    Anonymous invalid-code/version probes (2026-09-22) returned 400 with
+    error.message='Unauthorized request', and totpVerExpired='error' for an
+    expired version. Unknown bodies remain visible as request failures.
+    """
+    detail = getattr(error, "error", None)
+    if not isinstance(error, spotapi.exceptions.BaseClientError) or not isinstance(detail, str):
+        return False
+    match = re.fullmatch(r"Status Code: 400, Response: (.*)", detail, re.DOTALL)
+    if match is None:
+        return False
+    raw = match.group(1)
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        try:
+            body = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            return False
+    if not isinstance(body, dict):
+        return False
+    rejection = body.get("error")
+    return (body.get("totpVerExpired") == "error"
+            or (isinstance(rejection, dict) and rejection.get("message") == "Unauthorized request"))
+
+
+def _recordTotpTransportFailure():
+    global _totpTransportFailures
+    with _totpAuthLock:
+        _totpTransportFailures += 1
 
 
 def _autoRecoverEnabled() -> bool:
@@ -1423,6 +1465,8 @@ def totpAuthSnapshot() -> dict:
     activeVersion, _ = _resolveTotpSecret()
     with _totpAuthLock:
         failures = _totpConsecutiveFailures
+        transportFailures = _totpTransportFailures
+        lastMintAt = _totpLastMintAt
         firstAt = _totpFirstFailureAt
         adopted = _totpAdoptedSecret
     # "Parses", not "is set": _resolveTotpSecret IGNORES a malformed override,
@@ -1447,6 +1491,8 @@ def totpAuthSnapshot() -> dict:
         "autoRecovered": not envOverride and adopted is not None,
         "overrideEnvVar": TOTP_SECRET_ENV_VAR,
         "consecutiveFailures": failures,
+        "transportFailures": transportFailures,
+        "secondsSinceLastMint": None if lastMintAt is None else time.monotonic() - lastMintAt,
         "suspectedRotation": failures >= TOTP_ROTATION_CONFIRM_THRESHOLD,
         "secondsSinceFirstFailure": None if firstAt is None else time.monotonic() - firstAt,
     }
@@ -1545,7 +1591,10 @@ def patch_totp_secret() -> bool:
                       or getattr(self, "client_id", _Undefined) is _Undefined)
         try:
             result = original_get_auth_vars(self, *args, **kwargs)
-        except spotapi.exceptions.BaseClientError:
+        except (spotapi.exceptions.BaseClientError, spotapi.exceptions.RequestError) as error:
+            if not _isTotpRejection(error):
+                _recordTotpTransportFailure()
+                raise
             failures = recordTotpAuthFailure()
             # The message spotapi raises names neither TOTP nor these
             # constants, so the pin would be undiscoverable from the symptom it
@@ -1579,5 +1628,239 @@ def patch_totp_secret() -> bool:
     return True
 
 
+# Public web-player assets can be shared process-wide. Cookies and tokens cannot:
+# spotapi builds a new BaseClient for every lookup on a borrowed TLS transport.
+SPOTAPI_HASH_CACHE_TTL_SECONDS = 6 * 3600
+_spotapiBundle = None
+_spotapiHashByName = {}
+_spotapiJsPack = None
+_spotapiBundleFetchedAt = None
+_spotapiBundleGeneration = 0
+_spotapiBundleLock = threading.Lock()
+_spotapiHashUse = threading.local()
+_spotapiAuthByClient = {}
+_spotapiAuthLock = threading.Lock()
+_spotapiAuthRequestContext = threading.local()
+_SPOTAPI_AUTH_FIELDS = (
+    "access_token", "client_id", "access_token_expires_at_ms",
+    "client_token", "client_version", "device_id",
+)
+_SPOTAPI_AUTH_UNAUTHORIZED_STATUS = 401
+_SPOTAPI_AUTH_CLIENT_TOKEN_STATUS = 400
+_SPOTAPI_INVALID_CLIENT_TOKEN = "INVALID_CLIENTTOKEN"
+
+
+def _clearSpotapiBundle():
+    """Clear the entire public generation while holding _spotapiBundleLock."""
+    global _spotapiBundle, _spotapiJsPack, _spotapiBundleFetchedAt, _spotapiBundleGeneration
+    _spotapiBundle = _spotapiJsPack = _spotapiBundleFetchedAt = None
+    _spotapiHashByName.clear()
+    _spotapiBundleGeneration += 1
+
+
+def invalidateSpotapiHashCache(generation=None):
+    """Evict only the generation rejected by Spotify, or unconditionally for reset."""
+    with _spotapiBundleLock:
+        if generation is not None and generation != _spotapiBundleGeneration:
+            return False
+        _clearSpotapiBundle()
+        return True
+
+
+def beginSpotapiHashAttempt():
+    """Do not attribute a failure before part_hash to a previous lookup's bundle."""
+    _spotapiHashUse.generation = None
+
+
+def invalidateUsedSpotapiHash():
+    """The thread's actual part_hash generation, not a racy pre-request snapshot."""
+    generation = getattr(_spotapiHashUse, "generation", None)
+    return generation is not None and invalidateSpotapiHashCache(generation)
+
+
+def _hydrateSpotapiAuth(base):
+    # Only a newly constructed, empty BaseClient needs hydration. A direct
+    # get_session (e.g. websocket refresh) may already have supplied newer state.
+    if any(getattr(base, field, _Undefined) is not _Undefined
+           for field in ("access_token", "client_id", "client_token")):
+        return
+    with _spotapiAuthLock:
+        entry = _spotapiAuthByClient.get(id(base.client))
+        if entry is not None and entry[0]() is base.client:
+            for field, value in entry[1].items():
+                setattr(base, field, value)
+
+
+def _publishSpotapiAuth(base):
+    key = id(base.client)
+
+    def discard(ref):
+        with _spotapiAuthLock:
+            entry = _spotapiAuthByClient.get(key)
+            if entry is not None and entry[0] is ref:
+                _spotapiAuthByClient.pop(key, None)
+
+    state = {field: getattr(base, field) for field in _SPOTAPI_AUTH_FIELDS}
+    with _spotapiAuthLock:
+        _spotapiAuthByClient[key] = (weakref.ref(base.client, discard), state)
+
+
+def _isSpotapiAuthFailure(response):
+    status = getattr(response, "status_code", None)
+    if status == _SPOTAPI_AUTH_UNAUTHORIZED_STATUS:
+        return True
+    if status != _SPOTAPI_AUTH_CLIENT_TOKEN_STATUS:
+        return False
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        raw = getattr(response, "raw", None)
+        headers = getattr(raw, "headers", None)
+    try:
+        headers = {key.lower(): value for key, value in headers.items()}
+    except (AttributeError, TypeError):
+        return False
+    return headers.get("client-token-error") == _SPOTAPI_INVALID_CLIENT_TOKEN
+
+
+def _evictSpotapiAuthClient(client):
+    key = id(client)
+    with _spotapiAuthLock:
+        entry = _spotapiAuthByClient.get(key)
+        if entry is not None:
+            cachedClient = entry[0]()
+            if cachedClient is None or cachedClient is client:
+                _spotapiAuthByClient.pop(key, None)
+
+
+def _evictSpotapiAuth(base):
+    _evictSpotapiAuthClient(base.client)
+
+
+def _loadSpotapiBundle(base):
+    """Load under the bundle lock, publishing only the fully assembled string."""
+    global _spotapiBundle, _spotapiJsPack, _spotapiBundleFetchedAt, _spotapiBundleGeneration
+    import spotapi.client as upstream
+
+    if (_spotapiBundle is None or _spotapiBundleFetchedAt is None
+            or time.monotonic() - _spotapiBundleFetchedAt >= SPOTAPI_HASH_CACHE_TTL_SECONDS):
+        _clearSpotapiBundle()
+        _hydrateSpotapiAuth(base)
+        # Rediscover the pack URL on each refresh; base.js_pack may itself be old.
+        base.get_session()
+        if not base.js_pack or base.js_pack is _Undefined:
+            raise ValueError("Could not get playlist hashes")
+        response = base.client.get(str(base.js_pack))
+        if response.fail:
+            raise spotapi.exceptions.BaseClientError("Could not get general hashes", error=response.error.string)
+        chunks = [response.response]
+        strMapping, hashMapping = upstream.extract_mappings(str(chunks[0]))
+        for chunk in upstream.combine_chunks(hashMapping, strMapping):
+            response = base.client.get(f"https://open.spotifycdn.com/cdn/build/web-player/{chunk}")
+            if response.fail:
+                raise spotapi.exceptions.BaseClientError("Could not get general hashes", error=response.error.string)
+            chunks.append(response.response)
+        _spotapiBundle = "".join(chunks)
+        _spotapiJsPack = str(base.js_pack)
+        _spotapiBundleFetchedAt = time.monotonic()
+        _spotapiBundleGeneration += 1
+    base.raw_hashes = _spotapiBundle
+    base.js_pack = _spotapiJsPack
+
+
+def _extractSpotapiOperationHash(bundle, name):
+    try:
+        return bundle.split(f'"{name}","query","', 1)[1].split('"', 1)[0]
+    except IndexError:
+        return bundle.split(f'"{name}","mutation","', 1)[1].split('"', 1)[0]
+
+
+def patch_spotapi_cache():
+    """Reuse public hashes and per-transport auth without changing spotapi's expiry rules."""
+    import spotapi.client as upstream
+    baseClass = upstream.BaseClient
+
+    if not getattr(baseClass.get_sha256_hash, "_spotapiCached", False):
+        def getHashes(self):
+            with _spotapiBundleLock:
+                _loadSpotapiBundle(self)
+        getHashes._spotapiCached = True
+        baseClass.get_sha256_hash = getHashes
+
+    if not getattr(baseClass.part_hash, "_spotapiCached", False):
+        def partHash(self, name):
+            with _spotapiBundleLock:
+                # Check TTL even for an operation already in the map.
+                _loadSpotapiBundle(self)
+                if name not in _spotapiHashByName:
+                    _spotapiHashByName[name] = _extractSpotapiOperationHash(_spotapiBundle, name)
+                _spotapiHashUse.generation = _spotapiBundleGeneration
+                return _spotapiHashByName[name]
+        partHash._spotapiCached = True
+        baseClass.part_hash = partHash
+
+    from spotapi.http.request import TLSClient
+    if not getattr(TLSClient.parse_response, "_spotapiCached", False):
+        originalParseResponse = TLSClient.parse_response
+
+        def parseResponse(self, response, method, danger):
+            # TLSClient._send calls on_auth_failure only for its first failed
+            # response. Evict before parsing so a terminal retry, including a
+            # danger=True parser exception, cannot leave rejected auth cached.
+            context = getattr(_spotapiAuthRequestContext, "active", None)
+            authenticated = (context is not None and context[0] is self
+                             and context[1])
+            if authenticated and _isSpotapiAuthFailure(response):
+                _evictSpotapiAuthClient(self)
+            return originalParseResponse(self, response, method, danger)
+        parseResponse._spotapiCached = True
+        TLSClient.parse_response = parseResponse
+
+    if not getattr(TLSClient._send, "_spotapiCached", False):
+        originalSend = TLSClient._send
+
+        def send(self, method, url, *, authenticate, danger, **kwargs):
+            previous = getattr(_spotapiAuthRequestContext, "active", None)
+            _spotapiAuthRequestContext.active = (self, authenticate)
+            try:
+                return originalSend(self, method, url, authenticate=authenticate,
+                                    danger=danger, **kwargs)
+            finally:
+                _spotapiAuthRequestContext.active = previous
+        send._spotapiCached = True
+        TLSClient._send = send
+
+    if not getattr(baseClass._auth_rule, "_spotapiCached", False):
+        originalAuth = baseClass._auth_rule
+
+        def authRule(self, kwargs):
+            _hydrateSpotapiAuth(self)
+            try:
+                result = originalAuth(self, kwargs)
+            except Exception:
+                _evictSpotapiAuth(self)
+                raise
+            _publishSpotapiAuth(self)
+            return result
+        authRule._spotapiCached = True
+        baseClass._auth_rule = authRule
+
+    if not getattr(baseClass._handle_auth_failure, "_spotapiCached", False):
+        originalFailure = baseClass._handle_auth_failure
+
+        def authFailure(self, response):
+            refresh = _isSpotapiAuthFailure(response)
+            if refresh:
+                _evictSpotapiAuth(self)
+            result = originalFailure(self, response)
+            if refresh and result:
+                # TLS._send authenticates again immediately after this callback.
+                _publishSpotapiAuth(self)
+            return result
+        authFailure._spotapiCached = True
+        baseClass._handle_auth_failure = authFailure
+    return True
+
+
 patch_spotapi_user()
 patch_totp_secret()
+patch_spotapi_cache()

@@ -19,9 +19,10 @@ def setUpModule():
     # other test module's mock was still in sys.modules, the real spotapi
     # would never get patched for the rest of the process. Re-applying here
     # makes this module correct regardless of import order.
-    from Database.patches import patch_spotapi_user, patch_totp_secret
+    from Database.patches import patch_spotapi_user, patch_totp_secret, patch_spotapi_cache
     patch_spotapi_user()
     patch_totp_secret()
+    patch_spotapi_cache()
 
 
 class TestPatches(unittest.TestCase):
@@ -2084,7 +2085,7 @@ class TestTotpRotationTracking(unittest.TestCase):
         instance.client_id = spotapi.client._Undefined
         failure = MagicMock()
         failure.fail = True
-        failure.error.string = "400 Bad Request"
+        failure.error.string = "Status Code: 400, Response: {'totpVerExpired': 'error'}"
         instance.client = MagicMock()
         instance.client.get.return_value = failure
 
@@ -2104,7 +2105,7 @@ class TestTotpRotationTracking(unittest.TestCase):
         instance.client_id = spotapi.client._Undefined
         failure = MagicMock()
         failure.fail = True
-        failure.error.string = "400 Bad Request"
+        failure.error.string = "Status Code: 400, Response: {'totpVerExpired': 'error'}"
         instance.client = MagicMock()
         instance.client.get.return_value = failure
 
@@ -2272,7 +2273,7 @@ class TestTotpAutoRecovery(unittest.TestCase):
         instance.client_id = spotapi.client._Undefined
         failure = MagicMock()
         failure.fail = True
-        failure.error.string = "400 Bad Request"
+        failure.error.string = "Status Code: 400, Response: {'totpVerExpired': 'error'}"
         instance.client = MagicMock()
         instance.client.get.return_value = failure
 
@@ -2302,7 +2303,7 @@ class TestTotpAutoRecovery(unittest.TestCase):
         instance.client_id = spotapi.client._Undefined
         failure = MagicMock()
         failure.fail = True
-        failure.error.string = "400 Bad Request"
+        failure.error.string = "Status Code: 400, Response: {'totpVerExpired': 'error'}"
         instance.client = MagicMock()
         instance.client.get.return_value = failure
 
@@ -2415,7 +2416,7 @@ class TestAuthFailureHint(unittest.TestCase):
         instance.client_id = spotapi.client._Undefined
         failure = MagicMock()
         failure.fail = True
-        failure.error.string = "401 Unauthorized"
+        failure.error.string = "Status Code: 400, Response: {'totpVerExpired': 'error'}"
         instance.client = MagicMock()
         instance.client.get.return_value = failure
         return instance

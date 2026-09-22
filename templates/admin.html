@@ -383,8 +383,16 @@
               {% endif %}
             {% elif spotify_totp.consecutiveFailures %}
               <span class="badge badge-orange">TOKEN FAILURES: {{ spotify_totp.consecutiveFailures }}</span>
+            {% elif spotify_totp.transportFailures %}
+              <span class="badge badge-orange">TOKEN REQUEST FAILURES: {{ spotify_totp.transportFailures }}</span>
             {% else %}
               <span class="badge badge-success">OK</span>
+            {% endif %}
+            {% if spotify_totp.consecutiveFailures and spotify_totp.transportFailures %}
+              <span class="badge badge-orange">TOKEN REQUEST FAILURES: {{ spotify_totp.transportFailures }}</span>
+            {% endif %}
+            {% if spotify_totp.get('secondsSinceLastMint') is not none %}
+              <span class="badge badge-secondary">LAST TOKEN MINT: {{ (spotify_totp.secondsSinceLastMint / 60) | round | int }} MIN AGO</span>
             {% endif %}
             <span class="badge badge-secondary">VERSION: {{ spotify_totp.activeVersion }}</span>
             {% if spotify_totp.overrideActive %}
