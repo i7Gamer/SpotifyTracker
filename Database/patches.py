@@ -1644,6 +1644,9 @@ _SPOTAPI_AUTH_FIELDS = (
     "access_token", "client_id", "access_token_expires_at_ms",
     "client_token", "client_version", "device_id",
 )
+_SPOTAPI_AUTH_UNAUTHORIZED_STATUS = 401
+_SPOTAPI_AUTH_CLIENT_TOKEN_STATUS = 400
+_SPOTAPI_INVALID_CLIENT_TOKEN = "INVALID_CLIENTTOKEN"
 
 
 def _clearSpotapiBundle():
@@ -1701,9 +1704,35 @@ def _publishSpotapiAuth(base):
         _spotapiAuthByClient[key] = (weakref.ref(base.client, discard), state)
 
 
-def _evictSpotapiAuth(base):
+def _isSpotapiAuthFailure(response):
+    status = getattr(response, "status_code", None)
+    if status == _SPOTAPI_AUTH_UNAUTHORIZED_STATUS:
+        return True
+    if status != _SPOTAPI_AUTH_CLIENT_TOKEN_STATUS:
+        return False
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        raw = getattr(response, "raw", None)
+        headers = getattr(raw, "headers", None)
+    try:
+        headers = {key.lower(): value for key, value in headers.items()}
+    except (AttributeError, TypeError):
+        return False
+    return headers.get("client-token-error") == _SPOTAPI_INVALID_CLIENT_TOKEN
+
+
+def _evictSpotapiAuthClient(client):
+    key = id(client)
     with _spotapiAuthLock:
-        _spotapiAuthByClient.pop(id(base.client), None)
+        entry = _spotapiAuthByClient.get(key)
+        if entry is not None:
+            cachedClient = entry[0]()
+            if cachedClient is None or cachedClient is client:
+                _spotapiAuthByClient.pop(key, None)
+
+
+def _evictSpotapiAuth(base):
+    _evictSpotapiAuthClient(base.client)
 
 
 def _loadSpotapiBundle(base):
@@ -1768,6 +1797,20 @@ def patch_spotapi_cache():
         partHash._spotapiCached = True
         baseClass.part_hash = partHash
 
+    from spotapi.http.request import TLSClient
+    if not getattr(TLSClient.parse_response, "_spotapiCached", False):
+        originalParseResponse = TLSClient.parse_response
+
+        def parseResponse(self, response, method, danger):
+            # TLSClient._send calls on_auth_failure only for its first failed
+            # response. Evict before parsing so a terminal retry, including a
+            # danger=True parser exception, cannot leave rejected auth cached.
+            if _isSpotapiAuthFailure(response):
+                _evictSpotapiAuthClient(self)
+            return originalParseResponse(self, response, method, danger)
+        parseResponse._spotapiCached = True
+        TLSClient.parse_response = parseResponse
+
     if not getattr(baseClass._auth_rule, "_spotapiCached", False):
         originalAuth = baseClass._auth_rule
 
@@ -1787,12 +1830,7 @@ def patch_spotapi_cache():
         originalFailure = baseClass._handle_auth_failure
 
         def authFailure(self, response):
-            try:
-                headers = {key.lower(): value for key, value in response.raw.headers.items()}
-            except (AttributeError, TypeError):
-                headers = {}
-            refresh = (response.status_code == 401 or (response.status_code == 400
-                       and headers.get("client-token-error") == "INVALID_CLIENTTOKEN"))
+            refresh = _isSpotapiAuthFailure(response)
             if refresh:
                 _evictSpotapiAuth(self)
             result = originalFailure(self, response)

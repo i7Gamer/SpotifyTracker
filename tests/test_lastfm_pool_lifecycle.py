@@ -18,6 +18,8 @@ THREAD_TIMEOUT_SECONDS = 5
 FETCH_TIMEOUT_SECONDS = THREAD_TIMEOUT_SECONDS * 2
 START_TIME = 100
 REGISTRY_ACCESS_REPEAT_COUNT = 5
+TINY_POOL_SIZE = 4
+TINY_BATCH_SIZE = 2
 
 
 class PoolHarness(workers.LastfmBackfillMixin):
@@ -33,6 +35,13 @@ class PoolHarness(workers.LastfmBackfillMixin):
 
     def _lastfmRevalidateRows(self, kind, scopeUsername, rows):
         return rows
+
+
+class TinyPoolHarness(PoolHarness):
+    LASTFM_QUEUE_POOL_SIZE = TINY_POOL_SIZE
+    LASTFM_QUEUE_BATCH_SIZE = TINY_BATCH_SIZE
+    LASTFM_BIOGRAPHY_QUEUE_BATCH_SIZE = TINY_BATCH_SIZE
+    LASTFM_ALBUM_BIOGRAPHY_QUEUE_BATCH_SIZE = TINY_BATCH_SIZE
 
 
 @pytest.fixture
@@ -199,6 +208,90 @@ def test_finish_without_pool_releases_claims_without_creating_an_entry(clock):
     worker._finishPooledCandidates("artist", "absent", claimed, claimed)
     assert not Database._lastfm_active
     assert not workers._LASTFM_CANDIDATE_POOLS
+
+
+def test_ttl_refill_waits_for_old_inflight_and_retry_capacity(clock):
+    worker = TinyPoolHarness()
+    oldRows = [{"id": f"old-{index}", "name": f"Old {index}"}
+               for index in range(TINY_POOL_SIZE)]
+    newRows = [{"id": f"new-{index}", "name": f"New {index}"}
+               for index in range(TINY_POOL_SIZE)]
+    fetch = Mock(side_effect=[oldRows, [], newRows])
+
+    first = worker._pooledCandidates("artist", "user", fetch)
+    assert [row["id"] for row in first] == ["old-0", "old-1"]
+    Database._lastfm_active.update(("artist", f"old-{index}")
+                                   for index in (2, 3))
+    assert worker._pooledCandidates("artist", "user", fetch) == []
+    pool = workers._LASTFM_CANDIDATE_POOLS[("artist", "user", "database-a")]
+    assert [row["id"] for row in pool.retry_rows] == ["old-2", "old-3"]
+
+    clock[0] += worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+    assert worker._pooledCandidates("artist", "user", fetch) == []
+    assert pool.cursor == 0
+    assert [row["id"] for row in pool.retry_rows] == ["old-2", "old-3"]
+    assert pool.in_flight == {"old-0", "old-1"}
+    assert len(pool.retry_rows) + len(pool.in_flight) <= TINY_POOL_SIZE
+
+    Database._lastfm_active.difference_update(
+        ("artist", f"old-{index}") for index in (2, 3))
+    retry = worker._pooledCandidates("artist", "user", fetch)
+    assert [row["id"] for row in retry] == ["old-2", "old-3"]
+    assert pool.cursor == 0
+    assert len(pool.retry_rows) + len(pool.in_flight) <= TINY_POOL_SIZE
+    worker._finishPooledCandidates("artist", "user", retry, [])
+    worker._finishPooledCandidates("artist", "user", first, first)
+    assert [row["id"] for row in pool.retry_rows] == ["old-0", "old-1"]
+
+    oldRetry = worker._pooledCandidates("artist", "user", fetch)
+    assert [row["id"] for row in oldRetry] == ["old-0", "old-1"]
+    worker._finishPooledCandidates("artist", "user", oldRetry, [])
+    offered = []
+    for _ in range(TINY_POOL_SIZE // TINY_BATCH_SIZE):
+        batch = worker._pooledCandidates("artist", "user", fetch)
+        offered.extend(row["id"] for row in batch)
+        assert len(pool.retry_rows) + len(pool.in_flight) <= TINY_POOL_SIZE
+        worker._finishPooledCandidates("artist", "user", batch, [])
+    assert offered == [f"new-{index}" for index in range(TINY_POOL_SIZE)]
+    assert fetch.call_count == 3
+    assert not Database._lastfm_active
+
+
+@pytest.mark.parametrize("kind", ["artist", "album", "track", "bio", "album_bio"])
+def test_exhausted_refill_reserves_retry_capacity_through_revalidation_failure(clock, kind):
+    worker = TinyPoolHarness()
+    oldRows = rows("old")[:TINY_POOL_SIZE]
+    newRows = rows("new")[:TINY_POOL_SIZE]
+    fetch = Mock(side_effect=[oldRows, newRows])
+    first = worker._pooledCandidates(kind, "user", fetch)
+    second = worker._pooledCandidates(kind, "user", fetch)
+
+    assert worker._pooledCandidates(kind, "user", fetch) == []
+    pool = workers._LASTFM_CANDIDATE_POOLS[(kind, "user", "database-a")]
+    assert pool.cursor == 0
+    assert pool.in_flight == {row["id"] for row in oldRows}
+    worker._finishPooledCandidates(kind, "user", first, first)
+    assert {row["id"] for row in pool.retry_rows} == {row["id"] for row in first}
+
+    worker._lastfmRevalidateRows = Mock(side_effect=RuntimeError("synthetic revalidation failure"))
+    with pytest.raises(RuntimeError, match="synthetic revalidation failure"):
+        worker._pooledCandidates(kind, "user", fetch)
+    assert {row["id"] for row in pool.retry_rows} == {row["id"] for row in first}
+    assert pool.in_flight == {row["id"] for row in second}
+    assert len(pool.retry_rows) + len(pool.in_flight) == TINY_POOL_SIZE
+
+    worker._lastfmRevalidateRows = lambda _kind, _scope, candidates: candidates
+    retry = worker._pooledCandidates(kind, "user", fetch)
+    assert retry == first
+    worker._finishPooledCandidates(kind, "user", retry, [])
+    fresh = worker._pooledCandidates(kind, "user", fetch)
+    assert fresh == newRows[:TINY_BATCH_SIZE]
+    worker._finishPooledCandidates(kind, "user", fresh, fresh)
+    worker._finishPooledCandidates(kind, "user", second, second)
+    assert len(pool.retry_rows) == TINY_POOL_SIZE
+    assert not pool.in_flight
+    assert not Database._lastfm_active
+    assert fetch.call_count == 2
 
 
 def test_pool_registry_maintenance_is_amortized_and_resumes_after_clock_rollback(

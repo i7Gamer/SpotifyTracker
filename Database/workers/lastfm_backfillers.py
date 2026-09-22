@@ -137,7 +137,9 @@ class LastfmBackfillMixin:
         """Shared loop policy for the three Last.fm workers.
 
         The workers keep their own entrypoints, timings, telemetry names and
-        entity processors; only the repeated loop shell lives here.
+        entity processors; only the repeated loop shell lives here. The shared
+        limiter spaces lookup starts, while productive cycles also receive the
+        bounded pause configured by the worker mixin.
         """
         import random
         if stop_event is None:
@@ -201,8 +203,9 @@ class LastfmBackfillMixin:
         """Fetches Last.fm genre tags for this user's played artists, albums
         and tracks (most-played first), then - once the own queue is drained -
         for everyone else's (the catalog is shared, so one keyed user's worker
-        converges the whole instance). Pacing comes from the process-wide rate
-        limiter inside LastfmClient, not from this loop.
+        converges the whole instance). The process-wide rate limiter inside
+        LastfmClient spaces lookup starts; productive cycles also use the
+        shared loop's bounded pause.
 
         `stop_event` is THIS run's private event (see the fresh-event note in
         startLastfmGenreBackfiller); the loop's own lifecycle checks use it
@@ -458,8 +461,9 @@ class LastfmBackfillMixin:
             unique.append(row)
         return unique
 
-    def _lastfmBoundedRetryRows(self, rows: list[dict]) -> list[dict]:
-        return self._lastfmUniqueRows(rows)[:self.LASTFM_QUEUE_POOL_SIZE]
+    def _lastfmUniqueRetryRows(self, rows: list[dict]) -> list[dict]:
+        """Deduplicate retry rows; admission keeps pending IDs within pool capacity."""
+        return self._lastfmUniqueRows(rows)
 
     @contextmanager
     def _lastfmPoolAccess(self, kind: str, scopeUsername: str | None, *, create: bool = True):
@@ -535,18 +539,29 @@ class LastfmBackfillMixin:
             retryPrefix = list(pool.retry_rows)
             pool.retry_rows = []
             selectedIds = set()
+            outstandingIds = {row["id"] for row in retryPrefix}
+            outstandingIds.update(pool.in_flight)
 
-            def consider(row: dict, fromMain: bool) -> None:
+            def consider(row: dict, fromMain: bool) -> bool:
+                rowId = row["id"]
+                knownOutstanding = rowId in outstandingIds
                 if fromMain:
+                    if (not knownOutstanding
+                            and len(outstandingIds) >= self.LASTFM_QUEUE_POOL_SIZE):
+                        return False
                     pool.cursor += 1
-                if len(selected) >= batchSize or row["id"] in selectedIds:
-                    return
+                    if knownOutstanding:
+                        return True
+                if len(selected) >= batchSize or rowId in selectedIds:
+                    return True
                 claimed = self._claimLastfmEntities(kind, [row])
                 if claimed:
                     selected.append(claimed[0])
-                    selectedIds.add(row["id"])
+                    selectedIds.add(rowId)
                 else:
                     pool.retry_rows.append(row)
+                outstandingIds.add(rowId)
+                return True
 
             for retryIndex, row in enumerate(retryPrefix):
                 if len(selected) >= batchSize:
@@ -560,7 +575,8 @@ class LastfmBackfillMixin:
                 if row["id"] in retryIds:
                     pool.cursor += 1
                     continue
-                consider(row, True)
+                if not consider(row, True):
+                    break
 
             if (not selected and not retryPrefix and pool.cursor >= len(pool.rows)
                     and not poolWasRefilled):
@@ -568,9 +584,10 @@ class LastfmBackfillMixin:
                 poolWasRefilled = True
                 while len(selected) < batchSize and pool.cursor < len(pool.rows):
                     row = pool.rows[pool.cursor]
-                    consider(row, True)
+                    if not consider(row, True):
+                        break
 
-            pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows)
+            pool.retry_rows = self._lastfmUniqueRetryRows(pool.retry_rows)
             pool.in_flight.update(row["id"] for row in selected)
 
         if not selected:
@@ -591,9 +608,13 @@ class LastfmBackfillMixin:
         try:
             with self._lastfmPoolAccess(kind, scopeUsername, create=False) as pool:
                 if pool is not None:
+                    claimedIds = {row["id"] for row in claimed}
+                    pool.in_flight.difference_update(claimedIds)
+                    pool.retry_rows = [row for row in pool.retry_rows
+                                       if row["id"] not in claimedIds]
                     if retryRows:
-                        pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows + retryRows)
-                    pool.in_flight.difference_update(row["id"] for row in claimed)
+                        pool.retry_rows = self._lastfmUniqueRetryRows(
+                            pool.retry_rows + retryRows)
         finally:
             self._releaseLastfmEntities(kind, claimed)
 

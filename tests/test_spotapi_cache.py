@@ -38,6 +38,10 @@ CATALOG = {"data": {
         "uri": "spotify:track:test", "name": "Recovered", "__typename": "Track",
     }}}]}},
 }}
+TERMINAL_AUTH_FAILURE_CASES = (
+    (401, {}, "Authorization", "Bearer access-c"),
+    (400, {"Client-Token-Error": "INVALID_CLIENTTOKEN"}, "Client-Token", "client-c"),
+)
 
 
 class HttpScript:
@@ -192,10 +196,12 @@ def test_join_publishes_once_and_failure_leaves_no_partial_cache(script, monkeyp
 def test_installer_is_idempotent_per_method(script):
     methods = ("get_sha256_hash", "part_hash", "_auth_rule", "_handle_auth_failure")
     before = [getattr(upstream.BaseClient, name) for name in methods]
+    beforeParse = TLSClient.parse_response
     patches.patch_spotapi_cache()
     patches.patch_totp_secret()
     patches.patch_spotapi_cache()
     assert [getattr(upstream.BaseClient, name) for name in methods] == before
+    assert TLSClient.parse_response is beforeParse
 
 
 def test_auth_same_transport_reused_different_transport_isolated(script):
@@ -245,6 +251,69 @@ def test_failed_auth_refresh_leaves_cache_empty(script):
     script.tokenStatus = 503
     with pytest.raises(spotapi.exceptions.BaseClientError):
         spotapi.Public.song_info("test")
+    assert id(tls) not in patches._spotapiAuthByClient
+
+
+@pytest.mark.parametrize("status,headers,field,fresh", TERMINAL_AUTH_FAILURE_CASES)
+def test_terminal_auth_retry_evicts_cache_and_next_base_mints_fresh_tokens(script, status, headers, field, fresh):
+    spotapi.Public.song_info("test")
+    tls = script.pool.queue[0]
+    script.catalog = [(status, {}, headers), (status, {}, headers)]
+    script.token, script.clientToken = "access-b", "client-b"
+    with pytest.raises(spotapi.exceptions.ParentException):
+        spotapi.Public.song_info("test")
+    assert id(tls) not in patches._spotapiAuthByClient
+
+    script.catalog = [(200, TRACK, {})]
+    script.token, script.clientToken = "access-c", "client-c"
+    script.calls.clear()
+    assert spotapi.Public.song_info("test") == TRACK
+    sent = [h[field] for _, url, h in script.calls if "pathfinder" in url]
+    assert sent == [fresh]
+
+
+@pytest.mark.parametrize("status,headers", [
+    (400, {}),
+    (403, {}),
+    (500, {}),
+])
+def test_non_auth_failures_keep_valid_auth_cache(script, status, headers):
+    spotapi.Public.song_info("test")
+    tls = script.pool.queue[0]
+    script.catalog = [(status, {}, headers)]
+    with pytest.raises(spotapi.exceptions.ParentException):
+        spotapi.Public.song_info("test")
+    assert id(tls) in patches._spotapiAuthByClient
+
+
+def test_transport_failure_keeps_valid_auth_cache(script, monkeypatch):
+    spotapi.Public.song_info("test")
+    tls = script.pool.queue[0]
+
+    def fail_request(*args, **kwargs):
+        raise RuntimeError("synthetic transport failure")
+
+    monkeypatch.setattr(TLSClient, "build_request", fail_request)
+    with pytest.raises(RuntimeError, match="synthetic transport failure"):
+        spotapi.Public.song_info("test")
+    assert id(tls) in patches._spotapiAuthByClient
+
+
+@pytest.mark.parametrize("status,headers", [case[:2] for case in TERMINAL_AUTH_FAILURE_CASES])
+def test_danger_parse_exception_evicts_terminal_auth_cache(script, status, headers):
+    client = base(script)
+    client._auth_rule({})
+    tls = client.client
+    tls.fail_exception = spotapi.exceptions.ParentException
+    response = SimpleNamespace(
+        status_code=status,
+        text="not-json",
+        headers=headers,
+        url="https://spotify.test/",
+        json=lambda: {},
+    )
+    with pytest.raises(spotapi.exceptions.ParentException):
+        tls.parse_response(response, "GET", True)
     assert id(tls) not in patches._spotapiAuthByClient
 
 
