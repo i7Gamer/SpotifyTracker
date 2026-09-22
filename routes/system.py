@@ -131,7 +131,7 @@ def register(app, dashboard):
         if expansion.tooManyEntries:
             #< the byte budget is blind to this one: empty entries are free to
             #  store and costly to open, so the count needs its own ceiling
-            logger.warning("Refusing import for user %s: an archive holds more than %d entries",
+            logger.warning("Refusing import for user %s: archives hold more than %d total entries",
                            username, MAX_IMPORT_ARCHIVE_ENTRIES)
             return redirect(url_for("importPage", error="too_many_entries"))
         if expansion.exceededCap:
@@ -141,6 +141,14 @@ def register(app, dashboard):
             logger.warning("Refusing import for user %s: the upload unpacks past the %d MB cap",
                            username, MAX_UNCOMPRESSED_IMPORT_MB)
             return redirect(url_for("importPage", error="expanded_too_large"))
+        if expansion.unsupportedCompression:
+            logger.warning("Refusing import for user %s: a history ZIP member uses unsupported compression",
+                           username)
+            return redirect(url_for("importPage", error="unsupported_compression"))
+        if expansion.unreadableArchive:
+            logger.warning("Refusing import for user %s: a ZIP archive could not be read safely",
+                           username)
+            return redirect(url_for("importPage", error="unreadable_archive"))
         if not contents:
             #< the arms the batch never hears about at all, so the message has
             #  to come from here: an unannounced bounce back to /import looks
@@ -224,6 +232,8 @@ def register(app, dashboard):
             expandedTooLarge=request.args.get("error") == "expanded_too_large",
             emptyArchive=request.args.get("error") == "empty_archive",
             tooManyEntries=request.args.get("error") == "too_many_entries",
+            unsupportedCompression=request.args.get("error") == "unsupported_compression",
+            unreadableArchive=request.args.get("error") == "unreadable_archive",
             maxImportArchiveEntries=MAX_IMPORT_ARCHIVE_ENTRIES,
             section="import",
         )
