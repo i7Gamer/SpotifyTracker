@@ -13,6 +13,7 @@ from Database.repository import (
     COMPLETION_COMPLETE_PERCENT_KEY, COMPLETION_COMPLETE_PERCENT_MIN, COMPLETION_COMPLETE_PERCENT_MAX,
 )
 from config import TOP_LIST_DEFAULT_WINDOW
+from Database.backfill_matching import BackfillPage
 
 
 def makeTrack(trackId="t1", name="Song One", albumId="alb1", artistId="art1"):
@@ -1427,32 +1428,39 @@ class TestAvailabilityReason(RepositoryTestCase):
             legacyRepo.connectionManager.close()
 
 
-class TestHasPlayNearTime(RepositoryTestCase):
+class TestFindMatchingBackfillPlay(RepositoryTestCase):
     def setUp(self):
         super().setUp()
         self.repo.upsertUser("alice", "alice@example.com")
         self.repo.upsertTrack(makeTrack(trackId="t1"))
-        self.repo.upsertTrack(makeTrack(trackId="t2"))
+        unrelated = makeTrack(trackId="t2", name="Unrelated Song")
+        unrelated["isrc"] = "OTHER-RECORDING"
+        self.repo.upsertTrack(unrelated)
         self.repo.insertPlay("alice", "t1", 1000.0, 5000)
         self.repo.commit()
 
+    def _match(self, username, trackId, timestamp, tolerance, *, skipToleranceSeconds=None):
+        page = BackfillPage([{"track": {"id": trackId}, "played_at": timestamp}])
+        return self.repo.findMatchingBackfillPlay(username, trackId, timestamp, tolerance,
+                                                  skipToleranceSeconds=skipToleranceSeconds, page=page)
+
     def test_true_within_tolerance(self):
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t1", 1050.0, 100))
+        self.assertTrue(self._match("alice", "t1", 1050.0, 100))
 
     def test_true_at_exact_boundary(self):
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t1", 1100.0, 100))
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t1", 900.0, 100))
+        self.assertTrue(self._match("alice", "t1", 1100.0, 100))
+        self.assertTrue(self._match("alice", "t1", 900.0, 100))
 
     def test_false_just_outside_tolerance(self):
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t1", 1101.0, 100))
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t1", 899.0, 100))
+        self.assertFalse(self._match("alice", "t1", 1101.0, 100))
+        self.assertFalse(self._match("alice", "t1", 899.0, 100))
 
     def test_false_for_different_track_id(self):
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 1050.0, 100))
+        self.assertFalse(self._match("alice", "t2", 1050.0, 100))
 
     def test_false_for_different_user(self):
         self.repo.upsertUser("bob", "bob@example.com")
-        self.assertFalse(self.repo.hasPlayNearTime("bob", "t1", 1050.0, 100))
+        self.assertFalse(self._match("bob", "t1", 1050.0, 100))
 
     def _insertPlayCreatedAt(self, trackId, playedAt, createdAt, created_reason, is_skip=0):
         """created_at is stamped with time.time() inside insertPlay - pin the
@@ -1463,32 +1471,25 @@ class TestHasPlayNearTime(RepositoryTestCase):
                                  is_skip=is_skip)
         self.repo.commit()
 
-    def test_listener_end_tolerance_matches_a_row_by_its_created_at(self):
-        """A listener row's created_at is the observed end of the play (the
-        listener inserts at the track-change moment), so a backfill candidate
-        whose played_at sits at that end is the same listen - even when a
-        mid-track pause pushed it outside the duration-based window."""
+    def test_listener_observed_end_without_start_proof_is_reoffered(self):
+        """An end-only match cannot distinguish a paused copy from a repeat
+        whose earlier API event has fallen out of the finite page."""
         self._insertPlayCreatedAt("t2", 2000.0, 5000.0, "listener_play (user: alice)")
 
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 5000.0, 100))
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t2", 5000.0, 100,
-                                                  listenerEndToleranceSeconds=10))
+        self.assertFalse(self._match("alice", "t2", 5000.0, 100))
 
-    def test_listener_end_tolerance_ignores_non_listener_rows(self):
+    def test_non_listener_insert_time_is_not_playback_evidence(self):
         """An import or backfill row's created_at is the import/poll moment,
         not a play end - matching on it would suppress genuine plays."""
         self._insertPlayCreatedAt("t2", 2000.0, 5000.0, "history_import (user: alice)")
 
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 5000.0, 100,
-                                                   listenerEndToleranceSeconds=10))
+        self.assertFalse(self._match("alice", "t2", 5000.0, 100))
 
-    def test_listener_end_tolerance_is_a_point_match(self):
+    def test_listener_end_clock_tolerance_cannot_prove_a_copy(self):
         self._insertPlayCreatedAt("t2", 2000.0, 5000.0, "listener_play (user: alice)")
 
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 5011.0, 100,
-                                                   listenerEndToleranceSeconds=10))
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t2", 5010.0, 100,
-                                                  listenerEndToleranceSeconds=10))
+        self.assertFalse(self._match("alice", "t2", 5011.0, 100))
+        self.assertFalse(self._match("alice", "t2", 5010.0, 100))
 
     def test_skip_tolerance_matches_a_skip_by_its_played_at(self):
         """2026-08-14: the listener recorded a 3.6s skip at 16:29:06, the Web
@@ -1503,17 +1504,17 @@ class TestHasPlayNearTime(RepositoryTestCase):
         not a coincidence of timing."""
         self._insertPlayCreatedAt("t2", 2000.0, 2025.0, "listener_play (user: alice)", is_skip=1)
 
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 1985.0, 280))
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t2", 1985.0, 280,
+        self.assertFalse(self._match("alice", "t2", 1985.0, 280))
+        self.assertTrue(self._match("alice", "t2", 1985.0, 280,
                                                   skipToleranceSeconds=20))
 
     def test_skip_tolerance_is_a_tight_point_match(self):
         self._insertPlayCreatedAt("t2", 2000.0, 2025.0, "listener_play (user: alice)", is_skip=1)
 
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t2", 2020.0, 280, skipToleranceSeconds=20))
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 2021.0, 280, skipToleranceSeconds=20))
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t2", 1980.0, 280, skipToleranceSeconds=20))
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 1979.0, 280, skipToleranceSeconds=20))
+        self.assertTrue(self._match("alice", "t2", 2020.0, 280, skipToleranceSeconds=20))
+        self.assertFalse(self._match("alice", "t2", 2021.0, 280, skipToleranceSeconds=20))
+        self.assertTrue(self._match("alice", "t2", 1980.0, 280, skipToleranceSeconds=20))
+        self.assertFalse(self._match("alice", "t2", 1979.0, 280, skipToleranceSeconds=20))
 
     def test_a_skip_never_gets_the_wide_duration_window(self):
         """Measured over live data (2026-08-15): the provable duplicates sat
@@ -1524,7 +1525,7 @@ class TestHasPlayNearTime(RepositoryTestCase):
         page collides identically and nothing retries it."""
         self._insertPlayCreatedAt("t2", 2000.0, 2025.0, "listener_play (user: alice)", is_skip=1)
 
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 2095.0, 280, skipToleranceSeconds=20))
+        self.assertFalse(self._match("alice", "t2", 2095.0, 280, skipToleranceSeconds=20))
 
     def test_a_skips_created_at_never_anchors_an_end(self):
         """A skip's created_at is when the user skipped AWAY, not the end of a
@@ -1532,9 +1533,7 @@ class TestHasPlayNearTime(RepositoryTestCase):
         enforces on the announce side. Only a skip's played_at counts."""
         self._insertPlayCreatedAt("t2", 1000.0, 5000.0, "listener_play (user: alice)", is_skip=1)
 
-        self.assertFalse(self.repo.hasPlayNearTime("alice", "t2", 5000.0, 100,
-                                                   listenerEndToleranceSeconds=10,
-                                                   skipToleranceSeconds=20))
+        self.assertFalse(self._match("alice", "t2", 5000.0, 100, skipToleranceSeconds=20))
 
     def test_the_skip_arm_is_not_restricted_to_listener_rows(self):
         """Unlike the end arm - which needs created_at to MEAN a play end, true
@@ -1543,7 +1542,7 @@ class TestHasPlayNearTime(RepositoryTestCase):
         physical event."""
         self._insertPlayCreatedAt("t2", 2000.0, 2025.0, "history_import (user: alice)", is_skip=1)
 
-        self.assertTrue(self.repo.hasPlayNearTime("alice", "t2", 2010.0, 280, skipToleranceSeconds=20))
+        self.assertTrue(self._match("alice", "t2", 2010.0, 280, skipToleranceSeconds=20))
 
 
 def makeSearchableTrack(trackId, name, artistName, albumName):

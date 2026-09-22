@@ -17,9 +17,8 @@ from Database.rate_limit import (
     retryAfterSeconds,
 )
 from Database.backfill_matching import (
-    WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
-    WEB_API_BACKFILL_END_TIME_DEDUP_TOLERANCE_SECONDS,
     missing_backfill_items,
+    cache_backfill_evidence,
 )
 from Database.utils import parseError, timeToInt, flaskDebugEnabled, truncateForLog
 #< the connect-state string-number coercion, shared with the poll/push tracking
@@ -1763,12 +1762,7 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 self.process_backfill_page(items)
             else:
                 # Keep cache-only behavior for embedders without a provider.
-                recorded_timestamps: dict = {}
-                for item in self.recentlyPlayed_Z1 + self.webApiRecentlyPlayed_Z1:
-                    trackId = _itemTrackId(item)
-                    if not item.get("played_at") or not trackId:
-                        continue
-                    recorded_timestamps.setdefault(trackId, set()).add((timeToInt(item.get("played_at")), None))
+                evidence = cache_backfill_evidence(self.recentlyPlayed_Z1, self.webApiRecentlyPlayed_Z1)
                 # Both caches above live and die with this listener object, and a
                 # listener is rebuilt on every stale-feed reconnect (1,568 times in
                 # 11 days for 3 users) - webApiRecentlyPlayed_Z1 starts empty, and
@@ -1780,7 +1774,7 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                 # appendTrackData's own duplicate guard, long after the log had
                 # claimed them. The database is what tells a real gap from a cold
                 # cache.
-                missed_items = missing_backfill_items(items, recorded_timestamps, self.logUser)
+                missed_items = missing_backfill_items(items, evidence)
                 if missed_items:
                     # Routine progress, like the two lines above: the plays this
                     # announces are written to the database with their
@@ -1792,8 +1786,8 @@ class Listener:  #< one user's live playback watcher: cookie session + Web API b
                     for missed_item in missed_items:
                         missed_item["_source"] = WEB_API_BACKFILL_SOURCE
                     # Pass them to callback (it expects a list, newest plays last)
-                    # Web API returns newest plays first, so reverse to maintain cron order
-                    missed_items.reverse()
+                    # Keep delivery deterministic even if a caller reverses a page.
+                    missed_items.sort(key=lambda item: (timeToInt(item["played_at"]), item["track"]["id"]))
                     callback(missed_items)
 
             # Replace webApiRecentlyPlayed_Z1 (NOT recentlyPlayed_Z1 - that

@@ -180,8 +180,13 @@ class TestFallbackMetadataRepair(DatabaseTestCase):
                                TRACK_DURATION_MS, created_reason=self.db.WEB_API_BACKFILL_SOURCE)
         self.db.repo.commit()
         assert len(self._plays()) == len(original) + 1
-        with patch.object(self.db.repo, "repairFallbackTracks", side_effect=RuntimeError("write interrupted")):
-            self.db._reconcileWithWebApiHistory([{"track": catalogTrack(), "played_at": PLAYED_AT}])
+        # Present the actual API copy. A different exact page event would
+        # reserve the primary row and correctly preserve this later timestamp.
+        copyTimestamp = timeToInt(PLAYED_AT) + BACKFILL_COPY_OFFSET_SECONDS
+        with patch.object(self.db.repo, "repairFallbackTracks",
+                          side_effect=RuntimeError("write interrupted")) as repair:
+            self.db._reconcileWithWebApiHistory([{"track": catalogTrack(), "played_at": copyTimestamp}])
+        repair.assert_called_once()
         assert self._plays() == original
 
     def test_repair_rechecks_fallback_under_write_lock_and_rolls_back_whole_batch(self):

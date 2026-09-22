@@ -7,10 +7,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from conftest import DatabaseTestCase
-from Database.backfill_matching import backfill_page_window
+from Database.backfill_matching import backfill_page_window, WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
 from Database.Listeners.spotifyListener import (
     Listener,
-    WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
     WEB_API_POLL_INTERVAL_SECONDS,
 )
 from Database.utils import timeToInt
@@ -38,6 +37,26 @@ def _iso_from_timestamp(timestamp):
     return datetime.datetime.fromtimestamp(
         timestamp, datetime.timezone.utc
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _rich_evidence(rows):
+    """Convert only legacy synthetic triples into explicit C5b evidence rows."""
+    if all(isinstance(row, dict) for row in rows):
+        return rows
+    return [
+        {
+            "rowId": f"synthetic-row-{index}",
+            "trackId": track_id,
+            "aliases": {track_id},
+            "playedAt": played_at,
+            "listenerCreatedAt": listener_created_at,
+            "createdReason": (
+                "listener_play (user: alice)" if listener_created_at is not None else None
+            ),
+            "isSkip": 0,
+        }
+        for index, (track_id, played_at, listener_created_at) in enumerate(rows)
+    ]
 
 
 class ListenerBackfillPageContractTest(unittest.TestCase):
@@ -196,11 +215,58 @@ class ListenerBackfillPageContractTest(unittest.TestCase):
             listener.webApiRecentlyPlayed_Z1[0]["track"]["id"], "cached"
         )
 
+    def test_api_cache_does_not_use_duration_to_suppress_a_later_api_play(self):
+        listener = self._make_listener(process_backfill_page=None)
+        listener.webApiRecentlyPlayed_Z1 = [_item("cached", FIRST_PLAYED_AT)]
+        callback = MagicMock()
+
+        self._run_poll(
+            listener,
+            [_item("cached", _iso_from_timestamp(
+                timeToInt(FIRST_PLAYED_AT) + TRACK_DURATION_SECONDS
+            ))],
+            callback,
+        )
+
+        callback.assert_called_once()
+
+    def test_api_cache_same_timestamp_still_deduplicates(self):
+        listener = self._make_listener(process_backfill_page=None)
+        listener.webApiRecentlyPlayed_Z1 = [_item("cached", FIRST_PLAYED_AT)]
+        callback = MagicMock()
+
+        self._run_poll(listener, [_item("cached", FIRST_PLAYED_AT)], callback)
+
+        callback.assert_not_called()
+
+    def test_live_and_api_cache_keep_their_source_semantics_separate(self):
+        live_cached = self._make_listener(process_backfill_page=None)
+        live_cached.recentlyPlayed_Z1 = [_item("cached", FIRST_PLAYED_AT)]
+        live_callback = MagicMock()
+        self._run_poll(
+            live_cached,
+            [_item("cached", FIRST_PLAYED_AT)],
+            live_callback,
+        )
+        live_callback.assert_not_called()
+
+        api_cached = self._make_listener(process_backfill_page=None)
+        api_cached.webApiRecentlyPlayed_Z1 = [_item("cached", FIRST_PLAYED_AT)]
+        api_callback = MagicMock()
+        self._run_poll(
+            api_cached,
+            [_item("cached", _iso_from_timestamp(
+                timeToInt(FIRST_PLAYED_AT) + TRACK_DURATION_SECONDS
+            ))],
+            api_callback,
+        )
+        api_callback.assert_called_once()
+
 
 class DatabaseBackfillPageContractTest(DatabaseTestCase):
     def _make_db_with_evidence(self, evidence):
         db = self._makeDb({}, [], username=USER)
-        db.repo.getTrackPlayTimesInRange = MagicMock(return_value=evidence)
+        db.repo.getTrackPlayTimesInRange = MagicMock(return_value=_rich_evidence(evidence))
         db._addToDatabaseFromListener = MagicMock()
         return db
 
@@ -223,15 +289,17 @@ class DatabaseBackfillPageContractTest(DatabaseTestCase):
             - WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
         )
         expected_end = end_ts + WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-        db.repo.getTrackPlayTimesInRange.assert_called_once_with(
-            USER, expected_start, expected_end
-        )
+        lookup = db.repo.getTrackPlayTimesInRange
+        lookup.assert_called_once()
+        self.assertEqual(lookup.call_args.args, (USER, expected_start, expected_end))
+        self.assertIn("page", lookup.call_args.kwargs)
         self.assertEqual(
             [item["track"]["id"] for item in self._submitted_items(db)],
             ["older", "newer"],
         )
+        self.assertIn("backfillPage", db._addToDatabaseFromListener.call_args.kwargs)
 
-    def test_pause_end_anchor_is_still_filtered_by_page_processing(self):
+    def test_pause_end_anchor_is_reoffered_by_page_processing(self):
         end_ts = timeToInt(SECOND_PLAYED_AT)
         start_ts = end_ts - TRACK_DURATION_SECONDS - PAUSE_SECONDS
         evidence = [("track", start_ts, end_ts + INSERT_LAG_SECONDS)]
@@ -239,7 +307,10 @@ class DatabaseBackfillPageContractTest(DatabaseTestCase):
 
         db.process_backfill_page([_item("track", SECOND_PLAYED_AT)])
 
-        db._addToDatabaseFromListener.assert_not_called()
+        self.assertEqual(
+            [item["track"]["id"] for item in self._submitted_items(db)],
+            ["track"],
+        )
 
     def test_gapless_previous_track_end_does_not_filter_next_track(self):
         first_ts = timeToInt(FIRST_PLAYED_AT)

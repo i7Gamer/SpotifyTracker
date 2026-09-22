@@ -1,46 +1,166 @@
 # SPDX-FileCopyrightText: 2026 i7Gamer
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Database-independent Web API backfill window and matching calculations."""
+"""Database-independent Web API backfill windows and per-page matching."""
 
-import logging
+from __future__ import annotations
 
-from Database.utils import flaskDebugEnabled, timeToInt
+from collections.abc import Iterable, Mapping
 
-
-WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS = 2  #< max gap between a Web API item's played_at (interpreted as
-                                               #  either a start or end time - see the comment at its use site)
-                                               #  and an already-recorded play's timestamp for them to count as
-                                               #  the same play rather than a genuinely missing one
-
-WEB_API_BACKFILL_END_TIME_DEDUP_TOLERANCE_SECONDS = 10  #< max gap between a Web API item's played_at and a
-                                                        #  recorded listener row's created_at (its observed play
-                                                        #  end - the listener inserts at the track-change moment)
-                                                        #  for them to count as the same play. Wider than the 2s
-                                                        #  tolerance above because insert lag sits between the
-                                                        #  two stamps (~1s live, a few seconds in poll mode), but
-                                                        #  deliberately still a point match - a recorded end
-                                                        #  minutes away is evidence of a DIFFERENT listen, and
-                                                        #  suppressing on it would lose that play for good
+from Database.db import WEB_API_BACKFILL_SOURCE
+from Database.utils import timeToInt
 
 
-_BACKFILL_LOGGER = logging.getLogger("Database.Listeners.spotifyListener")
+WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS = 2
+MILLISECONDS_PER_SECOND = 1_000
+_LISTENER_SOURCE_PREFIX = "listener_play"
+_LIVE_CACHE_SOURCE = "listener_cache"
+
+
+def _item_track_id(item: Mapping) -> str | None:
+    track = item.get("track") or item.get("item") or {}
+    if not isinstance(track, Mapping):
+        return None
+    return track.get("id") or track.get("track_id")
+
+
+def _item_timestamp(item: Mapping) -> float:
+    value = item.get("played_at")
+    if value is None:
+        value = item.get("playedAt")
+    return timeToInt(value) if value is not None else 0
+
+
+def _track_descriptor(item: Mapping) -> dict:
+    """The raw page can supply identity before a suppressed alias is catalogued.
+
+    Canonical/merge identity is deliberately absent: only the repository can
+    supply that decided fact. This descriptor carries the two existing
+    fallback proofs (ISRC and exact name/primary-artist/duration).
+    """
+    track = item.get("track") or item.get("item") or {}
+    artists = track.get("artists") or []
+    primary = artists[0] if artists and isinstance(artists[0], Mapping) else {}
+    external = track.get("external_ids") or {}
+    return {
+        "id": _item_track_id(item),
+        "name": track.get("name"),
+        "durationMs": track.get("duration_ms"),
+        "isrc": track.get("isrc") or external.get("isrc") or "",
+        "primaryArtistId": primary.get("id"),
+    }
+
+
+class BackfillPage:
+    """One page's logical events and confirmed physical-row assignments.
+
+    Rows and aliases remain fresh inputs to match(), including after a catalog
+    upsert. Only claims persist here. Exact page timestamps reserve their
+    matching rows before any ambiguous assignment, independent of page order.
+    """
+
+    def __init__(self, items: Iterable[Mapping]):
+        self._events: dict[tuple[str, float], dict] = {}
+        self._times_by_track: dict[str, set[float]] = {}
+        self._claims: dict[object, float] = {}
+        for item in items:
+            track_id = _item_track_id(item)
+            timestamp = _item_timestamp(item)
+            if track_id and timestamp > 0:
+                self._events.setdefault((track_id, timestamp), _track_descriptor(item))
+                self._times_by_track.setdefault(track_id, set()).add(timestamp)
+
+    @property
+    def trackIds(self) -> set[str]:
+        return set(self._times_by_track)
+
+    @property
+    def pendingTracks(self) -> list[dict]:
+        return list(self._events.values())
+
+    def match(self, trackId: str, playedAt: float, rows: Iterable[Mapping], *,
+              toleranceSeconds: float | None = None,
+              skipToleranceSeconds: float | None = None,
+              startToleranceSeconds: float = WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
+              derivedStartToleranceSeconds: float | None = None):
+        """Return a confirmed candidate without consuming it.
+
+        API rows use exact normalized timestamp identity, even when classified
+        as skips. Listener starts retain a tight clock tolerance; their duration
+        and observed end cannot distinguish a paused copy from a later repeat
+        missing its predecessor at the page boundary. Reoffer that ambiguity.
+        NULL/import/unknown rows retain the legacy guard window; only the page
+        prefilter opts into the old duration-derived start interpretation.
+        """
+        timestamp = float(playedAt)
+        descriptor = self._events.get((trackId, timestamp), {})
+        candidates = []
+        for row in rows:
+            row_id = row.get("rowId")
+            row_time = row.get("playedAt")
+            if row_id is None or row_time is None:
+                continue
+            row_time = float(row_time)
+            claimed_time = self._claims.get(row_id)
+            if claimed_time is not None and claimed_time != timestamp:
+                continue
+            aliases = set(row.get("aliases") or ()) | {row["trackId"]}
+            if trackId not in aliases:
+                continue
+            reason = row.get("createdReason") or ""
+            is_api = reason.startswith(WEB_API_BACKFILL_SOURCE)
+            distance = abs(row_time - timestamp)
+            if distance == 0:
+                candidates.append((0 if is_api else 1, distance, str(row_id), row))
+                continue
+            if is_api:
+                continue
+            # This physical row belongs to an exact event elsewhere in the
+            # complete page. Alias lookup is current, never cached pre-upsert.
+            if any(row_time in self._times_by_track.get(alias, ()) for alias in aliases):
+                continue
+            if row.get("isSkip"):
+                skip_tolerance = (skipToleranceSeconds if skipToleranceSeconds is not None
+                                  else startToleranceSeconds)
+                if distance <= skip_tolerance:
+                    candidates.append((2, distance, str(row_id), row))
+                continue
+            if distance <= startToleranceSeconds:
+                candidates.append((2, distance, str(row_id), row))
+                continue
+            if reason.startswith(_LISTENER_SOURCE_PREFIX) or reason == _LIVE_CACHE_SOURCE:
+                continue
+            if toleranceSeconds is not None and distance <= toleranceSeconds:
+                candidates.append((3, distance, str(row_id), row))
+                continue
+            duration_ms = descriptor.get("durationMs") or 0
+            if derivedStartToleranceSeconds is not None and duration_ms:
+                derived_distance = abs(timestamp - duration_ms / MILLISECONDS_PER_SECOND - row_time)
+                if derived_distance <= derivedStartToleranceSeconds:
+                    candidates.append((3, derived_distance, str(row_id), row))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: candidate[:3])[3]
+
+    def claim(self, row: Mapping, playedAt: float) -> bool:
+        """Record a confirmed read or committed match; failed writes never call this."""
+        row_id = row.get("rowId")
+        timestamp = float(playedAt)
+        if row_id is None:
+            return False
+        existing = self._claims.get(row_id)
+        if existing is not None:
+            return existing == timestamp
+        self._claims[row_id] = timestamp
+        return True
 
 
 def backfill_page_window(items: list) -> tuple[float, float] | None:
-    """Return the existing database-evidence window for an API page."""
     timestamps = [ts for ts in (timeToInt(item.get("played_at")) for item in items) if ts > 0]
     if not timestamps:
         return None
-
-    # played_at may be the END of a play (see the dedup comment below), in
-    # which case the recorded row sits up to one track-length earlier - so
-    # the window has to reach back that far to find it. A PAUSED play's
-    # start sits even earlier (duration + pause), which no fixed reach-back
-    # can cover - the query closes that gap itself by also matching
-    # listener rows into the window by their created_at.
     longest_track_seconds = max(
-        ((item.get("track") or {}).get("duration_ms", 0) or 0) // 1000 for item in items
+        ((item.get("track") or {}).get("duration_ms", 0) or 0) // MILLISECONDS_PER_SECOND for item in items
     )
     return (
         min(timestamps) - longest_track_seconds - WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
@@ -48,98 +168,49 @@ def backfill_page_window(items: list) -> tuple[float, float] | None:
     )
 
 
-def recorded_play_times_by_track(rows) -> dict:
-    """Group repository ``(track_id, played_at, listener_created_at)`` rows."""
-    recorded: dict = {}
-    for track_id, played_at, listener_created_at in rows:
-        recorded.setdefault(track_id, set()).add(
-            (float(played_at), float(listener_created_at) if listener_created_at is not None else None)
-        )
-    return recorded
-
-
-def missing_backfill_items(items: list, recorded_timestamps: dict, log_user=None) -> list:
-    """Return API items absent from the recorded evidence, preserving old arms."""
-    # Built directly from `items` in one pass so each missed item stays tied
-    # to its OWN source API item's played_at - no post-hoc re-matching by
-    # track ID, which breaks when the same track appears more than once in
-    # `items` (all copies would resolve to whichever occurrence next() finds
-    # first).
-    missed_items = []
-
-    for item in items:
-        played_at_str = item.get("played_at")
-        track = item.get("track")
-        track_id = track.get("id") if track else None
-        if not played_at_str or not track_id:
-            continue
-
-        timestamp = timeToInt(played_at_str)
-        # `or 0` (not get's default): an item's track can carry
-        # "duration_ms": None (present but null), where dict.get returns None
-        # rather than falling back to 0, and the division below would crash
-        # and abort the whole poll.
-        duration_ms = track.get("duration_ms", 0) or 0
-        duration_s = duration_ms // 1000
-
-        # Spotify's Web API documents played_at only as "the date and time the
-        # track was played" - it does NOT specify start vs end, and Spotify's
-        # own developer community has confirmed the same endpoint can report
-        # either for different entries (see spotify/web-api#1083). So this
-        # can't assume one direction: check both interpretations - timestamp
-        # itself already being a start time, or timestamp being an end time
-        # duration_s seconds after the true start - before deciding this play
-        # is genuinely missing.
-        #
-        # Only THIS track's recorded times can answer for it. A flat set of
-        # timestamps meant any recorded play within the tolerance did, and
-        # the second arm made that systematic: under gapless playback a
-        # missing track's derived start equals the recorded END of the track
-        # before it - i.e. the one recorded neighbour a real gap always has
-        # beside it. The suppressed play was then lost for good, since the
-        # next poll's page collides identically and nothing else retries it.
-        #
-        # The third arm covers what the second cannot: a mid-track PAUSE
-        # stretches start-to-end beyond duration_s by an unbounded amount
-        # (2026-08-04: a ~3min pause put played_at 474s after a 287s track's
-        # recorded start, and the same listen was recorded twice). A listener
-        # row's created_at is its OBSERVED end - the row is inserted at the
-        # track-change moment, pauses included - so the end-time interpretation
-        # is matched against that stamp directly instead of deriving a start
-        # that assumes uninterrupted playback.
-        recorded_times = recorded_timestamps.get(track_id, ())
-        matched_by_played_at = any(
-            abs(timestamp - recorded_t) <= WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-            or abs(timestamp - duration_s - recorded_t) <= WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS
-            for recorded_t, _recorded_end in recorded_times
-        )
-        matched_by_end = not matched_by_played_at and any(
-            recorded_end is not None
-            and abs(timestamp - recorded_end) <= WEB_API_BACKFILL_END_TIME_DEDUP_TOLERANCE_SECONDS
-            for _recorded_t, recorded_end in recorded_times
-        )
-        if matched_by_end and flaskDebugEnabled():
-            # Live validation for the 2026-08-04 pause-duplicate fix:
-            # only the cases the two played_at arms would have MISSED
-            # are interesting - remove once a few days of logs confirm
-            # the arm fires on real pauses and nothing else.
-            _BACKFILL_LOGGER.info(
-                "Backfill item for track %s (played_at=%s) suppressed by the end-time arm alone "
-                "(pause-stretched play already recorded) for user %s",
-                track_id,
-                played_at_str,
-                log_user,
-            )
-        if not (matched_by_played_at or matched_by_end):
-            context = item.get("context") or {}
-
-            # Store played_at as given, untouched - see comment above
-            # on why we no longer subtract duration_s here.
-            missed_items.append({
-                "track": track,
-                "played_at": played_at_str,
-                "ms_played": duration_ms,
-                "context": context,
+def cache_backfill_evidence(liveItems: Iterable[Mapping], apiItems: Iterable[Mapping]) -> list[dict]:
+    """Cache-only observations use logical identities, never database row IDs."""
+    evidence = []
+    for source, items in ((_LIVE_CACHE_SOURCE, liveItems), (WEB_API_BACKFILL_SOURCE, apiItems)):
+        for item in items or ():
+            track_id = _item_track_id(item)
+            timestamp = _item_timestamp(item)
+            if not track_id or timestamp <= 0:
+                continue
+            evidence.append({
+                "rowId": (source, track_id, timestamp),
+                "trackId": track_id,
+                "aliases": {track_id},
+                "playedAt": timestamp,
+                "listenerCreatedAt": None,
+                "createdReason": source,
+                "isSkip": bool(item.get("is_skip", item.get("isSkip", 0))),
             })
+    return evidence
 
-    return missed_items
+
+def missing_backfill_items(items: list, evidenceRows, *, page: BackfillPage | None = None) -> list:
+    """Claim oldest-first, then return missing items in their original order."""
+    page = page if page is not None else BackfillPage(items)
+    evidence = list(evidenceRows or ())
+    missing = {}
+    ordered = sorted(enumerate(items), key=lambda pair:
+                     (_item_timestamp(pair[1]), _item_track_id(pair[1]) or "", pair[0]))
+    for index, item in ordered:
+        track = item.get("track") or {}
+        track_id = _item_track_id(item)
+        played_at = item.get("played_at")
+        timestamp = _item_timestamp(item)
+        if not track_id or not played_at or timestamp <= 0:
+            continue
+        matched = page.match(track_id, timestamp, evidence,
+                             derivedStartToleranceSeconds=WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS)
+        if matched is not None and page.claim(matched, timestamp):
+            continue
+        missing[index] = {
+            "track": track,
+            "played_at": played_at,
+            "ms_played": track.get("duration_ms", 0) or 0,
+            "context": item.get("context") or {},
+        }
+    return [missing[index] for index in sorted(missing)]

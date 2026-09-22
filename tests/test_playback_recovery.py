@@ -60,6 +60,24 @@ class TestDatabaseConfirmedBackfill(unittest.TestCase):
         self._poll(callback)
         callback.assert_called_once()
 
+    def test_processor_failure_does_not_fall_back_to_cache_acknowledgement(self):
+        self.listener.webApiRecentlyPlayed_Z1 = list(self.items)
+        self.listener.process_backfill_page = MagicMock(side_effect=RuntimeError("page failed"))
+        callback = MagicMock()
+
+        self.listener._lastWebApiPollTime = 0
+        with patch("Database.Listeners.spotifyListener._get_current_user_from_web_api",
+                   return_value={"id": "alice", "email": "alice@example.test"}), \
+             patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api",
+                   return_value=self.items), \
+             patch("Database.Listeners.spotifyListener._refresh_spotify_access_token",
+                   return_value="token"), \
+             patch("Database.Listeners.spotifyListener.time.monotonic",
+                   return_value=_MONOTONIC_NOW):
+            self.listener._checkWebApiBackfill(callback)
+
+        callback.assert_not_called()
+
 
 class TestMetadataFailurePlayback(unittest.TestCase):
     def test_catalog_failures_preserve_the_original_event(self):

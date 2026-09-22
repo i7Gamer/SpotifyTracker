@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from Database.repository import Repository
+from Database.backfill_matching import BackfillPage
 
 
 def _track(trackId, artistIds, albumId):
@@ -312,7 +313,10 @@ class TestGetPlayTimesInRange(unittest.TestCase):
         return sorted(playedAt for _trackId, playedAt, _createdAt in self._lookupPairs(startTs, endTs))
 
     def _lookupPairs(self, startTs, endTs):
-        return self.repo.getTrackPlayTimesInRange("alice", startTs, endTs)
+        return [
+            (row["trackId"], row["playedAt"], row["listenerCreatedAt"])
+            for row in self.repo.getTrackPlayTimesInRange("alice", startTs, endTs)
+        ]
 
     def _insertPlayCreatedAt(self, trackId, playedAt, createdAt, created_reason, is_skip=0):
         """A play whose insert-time stamp is controlled: created_at is stamped
@@ -372,7 +376,7 @@ class TestGetPlayTimesInRange(unittest.TestCase):
 
         This nulls the ANCHOR only. The skip's played_at still comes through
         for the caller's two played_at arms, and the insert guard behind this
-        check matches it directly on a tight tolerance (hasPlayNearTime's
+         check matches it directly on a tight tolerance (the backfill guard's
         skipToleranceSeconds) - which is where a backfill row re-recording a
         skipped listen gets dropped, with per-row knowledge this layer has
         not got."""
@@ -454,9 +458,12 @@ class TestPlayTimesInRangeAliases(unittest.TestCase):
         """Which track ids the recorded play of `playedTrackId` now answers for."""
         self.repo.insertPlay("alice", playedTrackId, self.base, 60000)
         self.repo.commit()
-        return {trackId for trackId, playedAt, _createdAt
-                in self.repo.getTrackPlayTimesInRange("alice", self.base - 10, self.base + 10)
-                if playedAt == self.base}
+        return {
+            alias
+            for row in self.repo.getTrackPlayTimesInRange("alice", self.base - 10, self.base + 10)
+            if row["playedAt"] == self.base
+            for alias in row["aliases"]
+        }
 
     def test_a_merged_sibling_is_the_same_recording(self):
         """A merge is a decided fact - the strongest signal there is. This is
@@ -544,8 +551,11 @@ class TestPlayTimesInRangeAliases(unittest.TestCase):
                                  created_reason="listener_play (user: alice)")
         self.repo.commit()
 
-        self.assertIn(("web_api_id", self.base, self.base + 700),
-                      self.repo.getTrackPlayTimesInRange("alice", self.base - 10, self.base + 10))
+        rows = self.repo.getTrackPlayTimesInRange("alice", self.base - 10, self.base + 10)
+        self.assertTrue(any(row["trackId"] == "listener_id"
+                            and "web_api_id" in row["aliases"]
+                            and row["listenerCreatedAt"] == self.base + 700
+                            for row in rows))
 
     def test_a_recorded_play_is_reported_once_under_its_own_id(self):
         """Aliasing adds ids; it must not duplicate the row it started from."""
@@ -555,8 +565,89 @@ class TestPlayTimesInRangeAliases(unittest.TestCase):
         self.repo.commit()
 
         rows = self.repo.getTrackPlayTimesInRange("alice", self.base - 10, self.base + 10)
-        self.assertEqual(len(rows), len(set(rows)))
-        self.assertEqual(len([row for row in rows if row[0] == "listener_id"]), 1)
+        self.assertEqual(len(rows), len({row["rowId"] for row in rows}))
+        self.assertEqual(len([row for row in rows if row["trackId"] == "listener_id"]), 1)
+
+    def test_candidate_bound_alias_query_does_not_return_unrequested_tracks(self):
+        self._upsert("one", isrc="SHARED-ISRC")
+        self._upsert("two", isrc="SHARED-ISRC")
+
+        aliases = self.repo._sameRecordingTrackIds({"one"}, candidateIds={"one"})
+
+        self.assertEqual(aliases.get("one", set()), set())
+
+    def test_pending_raw_identity_adds_alias_without_inventing_merge_group(self):
+        self._upsert("catalogued", isrc="SHARED-ISRC")
+        page = BackfillPage([{
+            "track": {
+                "id": "future",
+                "name": "Track catalogued",
+                "duration_ms": self.DURATION_MS,
+                "external_ids": {"isrc": "SHARED-ISRC"},
+                "artists": [{"id": "a1"}],
+            },
+            "played_at": self.base,
+        }])
+        self.repo.insertPlay("alice", "catalogued", self.base, 60000)
+        self.repo.commit()
+
+        rows = self.repo.getTrackPlayTimesInRange(
+            "alice", self.base - 10, self.base + 10, page=page
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("future", rows[0]["aliases"])
+
+    def test_bounded_page_retains_merge_only_alias_in_both_directions(self):
+        self._upsert("canonical", name="Original", isrc="CANONICAL-ISRC")
+        self._upsert("variant", name="Different title", isrc="VARIANT-ISRC",
+                     durationMs=self.DURATION_MS + 1)
+        self.repo.mergeTrackManually("variant", "canonical", "tester")
+        self.repo.insertPlay("alice", "canonical", self.base, 60000)
+        self.repo.commit()
+        page = BackfillPage([{"track": {"id": "variant"}, "played_at": self.base}])
+        rows = self.repo.getTrackPlayTimesInRange("alice", self.base - 10, self.base + 10, page=page)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("variant", rows[0]["aliases"])
+        self.assertIsNotNone(self.repo.findMatchingBackfillPlay("alice", "variant", self.base,
+                                                               100, page=page))
+
+    def test_alias_proofs_do_not_form_a_transitive_chain(self):
+        self._upsert("first", name="First", isrc="ONE")
+        self._upsert("bridge", name="Bridge", isrc="ONE")
+        self._upsert("last", name="Last", isrc="TWO")
+        self.repo.mergeTrackManually("last", "bridge", "tester")
+        aliases = self.repo._sameRecordingTrackIds({"first", "bridge", "last"})
+        self.assertIn("bridge", aliases["first"])
+        self.assertNotIn("last", aliases["first"])
+
+    def test_insert_guard_work_is_bounded_by_time_window_not_full_user_history(self):
+        history_count = 10_000
+        progress_step = 100
+        max_progress_callbacks = 20
+        history_start = self.base - history_count * 2
+        self._upsert("track")
+        conn = self.repo.connection()
+        conn.executemany(
+            "INSERT INTO plays (username, track_id, played_at, time_played) VALUES (?, ?, ?, ?)",
+            (("alice", "track", history_start + offset, 60000) for offset in range(history_count)))
+        self.repo.commit()
+        callbacks = 0
+
+        def count_steps():
+            nonlocal callbacks
+            callbacks += 1
+            return 0
+
+        page = BackfillPage([{"track": {"id": "track"}, "played_at": self.base}])
+        conn.set_progress_handler(count_steps, progress_step)
+        try:
+            result = self.repo.findMatchingBackfillPlay("alice", "track", self.base, 100, page=page)
+        finally:
+            conn.set_progress_handler(None, 0)
+        self.assertIsNone(result)
+        self.assertLess(callbacks, max_progress_callbacks,
+                        "the per-insert guard scanned history outside its narrow window")
 
 if __name__ == "__main__":
     unittest.main()

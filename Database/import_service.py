@@ -27,6 +27,7 @@ from Database.dbmodule import dbmod as _dbmod
 #  standard library, so it cannot take part in the cycle _dbmod exists to break
 from Database.utils import flaskDebugEnabled
 from Database.metadata_repair import WrappedRepairResult
+from Database.backfill_matching import BackfillPage
 
 # Drop counters (see StreamingHistoryImporter._processPlay) whose plays WOULD
 # import on a later attempt: the lookup failed, the data didn't. An overwrite
@@ -166,7 +167,8 @@ class ImportMixin:
                 source, self.user, result.repaired, result.repairDeleted, result.historyDeleted,
                 result.mode, result.reason or "within_limits")
 
-    def appendMetadata(self, meta: dict, created_reason: str | None = None) -> bool:
+    def appendMetadata(self, meta: dict, created_reason: str | None = None,
+                       *, backfillPage: BackfillPage | None = None) -> bool:
         self.saveImagesFromTrack(meta)
         entry, track = self._splitEntryAndTrack(meta)
         # These two are ONE transaction that this method owns: neither commits
@@ -189,64 +191,50 @@ class ImportMixin:
             # mode needs it); a sub-threshold event now lands as is_skip=1 in plays
             # rather than in a separate table.
             is_skip = self.repo.computeIsSkip(entry["timePlayed"], track.get("duration"))
-            was_inserted = self.repo.insertPlay(self.user, entry["id"], entry["playedAt"], entry["timePlayed"], entry.get("playedFrom"),
-                                  created_reason=created_reason, is_skip=is_skip)
+            matched = None
+            if backfillPage is not None:
+                # The catalog write exposes newly discovered recording aliases.
+                # Recheck while holding the same writer reservation as the insert:
+                # another worker cannot insert an alias copy between these steps.
+                legacyTolerance = (track.get("duration") or 0) // 1000 + self.BACKFILL_INSERT_GUARD_EXTRA_SECONDS
+                matched = self.repo.findMatchingBackfillPlay(
+                    self.user, entry["id"], entry["playedAt"], legacyTolerance,
+                    skipToleranceSeconds=self.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS,
+                    page=backfillPage)
+            was_inserted = False
+            if matched is None:
+                was_inserted = self.repo.insertPlay(
+                    self.user, entry["id"], entry["playedAt"], entry["timePlayed"], entry.get("playedFrom"),
+                    created_reason=created_reason, is_skip=is_skip)
             repairResult = self.repo._invalidateWrappedForRepairs(conn, [impact]) if impact is not None else None
             self.repo.commit()
         except Exception:
             self.repo.rollbackQuietly()
             raise
+        if matched is not None:
+            # A rollback must never consume this row for the rest of the page.
+            backfillPage.claim(matched, entry["playedAt"])
+            if flaskDebugEnabled():
+                _dbmod.logger.info(
+                    "Skipping backfilled play for track %s (%s): a confirmed recording already exists "
+                    "for played_at=%s", entry["id"], track.get("name", "unknown"), entry["playedAt"])
         self._logCommittedMetadataRepair("live", repairResult)
         self.updatePlaylists(entry.get("playedFrom"))
         return was_inserted
 
-    def appendTrackData(self, timestamp, track, timePlayed, context=None, source="listener"):
+    def appendTrackData(self, timestamp, track, timePlayed, context=None, source="listener",
+                        *, backfillPage: BackfillPage | None = None):
         formatted_track = _dbmod.Client.formatTrack(track, timestamp, timePlayed, context=context)
         track_id = track.get("id", "unknown")
         track_name = track.get("name", "unknown")
-
+        kwargs = {}
         if source == self.WEB_API_BACKFILL_SOURCE:
-            # Wide, defense-in-depth guard: skip if this exact track already has a
-            # play within (duration + 60s) of this one. Deliberately NOT applied to
-            # the live listener's own inserts (source == "listener") - the listener
-            # is the primary, trusted source, and a genuine short-track replay
-            # within this window is normal listening behavior that must not be
-            # silently dropped. Backfill is a catch-up mechanism and should be
-            # conservative about re-adding something a trusted source may already
-            # have captured - this window is symmetric so it catches a duplicate
-            # regardless of whether Spotify reported this entry's played_at as a
-            # start or end time (see _checkWebApiBackfill for why that can't be
-            # assumed one way or the other).
-            #
-            # The listener-end tolerance covers the case the duration window
-            # cannot: a mid-track pause stretches start-to-end by an unbounded
-            # amount, but a listener row's created_at is its observed end (the
-            # listener inserts at the track-change moment), so an entry whose
-            # played_at sits at that stamp is the same listen however long the
-            # pause was (see BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS).
-            #
-            # Both of those only ever look at real plays, and this source can
-            # never produce one that matches a SKIP: with no ms_played from the
-            # Web API the row below stamps the track's whole duration, so it is
-            # is_skip=0 by construction and a skipped listen was invisible to
-            # the guard entirely (2026-08-14: a 3.6s skip came back as a full
-            # 220s play recorded 15s away). The skip tolerance is that third
-            # arm, and is tight for the reason its constant explains.
-            durationSeconds = (track.get("duration_ms", 0) or 0) // 1000
-            tolerance = durationSeconds + self.BACKFILL_INSERT_GUARD_EXTRA_SECONDS
-            if self.repo.hasPlayNearTime(self.user, track_id, formatted_track["playedAt"], tolerance,
-                                         listenerEndToleranceSeconds=self.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS,
-                                         skipToleranceSeconds=self.BACKFILL_SKIP_MATCH_TOLERANCE_SECONDS):
-                if flaskDebugEnabled():
-                    _dbmod.logger.info(
-                        "Skipping backfilled play for track %s (%s): an existing play already exists "
-                        "within %ds (duration+60s) of played_at=%s",
-                        track_id, track_name, tolerance, formatted_track["playedAt"],
-                    )
-                return False
-
+            # Page claims never enter Listener. A direct API insert still gets
+            # a private one-item page, so every API path uses the atomic guard.
+            kwargs["backfillPage"] = backfillPage if backfillPage is not None else BackfillPage([
+                {"track": track, "played_at": timestamp}])
         created_reason = f"{source}_play (user: {self.user})"
-        was_inserted = self.appendMetadata(formatted_track, created_reason=created_reason)
+        was_inserted = self.appendMetadata(formatted_track, created_reason=created_reason, **kwargs)
         if was_inserted:
             _dbmod.logger.info(
                 "Recording play for user %s: track=%s (%s), timestamp=%s, duration=%dms, source=%s",
