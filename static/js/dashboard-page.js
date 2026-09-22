@@ -507,6 +507,7 @@ document.body.addEventListener('htmx:sendError', reportDashboardFailure);
   // threshold.
   var pollSeq = 0;      //< last request issued
   var appliedSeq = 0;   //< newest response that has already had its say
+  var pollStopped = false; //< an accepted 401 is terminal for every in-flight response
 
   //< true when this response is still the newest word and may act; claiming is
   //  what makes it the newest word, so each response claims at most once
@@ -538,9 +539,11 @@ document.body.addEventListener('htmx:sendError', reportDashboardFailure);
   }
 
   function poll() {
+    if (pollStopped) return;
     var seq = ++pollSeq;
     fetch('/api/now-playing')
       .then(function (resp) {
+        if (pollStopped) return null;
         // An expired session used to be treated as a transient blip, so the
         // card and the friends block sat frozen on stale content for as long as
         // the tab stayed open, polling every 15s forever and never redirecting.
@@ -560,6 +563,7 @@ document.body.addEventListener('htmx:sendError', reportDashboardFailure);
           //  tests/test_background_polls.py read the source text from the 401
           //  check to the branch's first return, and an early one hid them.
           if (claimPoll(seq)) {
+            pollStopped = true;
             if (pollHandle) pollHandle.stop();
             if (tickHandle) tickHandle.stop();
             setStale(true);
@@ -576,6 +580,7 @@ document.body.addEventListener('htmx:sendError', reportDashboardFailure);
         return resp.json();
       })
       .then(function (data) {
+        if (pollStopped) return;
         if (!data) return;   //< the 401/superseded branches above have had their say
         //< claimed only now: resp.json() was awaited in between, and a newer
         //  response may have landed - and applied - inside that window
@@ -586,6 +591,7 @@ document.body.addEventListener('htmx:sendError', reportDashboardFailure);
         renderFriends(data.friends, data.friendsMoreCount);
       })
       .catch(function () {
+        if (pollStopped) return;
         //< a superseded failure is not news about the LIVE feed
         if (!claimPoll(seq)) return;
         //< one dropped request is not news on a 15s poll; three in a row is

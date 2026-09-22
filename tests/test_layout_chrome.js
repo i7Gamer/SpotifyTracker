@@ -281,6 +281,100 @@ run('an expired session stops the poll instead of hiding the pill and polling on
             'the interval is cleared, or the tab keeps hitting the server every 10s forever');
 });
 
+run('an accepted 401 stays terminal when a newer listener response succeeds', async () => {
+  const pill = makeElement();
+  const statusText = makeElement();
+  const pending = [];
+  const chrome = loadChrome({
+    elements: { 'listener-status-pill': pill, 'listener-status-text': statusText },
+    responses: {
+      '/api/listener-status': () => new Promise((resolve) => pending.push(resolve)),
+    },
+  });
+  const listenerInterval = chrome.intervals.find(i => i.ms === 10 * 1000);
+  listenerInterval.fn();
+
+  pending[0]({ status: 401, json: () => Promise.resolve({}) });
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1]({ status: 200, json: () => Promise.resolve({ status: 'active' }) });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.strictEqual(pill.style.display, 'none');
+  assert.strictEqual(pill.className, '');
+  assert.strictEqual(pill.title, '');
+  assert.strictEqual(statusText.textContent, '');
+  assert.strictEqual(chrome.clearedIntervals.length, 1);
+});
+
+run('a late listener failure leaves accepted session expiry terminal', async () => {
+  const pill = makeElement();
+  const pending = [];
+  const chrome = loadChrome({
+    elements: { 'listener-status-pill': pill },
+    responses: {
+      '/api/listener-status': () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+    },
+  });
+  const listenerInterval = chrome.intervals.find(i => i.ms === 10 * 1000);
+  listenerInterval.fn();
+  pending[0].resolve({ status: 401, json: () => Promise.resolve({}) });
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1].reject(new Error('late failure'));
+  await new Promise(resolve => setImmediate(resolve));
+  listenerInterval.fn();
+
+  assert.strictEqual(pill.style.display, 'none');
+  assert.strictEqual(pill.className, '');
+  assert.strictEqual(chrome.clearedIntervals.length, 1);
+  assert.strictEqual(pending.length, 2);
+});
+
+run('a deferred listener body cannot revive the pill after a 401', async () => {
+  const pill = makeElement();
+  const pending = [];
+  let releaseBody;
+  const body = new Promise((resolve) => { releaseBody = resolve; });
+  const chrome = loadChrome({
+    elements: { 'listener-status-pill': pill },
+    responses: {
+      '/api/listener-status': () => new Promise((resolve) => pending.push(resolve)),
+    },
+  });
+  const listenerInterval = chrome.intervals.find(i => i.ms === 10 * 1000);
+  pending[0]({ status: 200, json: () => body });
+  await new Promise(resolve => setImmediate(resolve));
+  listenerInterval.fn();
+  pending[1]({ status: 401, json: () => Promise.resolve({}) });
+  await new Promise(resolve => setImmediate(resolve));
+
+  releaseBody({ status: 'active' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.strictEqual(pill.style.display, 'none');
+  assert.strictEqual(pill.className, '');
+  assert.strictEqual(chrome.clearedIntervals.length, 1);
+});
+
+run('a repeated 401 does not clear the listener interval twice', async () => {
+  const pill = makeElement();
+  const pending = [];
+  const chrome = loadChrome({
+    elements: { 'listener-status-pill': pill },
+    responses: {
+      '/api/listener-status': () => new Promise((resolve) => pending.push(resolve)),
+    },
+  });
+  const listenerInterval = chrome.intervals.find(i => i.ms === 10 * 1000);
+  listenerInterval.fn();
+  pending[0]({ status: 401, json: () => Promise.resolve({}) });
+  await new Promise(resolve => setImmediate(resolve));
+  pending[1]({ status: 401, json: () => Promise.resolve({}) });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.strictEqual(chrome.clearedIntervals.length, 1);
+  assert.strictEqual(pill.style.display, 'none');
+});
+
 run('a hidden tab stops asking for the pill', async () => {
   // Every authenticated page arms this, so a browser sitting on any of them
   // overnight used to hit /api/listener-status every 10s until it was closed.

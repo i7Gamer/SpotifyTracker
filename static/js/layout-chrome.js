@@ -80,10 +80,13 @@ const LISTENER_STATUS_POLL_MS = 10 * 1000;
   const statusText = document.getElementById('listener-status-text');
 
   let poll = null;
+  let pollStopped = false; //< an accepted 401 is terminal for every in-flight response
 
   function updateListenerStatus() {
+    if (pollStopped) return;
     fetch('/api/listener-status')
       .then(r => {
+        if (pollStopped) return null;
         if (r.status === 401) {
           // Session expired: stop polling, don't just hide the pill. The
           // throw below lands in the catch, and with nothing stopping the
@@ -93,6 +96,7 @@ const LISTENER_STATUS_POLL_MS = 10 * 1000;
           // mid-read, so it stops rather than navigates - the next click on
           // anything goes through the normal login redirect. stop() is
           // permanent, so the next tab switch does not restart it.
+          pollStopped = true;
           if (statusPill) statusPill.style.display = 'none';
           if (poll) poll.stop();
           throw new Error('Not logged in');
@@ -100,6 +104,7 @@ const LISTENER_STATUS_POLL_MS = 10 * 1000;
         return r.json();
       })
       .then(data => {
+        if (pollStopped) return;
         if (!data || !data.status || !statusPill) return;
 
         const status = data.status.toUpperCase();
@@ -111,7 +116,9 @@ const LISTENER_STATUS_POLL_MS = 10 * 1000;
         if (statusText) statusText.textContent = label;
         statusPill.style.display = 'inline-block';
       })
-      .catch(() => {});
+      .catch(() => {
+        if (pollStopped) return;
+      });
   }
 
   poll = window.VisibilityPoll.start(updateListenerStatus, LISTENER_STATUS_POLL_MS);

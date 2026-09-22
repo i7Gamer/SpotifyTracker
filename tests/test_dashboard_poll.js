@@ -21,9 +21,13 @@ function makeClassList() {
   const names = new Set();
   return {
     names,
+    toggleCalls: [],
     add(n) { names.add(n); },
     remove(n) { names.delete(n); },
-    toggle(n, on) { if (on) names.add(n); else names.delete(n); },
+    toggle(n, on) {
+      this.toggleCalls.push([n, on]);
+      if (on) names.add(n); else names.delete(n);
+    },
     contains(n) { return names.has(n); },
   };
 }
@@ -49,7 +53,8 @@ function freshPage() {
   const elements = {};
   for (const id of ['nowPlayingCard', 'nowPlayingPanel', 'nowPlayingName',
                     'nowPlayingArtists', 'nowPlayingState', 'nowPlayingCover',
-                    'nowPlayingCoverLink']) {
+                    'nowPlayingCoverLink', 'friendsListening', 'friendsListeningChips',
+                    'friendsListeningMore']) {
     elements[id] = makeEl(id);
   }
 
@@ -168,6 +173,84 @@ run('a 401 acts while it is still the newest word', async () => {
   assert.ok(page.elements.nowPlayingCard.classList.contains('is-stale'));
 });
 
+run('an accepted 401 stays terminal when a newer response succeeds', async () => {
+  const page = freshPage();
+
+  page.poll();   //< A - accepted session expiry
+  page.poll();   //< B - already in flight when A speaks
+  page.pendingFetches[0].resolve({ status: 401, ok: false, json: () => Promise.resolve({}) });
+  await settle();
+
+  page.pendingFetches[1].resolve(okResponse(nowPlaying('Late')));
+  await settle();
+
+  assert.strictEqual(page.pollHandle.stopped, 1);
+  assert.strictEqual(page.tickHandle.stopped, 1);
+  assert.ok(page.elements.nowPlayingCard.classList.contains('is-stale'));
+  assert.notStrictEqual(page.elements.nowPlayingName.textContent, 'Late');
+  assert.ok(page.elements.friendsListening.classList.contains('is-stale'));
+  assert.strictEqual(page.elements.nowPlayingState.textContent, 'Stale');
+});
+
+run('a deferred body cannot revive a poll after an accepted 401', async () => {
+  const page = freshPage();
+  let releaseBody;
+  const body = new Promise((resolve) => { releaseBody = resolve; });
+
+  page.poll();   //< A - body read is pending
+  page.pendingFetches[0].resolve({ status: 200, ok: true, json: () => body });
+  await settle();
+
+  page.poll();   //< B - accepted expiry while A waits on its body
+  page.pendingFetches[1].resolve({ status: 401, ok: false, json: () => Promise.resolve({}) });
+  await settle();
+
+  releaseBody(nowPlaying('Late body'));
+  await settle();
+
+  assert.ok(page.elements.nowPlayingCard.classList.contains('is-stale'));
+  assert.notStrictEqual(page.elements.nowPlayingName.textContent, 'Late body');
+  assert.ok(page.elements.friendsListening.classList.contains('is-stale'));
+  assert.strictEqual(page.pollHandle.stopped, 1);
+  assert.strictEqual(page.tickHandle.stopped, 1);
+});
+
+run('a late failure cannot claim or stop an already terminal poll', async () => {
+  const page = freshPage();
+
+  page.poll();   //< A - accepted session expiry
+  page.poll();   //< B, C, D - failures after A has stopped the poll
+  page.poll();
+  page.poll();
+  page.pendingFetches[0].resolve({ status: 401, ok: false, json: () => Promise.resolve({}) });
+  await settle();
+  for (const pending of page.pendingFetches.slice(1)) pending.reject(new Error('late failure'));
+  await settle();
+
+  assert.strictEqual(page.pollHandle.stopped, 1);
+  assert.strictEqual(page.tickHandle.stopped, 1);
+  assert.strictEqual(page.elements.nowPlayingCard.classList.toggleCalls
+    .filter(([name, on]) => name === 'is-stale' && on).length, 1);
+});
+
+run('a repeated 401 does not stop the terminal handles twice', async () => {
+  const page = freshPage();
+
+  page.poll();
+  page.poll();
+  page.pendingFetches[0].resolve({ status: 401, ok: false, json: () => Promise.resolve({}) });
+  await settle();
+  page.pendingFetches[1].resolve({ status: 401, ok: false, json: () => Promise.resolve({}) });
+  await settle();
+
+  const pendingBefore = page.pendingFetches.length;
+  page.poll();
+
+  assert.strictEqual(page.pollHandle.stopped, 1);
+  assert.strictEqual(page.tickHandle.stopped, 1);
+  assert.strictEqual(page.pendingFetches.length, pendingBefore);
+});
+
 run('a response superseded by an APPLIED newer one still stands down', async () => {
   /* The other half of the rule, and what keeps the out-of-order protection:
    * once a newer response has actually been applied, an older one must not
@@ -207,6 +290,16 @@ async function runSustainedLatency(settleOne) {
   return page;
 }
 
+async function runSustainedExpiredSession() {
+  const page = freshPage();
+  for (let i = 0; i < 10; i++) page.poll();
+  for (const pending of page.pendingFetches) {
+    pending.resolve({ status: 401, ok: false, json: () => Promise.resolve({}) });
+    await settle();
+  }
+  return page;
+}
+
 run('a feed slower than the poll interval still renders', async () => {
   const page = await runSustainedLatency((f, n) => f.resolve(okResponse(nowPlaying('Track' + n))));
 
@@ -223,8 +316,7 @@ run('a feed slower than the poll interval still goes Stale', async () => {
 });
 
 run('an expired session under latency still stops the poll', async () => {
-  const page = await runSustainedLatency((f) =>
-    f.resolve({ status: 401, ok: false, json: () => Promise.resolve({}) }));
+  const page = await runSustainedExpiredSession();
 
   assert.ok(page.pollHandle.stopped > 0, 'the 401 branch must be reachable under latency');
   assert.ok(page.tickHandle.stopped > 0);
