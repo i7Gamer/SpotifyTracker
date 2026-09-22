@@ -15,13 +15,9 @@ import sqlite3
 import time
 from pathlib import Path
 
-# How long these helpers wait for a lock rather than failing on it. A raw
-# sqlite3 connection's busy_timeout is 0, so any lock held at that instant -
-# a checkpoint, a VACUUM, the live instance mid-write - is an immediate
-# "database is locked" instead of a wait. Every ConnectionManager connection
-# already waits (see Database/db.py), and Database/backup.py closed this same
-# gap for the snapshot connection; a startup version read that uniquely
-# refuses to wait fails for something the rest of the app is happy to sit out.
+# Python's sqlite3 connections wait five seconds for a lock by default.
+# Allow thirty seconds here for a checkpoint, VACUUM, or concurrent writer,
+# matching the explicit waits used by the app and backup connections.
 MIGRATION_BUSY_TIMEOUT_MS = 30_000
 
 

@@ -51,6 +51,14 @@ def _appWithStubbedWorkers():
 
 
 class TestConstructionStartsNoWorkers(unittest.TestCase):
+    def test_backup_worker_uses_environment_fallbacks_on_a_fresh_install(self):
+        with patch.dict(os.environ, {
+            "BACKUP_INTERVAL_HOURS": "12",
+            "BACKUP_RETENTION_COUNT": "30",
+        }), _appWithStubbedWorkers() as (dashboard, _seams):
+            self.assertEqual(dashboard.backupWorker.intervalHours, 12)
+            self.assertEqual(dashboard.backupWorker.retentionCount, 30)
+
     def test_construction_starts_no_worker(self):
         with _appWithStubbedWorkers() as (_dashboard, seams):
             for name, seam in seams.items():

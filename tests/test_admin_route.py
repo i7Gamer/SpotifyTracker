@@ -1167,6 +1167,52 @@ class TestAdminLastfmSettings(AdminRouteTestBase):
 
 
 class TestAdminBackupSettings(AdminRouteTestBase):
+    def test_fresh_install_form_uses_environment_fallbacks(self):
+        dash = self._makeApp()
+        with patch.dict(os.environ, {
+            "BACKUP_INTERVAL_HOURS": "12",
+            "BACKUP_RETENTION_COUNT": "30",
+        }):
+            response = self._getAdmin(dash, path="/admin?tab=settings")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'name="backup_interval_hours" value="12"', response.data)
+        self.assertIn(b'name="backup_retention_count" value="30"', response.data)
+
+    def test_saved_values_win_over_environment_fallbacks(self):
+        dash = self._makeApp()
+        dash.repo.setAppSetting("backup_interval_hours", "6")
+        dash.repo.setAppSetting("backup_retention_count", "30")
+        with patch.dict(os.environ, {
+            "BACKUP_INTERVAL_HOURS": "12",
+            "BACKUP_RETENTION_COUNT": "7",
+        }):
+            response = self._getAdmin(dash, path="/admin?tab=settings")
+
+        self.assertIn(b'name="backup_interval_hours" value="6"', response.data)
+        self.assertIn(b'name="backup_retention_count" value="30"', response.data)
+
+    def test_in_range_environment_defaults_survive_an_unchanged_form_post(self):
+        dash = self._makeApp()
+        with patch.dict(os.environ, {
+            "BACKUP_INTERVAL_HOURS": "12",
+            "BACKUP_RETENTION_COUNT": "30",
+        }):
+            response = self._getAdmin(dash, path="/admin?tab=settings")
+            self.assertIn(b'name="backup_interval_hours" value="12"', response.data)
+            self.assertIn(b'name="backup_retention_count" value="30"', response.data)
+            self._post(dash, "/admin/backup_settings", isAdmin=True,
+                       data={"backup_interval_hours": "12", "backup_retention_count": "30"})
+
+        with patch.dict(os.environ, {
+            "BACKUP_INTERVAL_HOURS": "24",
+            "BACKUP_RETENTION_COUNT": "7",
+        }):
+            response = self._getAdmin(dash, path="/admin?tab=settings")
+
+        self.assertIn(b'name="backup_interval_hours" value="12"', response.data)
+        self.assertIn(b'name="backup_retention_count" value="30"', response.data)
+
     def test_non_admin_post_is_forbidden(self):
         dash = self._makeApp()
         resp = self._post(dash, "/admin/backup_settings", isAdmin=False, data={"backup_interval_hours": "12"})
