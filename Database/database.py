@@ -308,6 +308,8 @@ class Database(MediaFetchMixin, ImportMixin, WorkerLifecycleMixin):
     LASTFM_BACKFILLER_MIN_START_DELAY = 30     #< random startup-offset bounds for the Last.fm genre
     LASTFM_BACKFILLER_MAX_START_DELAY = 90     #  backfiller, in seconds - staggers per-user threads
     LASTFM_QUEUE_BATCH_SIZE = 30               #< entities claimed per kind (artists/albums/tracks) per cycle
+    LASTFM_QUEUE_POOL_SIZE = 600                #< candidates read per Last.fm queue refill; retained in memory across cycles
+    LASTFM_QUEUE_POOL_TTL_SECONDS = 1800       #< non-empty candidate pools are refreshed after 30 minutes
     LASTFM_IDLE_WAIT_SECONDS = 300             #< wait between cycles once both queues are drained (or after errors)
 
     # The biography backfiller runs as its own thread alongside the genre one

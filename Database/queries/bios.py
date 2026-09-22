@@ -182,6 +182,46 @@ class BioQueries:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def getLastfmBiographyRowsByIds(self, kind: str, entityIds: list[str],
+                                    username: str | None = None) -> list[dict]:
+        """Revalidate a bounded pooled biography candidate set.
+
+        The history aggregate is intentionally absent here: callers already
+        selected these ids from it. Recheck biography eligibility by primary
+        key; scope membership is refreshed with the candidate pool's TTL.
+        """
+        if not entityIds:
+            return []
+        placeholders = ",".join("?" for _ in entityIds)
+        cutoff = time.time() - self.getBioBackfillRetrySeconds()
+        conn = self._conn()
+
+        if kind == "bio":
+            rows = conn.execute(
+                f"""
+                SELECT ar.id AS id, ar.name AS name
+                FROM artists ar
+                WHERE ar.id IN ({placeholders})
+                  AND (ar.bio_attempted_at IS NULL
+                       OR (ar.bio_attempted_at < ? AND ar.bio IS NULL))
+                """,
+                [*entityIds, cutoff],
+            ).fetchall()
+        elif kind == "album_bio":
+            rows = conn.execute(
+                f"""
+                SELECT al.id AS id, al.name AS name
+                FROM albums al
+                WHERE al.id IN ({placeholders})
+                  AND (al.bio_attempted_at IS NULL
+                       OR (al.bio_attempted_at < ? AND al.bio IS NULL))
+                """,
+                [*entityIds, cutoff],
+            ).fetchall()
+        else:
+            raise ValueError(f"unknown Last.fm biography kind: {kind}")
+        return [dict(row) for row in rows]
+
     def getBiographyCoverage(self, username: str) -> dict:
         """Entity-count coverage for the Overview "Biography Backfill
         Progress" widget: {"artist": {"covered", "total"}, "album": {...}} -

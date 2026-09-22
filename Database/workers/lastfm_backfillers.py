@@ -10,6 +10,7 @@ from __future__ import annotations
 # (stdlib, or Database/lastfm.py, which imports nothing of ours), so a real
 # import costs nothing and cannot cycle.
 import threading
+from dataclasses import dataclass, field
 from Database.lastfm import LastfmClient
 
 # Module-global names (LastfmClient, requests, Importer, logger, time, Path, ...)
@@ -24,6 +25,18 @@ from Database.workers.periodic import WORKER_STOP_JOIN_TIMEOUT_SECONDS
 # Kept as an alias: the bound now lives with the shared lifecycle, but tests
 # and callers still import it from here.
 LASTFM_WORKER_STOP_JOIN_TIMEOUT_SECONDS = WORKER_STOP_JOIN_TIMEOUT_SECONDS
+
+
+@dataclass
+class _LastfmCandidatePool:
+    rows: list[dict]
+    fetched_at: float
+    cursor: int = 0
+    retry_rows: list[dict] = field(default_factory=list)
+
+
+_LASTFM_CANDIDATE_POOLS: dict[tuple[str, str | None, str | None], _LastfmCandidatePool] = {}
+_LASTFM_CANDIDATE_POOLS_LOCK = threading.Lock()
 
 
 class LastfmBackfillMixin:
@@ -245,9 +258,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_biography_stop_event
-        rows = self.repo.getArtistsMissingBiographies(self.LASTFM_BIOGRAPHY_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("bio", rows)
+        claimed = self._pooledCandidates(
+            "bio", scopeUsername,
+            lambda limit: self.repo.getArtistsMissingBiographies(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             for row in claimed:
                 if stop_event.is_set():
@@ -261,9 +276,11 @@ class LastfmBackfillMixin:
                     continue   #< stays unattempted, retried next cycle
                 bio = outcome.bio if outcome.status == _dbmod.OUTCOME_OK else None
                 self.repo.setArtistBio(row["id"], bio)
+                completedIds.add(row["id"])
                 processedAny = True
         finally:
-            self._releaseLastfmEntities("bio", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("bio", scopeUsername, claimed, retryRows)
         return processedAny
 
     def startLastfmAlbumBiographyBackfiller(self) -> None:
@@ -317,9 +334,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_album_biography_stop_event
-        rows = self.repo.getAlbumsMissingBiographies(self.LASTFM_ALBUM_BIOGRAPHY_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("album_bio", rows)
+        claimed = self._pooledCandidates(
+            "album_bio", scopeUsername,
+            lambda limit: self.repo.getAlbumsMissingBiographies(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             primaries = self.repo.getAlbumPrimaryArtists([row["id"] for row in claimed])
             for row in claimed:
@@ -328,6 +347,7 @@ class LastfmBackfillMixin:
                 primary = primaries.get(row["id"])
                 if primary is None:
                     self.repo.setAlbumBio(row["id"], None)
+                    completedIds.add(row["id"])
                     processedAny = True
                     continue
                 outcome = self._lastfmLookupBioOutcome(
@@ -343,10 +363,12 @@ class LastfmBackfillMixin:
 
                 bio = outcome.bio if outcome.status == _dbmod.OUTCOME_OK else None
                 self.repo.setAlbumBio(row["id"], bio)
+                completedIds.add(row["id"])
                 processedAny = True
 
         finally:
-            self._releaseLastfmEntities("album_bio", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("album_bio", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _claimLastfmEntities(self, kind: str, rows: list[dict]) -> list[dict]:
@@ -366,6 +388,134 @@ class LastfmBackfillMixin:
         with _dbmod.Database._lastfm_active_lock:
             for row in rows:
                 _dbmod.Database._lastfm_active.discard((kind, row["id"]))
+
+    def _lastfmPoolBatchSize(self, kind: str) -> int:
+        if kind in ("artist", "album", "track"):
+            return self.LASTFM_QUEUE_BATCH_SIZE
+        if kind == "bio":
+            return self.LASTFM_BIOGRAPHY_QUEUE_BATCH_SIZE
+        if kind == "album_bio":
+            return self.LASTFM_ALBUM_BIOGRAPHY_QUEUE_BATCH_SIZE
+        raise ValueError(f"unknown Last.fm pool kind: {kind}")
+
+    def _lastfmRevalidateRows(self, kind: str, scopeUsername: str | None,
+                              rows: list[dict]) -> list[dict]:
+        ids = [row["id"] for row in rows]
+        if kind in ("artist", "album", "track"):
+            eligible = self.repo.getLastfmGenreRowsByIds(kind, ids, scopeUsername)
+        else:
+            eligible = self.repo.getLastfmBiographyRowsByIds(kind, ids, scopeUsername)
+        eligibleById = {row["id"]: row for row in eligible}
+        return [eligibleById[row["id"]] for row in rows if row["id"] in eligibleById]
+
+    @staticmethod
+    def _lastfmUniqueRows(rows: list[dict]) -> list[dict]:
+        seen = set()
+        unique = []
+        for row in rows:
+            rowId = row["id"]
+            if rowId in seen:
+                continue
+            seen.add(rowId)
+            unique.append(row)
+        return unique
+
+    def _lastfmBoundedRetryRows(self, rows: list[dict]) -> list[dict]:
+        return self._lastfmUniqueRows(rows)[:self.LASTFM_QUEUE_POOL_SIZE]
+
+    def _pooledCandidates(self, kind: str, scopeUsername: str | None, fetch) -> list[dict]:
+        """Claim one bounded batch from a cached, scope-specific candidate pool.
+
+        The database fetch is limited to one per invocation. Main-pool rows are
+        consumed by an ordered cursor; rows that were held, stopped, or failed
+        transiently form a bounded retry prefix for the next invocation.
+        """
+        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
+        key = (kind, scopeUsername, dbPath)
+        now = _dbmod.time.monotonic()
+        batchSize = self._lastfmPoolBatchSize(kind)
+        poolWasRefilled = False
+
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            pool = _LASTFM_CANDIDATE_POOLS.get(key)
+            expired = (pool is None or
+                       now - pool.fetched_at >= self.LASTFM_QUEUE_POOL_TTL_SECONDS)
+            if expired:
+                fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
+                preservedRetries = list(pool.retry_rows) if pool is not None else []
+                pool = _LastfmCandidatePool(fetched, now, retry_rows=preservedRetries)
+                _LASTFM_CANDIDATE_POOLS[key] = pool
+                poolWasRefilled = True
+
+            selected: list[dict] = []
+            retryPrefix = list(pool.retry_rows)
+            pool.retry_rows = []
+            selectedIds = set()
+
+            def consider(row: dict, fromMain: bool) -> None:
+                if fromMain:
+                    pool.cursor += 1
+                if len(selected) >= batchSize or row["id"] in selectedIds:
+                    return
+                claimed = self._claimLastfmEntities(kind, [row])
+                if claimed:
+                    selected.append(claimed[0])
+                    selectedIds.add(row["id"])
+                else:
+                    pool.retry_rows.append(row)
+
+            for retryIndex, row in enumerate(retryPrefix):
+                if len(selected) >= batchSize:
+                    pool.retry_rows.extend(retryPrefix[retryIndex:])
+                    break
+                consider(row, False)
+
+            retryIds = {row["id"] for row in retryPrefix}
+            while len(selected) < batchSize and pool.cursor < len(pool.rows):
+                row = pool.rows[pool.cursor]
+                if row["id"] in retryIds:
+                    pool.cursor += 1
+                    continue
+                consider(row, True)
+
+            if (not selected and not retryPrefix and pool.cursor >= len(pool.rows)
+                    and not poolWasRefilled):
+                fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
+                preservedRetries = list(pool.retry_rows)
+                pool = _LastfmCandidatePool(fetched, now, retry_rows=preservedRetries)
+                _LASTFM_CANDIDATE_POOLS[key] = pool
+                poolWasRefilled = True
+                while len(selected) < batchSize and pool.cursor < len(pool.rows):
+                    row = pool.rows[pool.cursor]
+                    consider(row, True)
+
+            pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows)
+
+        if not selected:
+            return []
+        try:
+            eligible = self._lastfmRevalidateRows(kind, scopeUsername, selected)
+        except Exception:
+            with _LASTFM_CANDIDATE_POOLS_LOCK:
+                pool = _LASTFM_CANDIDATE_POOLS.get(key)
+                if pool is not None:
+                    pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows + selected)
+            self._releaseLastfmEntities(kind, selected)
+            raise
+        eligibleIds = {row["id"] for row in eligible}
+        stale = [row for row in selected if row["id"] not in eligibleIds]
+        self._releaseLastfmEntities(kind, stale)
+        return eligible
+
+    def _finishPooledCandidates(self, kind: str, scopeUsername: str | None,
+                                claimed: list[dict], retryRows: list[dict]) -> None:
+        dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
+        key = (kind, scopeUsername, dbPath)
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            pool = _LASTFM_CANDIDATE_POOLS.get(key)
+            if pool is not None and retryRows:
+                pool.retry_rows = self._lastfmBoundedRetryRows(pool.retry_rows + retryRows)
+        self._releaseLastfmEntities(kind, claimed)
 
     @staticmethod
     def _lastfmOutcomeGenres(outcome) -> tuple[bool, list[str]]:
@@ -442,9 +592,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_stop_event
-        rows = self.repo.getArtistsMissingGenres(self.LASTFM_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("artist", rows)
+        claimed = self._pooledCandidates(
+            "artist", scopeUsername,
+            lambda limit: self.repo.getArtistsMissingGenres(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             for row in claimed:
                 if stop_event.is_set():
@@ -458,9 +610,11 @@ class LastfmBackfillMixin:
                 if genres:
                     self.repo.replaceArtistGenres(row["id"], genres)
                 self.repo.markArtistsLastfmAttempted([row["id"]])
+                completedIds.add(row["id"])
                 processedAny = True
         finally:
-            self._releaseLastfmEntities("artist", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("artist", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _processLastfmAlbumBatch(self, client: LastfmClient, scopeUsername: str | None,
@@ -468,9 +622,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_stop_event
-        rows = self.repo.getAlbumsMissingGenres(self.LASTFM_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("album", rows)
+        claimed = self._pooledCandidates(
+            "album", scopeUsername,
+            lambda limit: self.repo.getAlbumsMissingGenres(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             primaries = self.repo.getAlbumPrimaryArtists([row["id"] for row in claimed])
             for row in claimed:
@@ -481,6 +637,7 @@ class LastfmBackfillMixin:
                     # No derivable artist: album.getTopTags needs artist+album,
                     # and there's nothing to inherit from either.
                     self.repo.markAlbumsLastfmAttempted([row["id"]])
+                    completedIds.add(row["id"])
                     processedAny = True
                     continue
 
@@ -512,8 +669,10 @@ class LastfmBackfillMixin:
                         selected_primary["artist_id"], selected_primary["artist_name"],
                         stop_event=stop_event):
                     processedAny = True
+                    completedIds.add(row["id"])
         finally:
-            self._releaseLastfmEntities("album", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("album", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _processLastfmTrackBatch(self, client: LastfmClient, scopeUsername: str | None,
@@ -521,9 +680,11 @@ class LastfmBackfillMixin:
         #< stop_event: the calling run's private event - see _runLastfmCycle
         if stop_event is None:
             stop_event = self.lastfm_stop_event
-        rows = self.repo.getTracksMissingGenres(self.LASTFM_QUEUE_BATCH_SIZE, scopeUsername)
-        claimed = self._claimLastfmEntities("track", rows)
+        claimed = self._pooledCandidates(
+            "track", scopeUsername,
+            lambda limit: self.repo.getTracksMissingGenres(limit, scopeUsername))
         processedAny = False
+        completedIds = set()
         try:
             for row in claimed:
                 if stop_event.is_set():
@@ -541,8 +702,10 @@ class LastfmBackfillMixin:
                         row["artist_id"], row["artist_name"], albumId=row["album_id"],
                         stop_event=stop_event):
                     processedAny = True
+                    completedIds.add(row["id"])
         finally:
-            self._releaseLastfmEntities("track", claimed)
+            retryRows = [row for row in claimed if row["id"] not in completedIds]
+            self._finishPooledCandidates("track", scopeUsername, claimed, retryRows)
         return processedAny
 
     def _storeLastfmGenresWithInheritance(self, client: LastfmClient, kind: str,
