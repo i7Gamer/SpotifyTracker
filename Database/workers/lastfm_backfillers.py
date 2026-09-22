@@ -33,6 +33,7 @@ class _LastfmCandidatePool:
     fetched_at: float
     cursor: int = 0
     retry_rows: list[dict] = field(default_factory=list)
+    drained_until: float | None = None
 
 
 _LASTFM_CANDIDATE_POOLS: dict[tuple[str, str | None, str | None], _LastfmCandidatePool] = {}
@@ -126,6 +127,7 @@ class LastfmBackfillMixin:
                             break
                         continue
 
+                    cycleStarted = _dbmod.time.monotonic()
                     apiKey = self.repo.getUserLastfmApiKey(self.user)
                     if not apiKey:
                         _dbmod.logger.info("[%s-%s] No API key stored anymore - exiting",
@@ -136,6 +138,7 @@ class LastfmBackfillMixin:
                     processedAny = runWork(client, self.user, stop_event=stop_event)
                     if not processedAny and not stop_event.is_set():
                         processedAny = runWork(client, None, stop_event=stop_event)
+                    cycleDuration = _dbmod.time.monotonic() - cycleStarted
                     if not processedAny:
                         if stop_event.wait(idleWaitSeconds):
                             break
@@ -156,6 +159,11 @@ class LastfmBackfillMixin:
                         break
                 else:
                     self._recordWorkerCycle(telemetryKey, success=True)
+                    if processedAny:
+                        pause = min(self.LASTFM_WORKING_CYCLE_PAUSE_MAX_SECONDS,
+                                    cycleDuration * self.LASTFM_WORKING_CYCLE_PAUSE_RATIO)
+                        if pause > 0 and stop_event.wait(pause):
+                            break
         finally:
             _dbmod.logger.info("[%s-%s] Exited gracefully", logPrefix, self.user)
 
@@ -438,12 +446,17 @@ class LastfmBackfillMixin:
 
         with _LASTFM_CANDIDATE_POOLS_LOCK:
             pool = _LASTFM_CANDIDATE_POOLS.get(key)
+            if (pool is not None and pool.drained_until is not None
+                    and now < pool.drained_until and not pool.retry_rows):
+                return []
             expired = (pool is None or
                        now - pool.fetched_at >= self.LASTFM_QUEUE_POOL_TTL_SECONDS)
             if expired:
                 fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
                 preservedRetries = list(pool.retry_rows) if pool is not None else []
-                pool = _LastfmCandidatePool(fetched, now, retry_rows=preservedRetries)
+                pool = _LastfmCandidatePool(
+                    fetched, now, retry_rows=preservedRetries,
+                    drained_until=None if fetched else now + self.LASTFM_QUEUE_DRAINED_MEMO_SECONDS)
                 _LASTFM_CANDIDATE_POOLS[key] = pool
                 poolWasRefilled = True
 
@@ -482,7 +495,9 @@ class LastfmBackfillMixin:
                     and not poolWasRefilled):
                 fetched = self._lastfmUniqueRows(fetch(self.LASTFM_QUEUE_POOL_SIZE))
                 preservedRetries = list(pool.retry_rows)
-                pool = _LastfmCandidatePool(fetched, now, retry_rows=preservedRetries)
+                pool = _LastfmCandidatePool(
+                    fetched, now, retry_rows=preservedRetries,
+                    drained_until=None if fetched else now + self.LASTFM_QUEUE_DRAINED_MEMO_SECONDS)
                 _LASTFM_CANDIDATE_POOLS[key] = pool
                 poolWasRefilled = True
                 while len(selected) < batchSize and pool.cursor < len(pool.rows):

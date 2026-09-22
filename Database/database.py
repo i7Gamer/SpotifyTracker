@@ -310,6 +310,9 @@ class Database(MediaFetchMixin, ImportMixin, WorkerLifecycleMixin):
     LASTFM_QUEUE_BATCH_SIZE = 30               #< entities claimed per kind (artists/albums/tracks) per cycle
     LASTFM_QUEUE_POOL_SIZE = 600                #< candidates read per Last.fm queue refill; retained in memory across cycles
     LASTFM_QUEUE_POOL_TTL_SECONDS = 1800       #< non-empty candidate pools are refreshed after 30 minutes
+    LASTFM_QUEUE_DRAINED_MEMO_SECONDS = 900    #< only genuinely empty candidate fetches
+    LASTFM_WORKING_CYCLE_PAUSE_RATIO = 0.05   #< <=5% loss in controlled one/three-worker lookup tests
+    LASTFM_WORKING_CYCLE_PAUSE_MAX_SECONDS = 15
     LASTFM_IDLE_WAIT_SECONDS = 300             #< wait between cycles once both queues are drained (or after errors)
 
     # The biography backfiller runs as its own thread alongside the genre one

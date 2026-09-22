@@ -517,7 +517,7 @@ class LastfmLoopPolicyContractTestCase(LastfmWorkerBase):
         for contract in LASTFM_LOOP_CONTRACTS:
             with self.subTest(worker=contract["name"]):
                 db = self._dbWithKey()
-                event = self._event(waits=[False])
+                event = self._event(waits=[False, False])  # startup, then productive pause
                 event.is_set.side_effect = [False, False, True]
                 scopes = []
 
