@@ -6,6 +6,7 @@ Merge groups and ISRCs prove recording identity; title/artist/duration does not
 justify deleting history. Same-source rows and absent API events remain safe.
 Listener end-only matches are ambiguous at truncated page boundaries and stay.
 """
+import datetime
 import sys
 import os
 import random
@@ -27,6 +28,7 @@ from Database.utils import timeToInt
 def _bareDatabase():
     db = Database.__new__(Database)
     db.user = "alice"
+    db.tz = datetime.timezone.utc
     db.repo = MagicMock()
     db.repo.deletePlay.return_value = True
     db.repo._sameRecordingTrackIds.return_value = {}
@@ -644,6 +646,7 @@ class TestReconcileWindowBoundary(unittest.TestCase):
         self.repo.commit()
         self.db = Database.__new__(Database)
         self.db.user = "alice"
+        self.db.tz = datetime.timezone.utc
         self.db.repo = self.repo
 
     def tearDown(self):

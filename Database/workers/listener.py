@@ -593,10 +593,17 @@ class ListenerMixin:
                                     if play["playedAt"] in matchedTimes & currentTimes)
 
                 deletedCount = 0
+                deletedYears = set()
                 for play in toDelete:
                     if self.repo.deletePlay(self.user, play["id"], play["playedAt"]):
                         deletedCount += 1
+                        deletedYears.add(_dbmod.convertToDatetime(play["playedAt"], tz=self.tz).year)
                 if deletedCount:
+                    # Removing an early listen can move discoveries in later
+                    # years. Invalidate with the deletes so an in-flight
+                    # calculation cannot save its pre-cleanup snapshot.
+                    self.repo._bumpWrappedGeneration(conn)
+                    self.repo._deleteUserWrappedFromYear(conn, self.user, min(deletedYears))
                     self.repo.commit()
                     _dbmod.logger.info(
                         "Web API reconciliation: removed %d duplicate play(s) for user %s",
