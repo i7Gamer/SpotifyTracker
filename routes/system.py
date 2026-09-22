@@ -15,13 +15,21 @@ from flask import (
     render_template, redirect, request, url_for, jsonify, Response, stream_with_context,
 )
 
-from config import MAX_UPLOAD_MB, EXPORT_FORMATS
+from config import (
+    MAX_UPLOAD_MB, MAX_UNCOMPRESSED_IMPORT_MB, MAX_IMPORT_ARCHIVE_ENTRIES,
+    BYTES_PER_MB, EXPORT_FORMATS,
+)
 from Database.Spotify.formatting import openSpotifyUrl
 from Database.utils import versionTuple, now
 from routes._auth import makeRequiresUser
 from services.export import generateJsonExport, generateCsvExport, attachmentDisposition
+from services.import_upload import expandUploads
 
 logger = logging.getLogger(__name__)
+
+# Resolved once here rather than per request; the MB figure stays the one a
+# human edits (config.py) and the template quotes back.
+MAX_UNCOMPRESSED_IMPORT_BYTES = MAX_UNCOMPRESSED_IMPORT_MB * BYTES_PER_MB
 
 
 def _friendChip(friend):
@@ -107,30 +115,38 @@ def register(app, dashboard):
         if not uploads:
             return redirect(url_for("importPage"))
 
-        contents = []
-        unreadableCount = 0
-        for upload in uploads:
-            try:
-                contents.append(upload.read().decode("utf-8"))
-            except UnicodeDecodeError:
-                # Mirrors AutoImporter._handleImport's per-file resilience
-                # (see its try/except around open(..., encoding="utf-8"))
-                # - one unreadable file must not 500 the whole request and
-                # drop every other file in the same upload.
-                #
-                # COUNTED, not merely logged. The drop happens here, above
-                # every guard the batch has for unreadable input, so the batch
-                # cannot see it: it reported "Imported 1/1 files" for a
-                # two-file upload, and in overwrite mode it deleted the covered
-                # range of the survivors - which can bracket the dropped file's
-                # plays - with nothing left to re-insert them (see
-                # importHistoryBatch's unreadableFileCount).
-                unreadableCount += 1
-                logger.warning("Skipping upload %r for user %s: not valid UTF-8 text", upload.filename, username)
+        # Decoding (and unpacking a ZIP export) lives in services/import_upload
+        # so the uncompressed-size guard is testable without a request: see
+        # that module for why MAX_CONTENT_LENGTH stops being enough once the
+        # server is the one unpacking. unreadableCount is COUNTED rather than
+        # merely logged because the drop happens above every guard the batch
+        # has for unreadable input - in overwrite mode it would delete the
+        # covered range of the survivors, which can bracket the dropped file's
+        # plays, with nothing left to re-insert them (see importHistoryBatch's
+        # unreadableFileCount).
+        expansion = expandUploads(uploads, MAX_UNCOMPRESSED_IMPORT_BYTES,
+                                  maxArchiveEntries=MAX_IMPORT_ARCHIVE_ENTRIES)
+        contents = expansion.contents
+        unreadableCount = expansion.unreadableCount
+        if expansion.tooManyEntries:
+            #< the byte budget is blind to this one: empty entries are free to
+            #  store and costly to open, so the count needs its own ceiling
+            logger.warning("Refusing import for user %s: an archive holds more than %d entries",
+                           username, MAX_IMPORT_ARCHIVE_ENTRIES)
+            return redirect(url_for("importPage", error="too_many_entries"))
+        if expansion.exceededCap:
+            #< NOT upload_too_large: the request itself passed
+            #  MAX_CONTENT_LENGTH, so "try uploading fewer files at once" is
+            #  wrong advice for a small archive that unpacks to a large one
+            logger.warning("Refusing import for user %s: the upload unpacks past the %d MB cap",
+                           username, MAX_UNCOMPRESSED_IMPORT_MB)
+            return redirect(url_for("importPage", error="expanded_too_large"))
         if not contents:
-            #< the one arm the batch never hears about at all, so the message
-            #  has to come from here: an unannounced bounce back to /import
-            #  looks exactly like a click that did nothing
+            #< the arms the batch never hears about at all, so the message has
+            #  to come from here: an unannounced bounce back to /import looks
+            #  exactly like a click that did nothing
+            if expansion.emptyArchive:
+                return redirect(url_for("importPage", error="empty_archive"))
             return redirect(url_for("importPage", error="unreadable_upload"))
 
         # Captured before the thread starts - no request context inside it.
@@ -185,6 +201,12 @@ def register(app, dashboard):
 
         thread = threading.Thread(target=_runImportBatch, daemon=True)
         thread.start()
+        if expansion.emptyArchive:
+            #< worth saying even though the import is under way: the batch only
+            #  reports on what it RECEIVED, so an archive holding no history at
+            #  all (the account-data export, uploaded alongside the right one)
+            #  would otherwise be dropped with no trace anywhere
+            return redirect(url_for("importPage", error="empty_archive"))
         return redirect(url_for("importPage"))
     app.add_url_rule("/import-history", "importHistory", importHistory, methods=["POST"])
 
@@ -196,8 +218,13 @@ def register(app, dashboard):
             "import.html",
             importProgress=db.readProgress(),
             maxUploadMb=MAX_UPLOAD_MB,
+            maxUncompressedImportMb=MAX_UNCOMPRESSED_IMPORT_MB,
             uploadTooLarge=request.args.get("error") == "upload_too_large",
             unreadableUpload=request.args.get("error") == "unreadable_upload",
+            expandedTooLarge=request.args.get("error") == "expanded_too_large",
+            emptyArchive=request.args.get("error") == "empty_archive",
+            tooManyEntries=request.args.get("error") == "too_many_entries",
+            maxImportArchiveEntries=MAX_IMPORT_ARCHIVE_ENTRIES,
             section="import",
         )
     app.add_url_rule("/import", "importPage", importPage, methods=["GET"])

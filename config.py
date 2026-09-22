@@ -96,6 +96,22 @@ PLACEHOLDER_IMG_DATA_URI = (
     "<path d='M62 24v34.8a12 12 0 1 0 6 10.4V36l10-3v-9l-16 4z' fill='%23555'/></svg>"
 )
 MAX_UPLOAD_MB = 500              #< cap on a single import-history request's total upload size
+# A ZIP upload is bounded by MAX_UPLOAD_MB like any other request body, but
+# what it UNPACKS to is not - that is what this caps (services/import_upload.py).
+# The same number on purpose: the ceiling means "how much history one request
+# may hand the importer", and unpacking server-side should not quietly raise
+# it. Without this, a 25 MB archive of 10 GB of zeroes passes every size check
+# the request layer has. Raise this one, not MAX_UPLOAD_MB, if a genuinely
+# larger export ever has to fit.
+MAX_UNCOMPRESSED_IMPORT_MB = MAX_UPLOAD_MB
+# A second ceiling the byte cap above cannot enforce: empty archive entries
+# cost nothing to store and plenty to parse, so 50,000 zero-byte members spend
+# 0% of the budget and still take seconds of a waitress worker thread
+# (measured). Spotify's own export holds a few dozen files, and Flask's
+# MAX_FORM_PARTS default is this same 1000, so this is generous for anything
+# real. It bounds opening the entries; the central-directory parse before that
+# stays bounded only by MAX_UPLOAD_MB.
+MAX_IMPORT_ARCHIVE_ENTRIES = 1000
 # Unit conversions, named so the ladders that format a byte count or split
 # an hour total into days read as units rather than as bare powers of two.
 # Binary (1024), not decimal: what they format is an on-disk size, which is
