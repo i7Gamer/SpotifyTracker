@@ -47,11 +47,13 @@ class TinyPoolHarness(PoolHarness):
 @pytest.fixture
 def clock(monkeypatch):
     workers._LASTFM_CANDIDATE_POOLS.clear()
+    getattr(workers, "_LASTFM_CANDIDATE_POOL_OWNERS", {}).clear()
     Database._lastfm_active.clear()
     now = [START_TIME]
     monkeypatch.setattr(workers._dbmod.time, "monotonic", lambda: now[0])
     yield now
     workers._LASTFM_CANDIDATE_POOLS.clear()
+    getattr(workers, "_LASTFM_CANDIDATE_POOL_OWNERS", {}).clear()
     Database._lastfm_active.clear()
 
 
@@ -231,6 +233,89 @@ def test_owner_cleanup_retires_only_its_kinds_scopes_and_database(clock):
     assert ("album", "owner", "database-a") in workers._LASTFM_CANDIDATE_POOLS
     assert ("artist", "other", "database-a") in workers._LASTFM_CANDIDATE_POOLS
     assert ("artist", "owner", "database-b") in workers._LASTFM_CANDIDATE_POOLS
+
+
+def test_shared_global_pool_retirement_waits_for_all_loop_owners(clock):
+    first = PoolHarness()
+    first.user = "alice"
+    second = PoolHarness()
+    second.user = "bob"
+    firstOwner = object()
+    secondOwner = object()
+    first._registerLastfmPoolOwner(("artist",), firstOwner)
+    second._registerLastfmPoolOwner(("artist",), secondOwner)
+
+    claimed = first._pooledCandidates("artist", None, lambda _: rows("global"))
+    first._finishPooledCandidates("artist", None, claimed, [])
+    key = ("artist", None, "database-a")
+    pool = workers._LASTFM_CANDIDATE_POOLS[key]
+    pool.cursor = 1
+    pool.retry_rows = [rows("retry")[0]]
+
+    first._releaseLastfmPoolOwner(("artist",), firstOwner)
+
+    assert workers._LASTFM_CANDIDATE_POOLS[key] is pool
+    assert pool.cursor == 1
+    assert pool.retry_rows == [rows("retry")[0]]
+
+    second._releaseLastfmPoolOwner(("artist",), secondOwner)
+
+    assert key not in workers._LASTFM_CANDIDATE_POOLS
+    assert key not in workers._LASTFM_CANDIDATE_POOL_OWNERS
+
+
+def test_overlapping_same_user_tokens_protect_own_pool_until_last_release(clock):
+    first = PoolHarness()
+    first.user = "same-user"
+    second = PoolHarness()
+    second.user = "same-user"
+    firstOwner = object()
+    secondOwner = object()
+    first._registerLastfmPoolOwner(("artist",), firstOwner)
+    second._registerLastfmPoolOwner(("artist",), secondOwner)
+
+    claimed = first._pooledCandidates("artist", "same-user", lambda _: rows("own"))
+    first._finishPooledCandidates("artist", "same-user", claimed, [])
+    key = ("artist", "same-user", "database-a")
+
+    first._releaseLastfmPoolOwner(("artist",), firstOwner)
+    assert key in workers._LASTFM_CANDIDATE_POOLS
+    assert workers._LASTFM_CANDIDATE_POOL_OWNERS[key] == {secondOwner}
+
+    second._releaseLastfmPoolOwner(("artist",), secondOwner)
+    assert key not in workers._LASTFM_CANDIDATE_POOLS
+    assert key not in workers._LASTFM_CANDIDATE_POOL_OWNERS
+
+
+def test_owner_registry_isolated_by_kind_and_database_path(clock):
+    worker = PoolHarness("database-a")
+    worker.user = "owner"
+    other = PoolHarness("database-b")
+    other.user = "owner"
+    artistOwner = object()
+    albumOwner = object()
+    otherOwner = object()
+    worker._registerLastfmPoolOwner(("artist",), artistOwner)
+    worker._registerLastfmPoolOwner(("album",), albumOwner)
+    other._registerLastfmPoolOwner(("artist",), otherOwner)
+
+    for kind, scope, prefix in (
+            ("artist", "owner", "artist"),
+            ("album", "owner", "album")):
+        claimed = worker._pooledCandidates(kind, scope, lambda _, p=prefix: rows(p))
+        worker._finishPooledCandidates(kind, scope, claimed, [])
+    claimed = other._pooledCandidates("artist", "owner", lambda _: rows("other"))
+    other._finishPooledCandidates("artist", "owner", claimed, [])
+
+    worker._releaseLastfmPoolOwner(("artist",), artistOwner)
+
+    assert ("artist", "owner", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
+    assert ("album", "owner", "database-a") in workers._LASTFM_CANDIDATE_POOLS
+    assert ("artist", "owner", "database-b") in workers._LASTFM_CANDIDATE_POOLS
+
+    worker._releaseLastfmPoolOwner(("album",), albumOwner)
+    other._releaseLastfmPoolOwner(("artist",), otherOwner)
+    assert not workers._LASTFM_CANDIDATE_POOLS
 
 
 def test_owner_cleanup_marks_inflight_then_finish_retires_without_losing_claim(clock):

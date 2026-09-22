@@ -43,6 +43,7 @@ class _LastfmCandidatePool:
 
 
 _LASTFM_CANDIDATE_POOLS: dict[tuple[str, str | None, str | None], _LastfmCandidatePool] = {}
+_LASTFM_CANDIDATE_POOL_OWNERS: dict[tuple[str, str | None, str | None], set[object]] = {}
 _LASTFM_CANDIDATE_POOLS_LOCK = threading.Lock()
 _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT: float | None = None
 _LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS = 60
@@ -145,6 +146,8 @@ class LastfmBackfillMixin:
         import random
         if stop_event is None:
             stop_event = getattr(self, eventAttr)
+        owner = object()
+        ownerRegistered = False
         try:
             startup_delay = random.randint(minStartDelay, maxStartDelay)
             _dbmod.logger.info("[%s-%s] Starting with initial delay of %d seconds",
@@ -156,11 +159,15 @@ class LastfmBackfillMixin:
             while not stop_event.is_set():
                 try:
                     if not enabled():
-                        self._retireLastfmPools(poolKinds)
+                        self._releaseLastfmPoolOwner(poolKinds, owner)
+                        ownerRegistered = False
                         if stop_event.wait(idleWaitSeconds):
                             break
                         continue
 
+                    if not ownerRegistered:
+                        self._registerLastfmPoolOwner(poolKinds, owner)
+                        ownerRegistered = True
                     cycleStarted = _dbmod.time.monotonic()
                     apiKey = self.repo.getUserLastfmApiKey(self.user)
                     if not apiKey:
@@ -199,7 +206,7 @@ class LastfmBackfillMixin:
                         if pause > 0 and stop_event.wait(pause):
                             break
         finally:
-            self._retireLastfmPools(poolKinds)
+            self._releaseLastfmPoolOwner(poolKinds, owner)
             _dbmod.logger.info("[%s-%s] Exited gracefully", logPrefix, self.user)
 
     def _lastfmGenreBackfillLoop(self, stop_event: threading.Event | None = None) -> None:
@@ -470,13 +477,42 @@ class LastfmBackfillMixin:
         """Deduplicate retry rows; admission keeps pending IDs within pool capacity."""
         return self._lastfmUniqueRows(rows)
 
-    def _retireLastfmPools(self, poolKinds: tuple[str, ...]) -> None:
-        """Retire this worker's user/global pools, deferring active work."""
+    def _lastfmPoolOwnerKeys(
+            self, poolKinds: tuple[str, ...]) -> set[tuple[str, str | None, str | None]]:
         dbPath = getattr(getattr(self.repo, "connectionManager", None), "dbPath", None)
         scopes = {getattr(self, "user", None), None}
-        keys = {(kind, scope, dbPath) for kind in poolKinds for scope in scopes}
+        return {(kind, scope, dbPath) for kind in poolKinds for scope in scopes}
+
+    def _registerLastfmPoolOwner(self, poolKinds: tuple[str, ...], owner: object) -> None:
+        """Register one loop token as an owner of its fixed user/global pools."""
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            for key in self._lastfmPoolOwnerKeys(poolKinds):
+                _LASTFM_CANDIDATE_POOL_OWNERS.setdefault(key, set()).add(owner)
+                pool = _LASTFM_CANDIDATE_POOLS.get(key)
+                if pool is not None:
+                    pool.retire_when_idle = False
+
+    def _releaseLastfmPoolOwner(self, poolKinds: tuple[str, ...], owner: object) -> None:
+        """Release one loop token and retire only pools without another owner."""
+        with _LASTFM_CANDIDATE_POOLS_LOCK:
+            for key in self._lastfmPoolOwnerKeys(poolKinds):
+                owners = _LASTFM_CANDIDATE_POOL_OWNERS.get(key)
+                if owners is None:
+                    continue
+                owners.discard(owner)
+                if not owners:
+                    _LASTFM_CANDIDATE_POOL_OWNERS.pop(key, None)
+        self._retireLastfmPools(poolKinds, owner=owner)
+
+    def _retireLastfmPools(self, poolKinds: tuple[str, ...], owner: object | None = None) -> None:
+        """Retire user/global pools when no other loop owner still needs them."""
+        keys = self._lastfmPoolOwnerKeys(poolKinds)
         with _LASTFM_CANDIDATE_POOLS_LOCK:
             for key in keys:
+                owners = _LASTFM_CANDIDATE_POOL_OWNERS.get(key)
+                if owners and (
+                        owner is None or any(candidate != owner for candidate in owners)):
+                    continue
                 pool = _LASTFM_CANDIDATE_POOLS.get(key)
                 if pool is None:
                     continue
@@ -507,6 +543,7 @@ class LastfmBackfillMixin:
                 for oldKey, oldPool in list(_LASTFM_CANDIDATE_POOLS.items()):
                     lastUsed = oldPool.last_used if oldPool.last_used is not None else oldPool.fetched_at
                     if (oldKey != key and not oldPool.leases and not oldPool.in_flight
+                            and not _LASTFM_CANDIDATE_POOL_OWNERS.get(oldKey)
                             and lastUsed is not None
                             and now - lastUsed >= self.LASTFM_QUEUE_POOL_TTL_SECONDS):
                         del _LASTFM_CANDIDATE_POOLS[oldKey]
@@ -526,7 +563,10 @@ class LastfmBackfillMixin:
                 if (pool.retire_when_idle and pool.leases == 0
                         and not pool.in_flight
                         and _LASTFM_CANDIDATE_POOLS.get(key) is pool):
-                    _LASTFM_CANDIDATE_POOLS.pop(key, None)
+                    if _LASTFM_CANDIDATE_POOL_OWNERS.get(key):
+                        pool.retire_when_idle = False
+                    else:
+                        _LASTFM_CANDIDATE_POOLS.pop(key, None)
 
     def _pooledCandidates(self, kind: str, scopeUsername: str | None, fetch) -> list[dict]:
         """Claim one bounded batch from a cached, scope-specific candidate pool.
