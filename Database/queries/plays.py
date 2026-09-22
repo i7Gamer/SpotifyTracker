@@ -37,7 +37,7 @@ class PlayQueries:
         return ", ".join(f"{column} = COALESCE(?, {column})" for column in BEHAVIORAL_COLUMNS)
 
     def correctPlay(self, playId: int, playedAt: float, timePlayed: int, isSkip: int,
-                     extrasValues: tuple) -> None:
+                     playedFrom: str | None, extrasValues: tuple) -> None:
         """Rewrite one play from a more accurate import row.
 
         Raises sqlite3.IntegrityError when moving played_at would collide with
@@ -45,17 +45,20 @@ class PlayQueries:
         whether to leave the row uncorrected, since that is an import-policy
         question, not a storage one."""
         self._conn().execute(
-            f"UPDATE plays SET played_at = ?, time_played = ?, is_skip = ?, {self._behavioralSetSql()}"
+            f"UPDATE plays SET played_at = ?, time_played = ?, is_skip = ?, "
+            f"played_from = COALESCE(?, played_from), {self._behavioralSetSql()}"
             " WHERE id = ?",
-            (playedAt, timePlayed, isSkip, *extrasValues, playId),
+            (playedAt, timePlayed, isSkip, playedFrom, *extrasValues, playId),
         )
 
-    def enrichPlayBehavioralColumns(self, playId: int, extrasValues: tuple) -> None:
-        """Backfill one play's behavioral columns from an import that carries
-        metadata the stored row lacks. The play itself is unchanged."""
+    def enrichPlayBehavioralColumns(self, playId: int, playedFrom: str | None,
+                                    extrasValues: tuple) -> None:
+        """Backfill one play's context and behavioral columns from an import
+        that carries metadata the stored row lacks. The play itself is unchanged."""
         self._conn().execute(
-            f"UPDATE plays SET {self._behavioralSetSql()} WHERE id = ?",
-            (*extrasValues, playId),
+            f"UPDATE plays SET played_from = COALESCE(?, played_from), "
+            f"{self._behavioralSetSql()} WHERE id = ?",
+            (playedFrom, *extrasValues, playId),
         )
 
     def insertPlay(self, username: str, trackId: str, playedAt: float, timePlayed: int,
@@ -386,7 +389,7 @@ class PlayQueries:
         behavioralSelect = ", ".join(BEHAVIORAL_COLUMNS)
         # is_skip=0: only real plays are correction/dedup candidates (see hasPlayNearTime).
         rows = conn.execute(
-            f"SELECT id, played_at, time_played, is_skip, {behavioralSelect} FROM plays "
+            f"SELECT id, played_at, time_played, is_skip, played_from, {behavioralSelect} FROM plays "
             f"WHERE username=? AND track_id=? AND played_at BETWEEN ? AND ? AND is_skip=0",
             (username, trackId, playedAt - toleranceSeconds, playedAt + toleranceSeconds),
         ).fetchall()
@@ -406,8 +409,9 @@ class PlayQueries:
         constraint - which needs an exact timestamp match - let one skip land
         twice and inflate skip counts."""
         conn = self._conn()
+        behavioralSelect = ", ".join(BEHAVIORAL_COLUMNS)
         rows = conn.execute(
-            "SELECT id, played_at FROM plays "
+            f"SELECT id, played_at, played_from, {behavioralSelect} FROM plays "
             "WHERE username=? AND track_id=? AND played_at BETWEEN ? AND ? AND is_skip=1",
             (username, trackId, playedAt - toleranceSeconds, playedAt + toleranceSeconds),
         ).fetchall()

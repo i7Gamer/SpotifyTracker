@@ -414,7 +414,7 @@ class ImportMixin:
 
         return stagedTracks, stagedPlays, total, importStats
 
-    def _claimNearbySkip(self, track_id, played_at, runState) -> bool:
+    def _claimNearbySkip(self, track_id, played_at, runState) -> dict | None:
         """Claim the nearest existing skip row (is_skip=1) of this track
         within SKIP_NEAR_TIME_TOLERANCE_SECONDS of played_at, if there is
         one - the one physical event the live listener already recorded
@@ -423,8 +423,8 @@ class ImportMixin:
         start-vs-end ambiguity), so one skip landed twice and inflated
         skip counts.
 
-        Returns True when a row was claimed (the entry is already
-        recorded; insert nothing), False when there is nothing to claim.
+        Returns the claimed row when one exists (the entry is already
+        recorded; insert nothing), or None when there is nothing to claim.
         Shared by the two callers that store an entry as a skip: the
         sub-floor skip path (_applySkipEntry) and the real-play path once
         it has found nothing to correct - see the dispatch comment in
@@ -438,7 +438,7 @@ class ImportMixin:
             if not runState.isOwnWrite(track_id, skip)
         ]
         if not nearbySkips:
-            return False
+            return None
         # Claim it, exactly as the real-play path does. An
         # unclaimed match stayed a candidate for every LATER
         # entry too, so a second genuine skip inside the same
@@ -448,10 +448,10 @@ class ImportMixin:
         # depend on the order the query returned them in.
         closest = min(nearbySkips, key=lambda skip: abs(skip["played_at"] - played_at))
         runState.claimedRowIds.add(closest["id"])
-        return True
+        return closest
 
     def _applySkipEntry(self, track_id, played_at, time_played, extras, runState,
-                        playedFrom=None) -> int:
+                        playedFrom=None) -> tuple[int, int]:
         """Sub-5s events (entry["isSkip"], the fixed import floor) never
         claim or correct a real play row - they match only against
         other skips (see _claimNearbySkip for why matching against
@@ -459,11 +459,15 @@ class ImportMixin:
 
         The apply loop's per-entry dispatch calls this and always
         `continue`s afterward - this branch fully owns the entry once
-        isSkip fires. Returns 1 when a new skip play was inserted, 0 when
-        an existing nearby skip was claimed instead (so the caller's
-        skipsSavedCount only counts genuine new rows)."""
-        if self._claimNearbySkip(track_id, played_at, runState):
-            return 0
+        isSkip fires. Returns (skipsSaved, enriched) so the caller's
+        skipsSavedCount only counts genuine new rows while metadata enrichment
+        remains visible in the import summary."""
+        extras = extras or {}
+        extrasValues = [extras.get(column) for column in _dbmod.BEHAVIORAL_COLUMNS]
+        claimedSkip = self._claimNearbySkip(track_id, played_at, runState)
+        if claimedSkip is not None:
+            enriched = self._enrichMatchedPlay(claimedSkip, playedFrom, extras, extrasValues)
+            return 0, int(enriched)
         #< playedFrom passed through exactly as the real-play insert passes
         #  it: this path used to drop the playlist context of every sub-floor
         #  skip on the way in
@@ -471,8 +475,8 @@ class ImportMixin:
                                 created_reason=f"history_import (user: {self.user})",
                                 extras=extras, is_skip=1):
             runState.insertedPlayKeys.add((track_id, played_at))
-            return 1
-        return 0
+            return 1, 0
+        return 0, 0
 
     def _nearTimeMatches(self, track_id, played_at, durationSeconds, runState):
         """Existing play rows within (duration + 60s) tolerance of one import
@@ -496,8 +500,22 @@ class ImportMixin:
                 matches.append(m)
         return matches
 
+    def _enrichMatchedPlay(self, existing_play, playedFrom, extras, extrasValues) -> bool:
+        """Apply supplied context/behavioral values and report actual changes."""
+        contextDiffers = (
+            playedFrom is not None and playedFrom != existing_play.get("played_from")
+        )
+        extrasDiffers = any(
+            extras.get(column) is not None and extras.get(column) != existing_play.get(column)
+            for column in _dbmod.BEHAVIORAL_COLUMNS
+        )
+        if not (contextDiffers or extrasDiffers):
+            return False
+        self.repo.enrichPlayBehavioralColumns(existing_play["id"], playedFrom, extrasValues)
+        return True
+
     def _reconcileSingleMatch(self, existing_play, track_id, played_at, time_played, isSkip,
-                              extras, extrasValues):
+                              playedFrom, extras, extrasValues):
         """The apply loop's exactly-one-match arm: safe to update the
         existing row in place rather than insert a duplicate. Returns
         (updated, enriched, correctedYears, earliestTouchedTimestamp) -
@@ -512,14 +530,6 @@ class ImportMixin:
             existing_play["played_at"] != played_at or
             existing_play["is_skip"] != isSkip
         )
-        # Behavioral columns the import can fill/correct on the
-        # matched row - a non-null import value wins, a None
-        # never clobbers a stored one (COALESCE below).
-        extras_differ = any(
-            extras.get(column) is not None and extras.get(column) != existing_play.get(column)
-            for column in _dbmod.BEHAVIORAL_COLUMNS
-        )
-
         if data_differs:
             # Update both fields with imported data (more accurate source).
             # A corrected time_played can cross the skip threshold, so
@@ -527,7 +537,7 @@ class ImportMixin:
             corrected_is_skip = isSkip
             try:
                 self.repo.correctPlay(existing_play["id"], played_at, time_played,
-                                       corrected_is_skip, extrasValues)
+                                       corrected_is_skip, playedFrom, extrasValues)
             except sqlite3.IntegrityError:
                 # Correcting played_at would collide with an existing
                 # (username, track_id, played_at) row the near-time
@@ -563,10 +573,9 @@ class ImportMixin:
             }
             earliestTouchedTimestamp = _minTimestamp(None, existing_play["played_at"], played_at)
             return True, False, correctedYears, earliestTouchedTimestamp
-        elif extras_differ:
+        elif self._enrichMatchedPlay(existing_play, playedFrom, extras, extrasValues):
             # Same play, but this import carries behavioral
             # metadata the row lacks - backfill it in place.
-            self.repo.enrichPlayBehavioralColumns(existing_play["id"], extrasValues)
             return False, True, set(), None
         else:
             # Data matches - skip, no update needed
@@ -658,9 +667,11 @@ class ImportMixin:
                 # _applySkipEntry for why a sub-5s event never claims or
                 # corrects a real play row.
                 if entry.get("isSkip") and isSkip:
-                    skipsSavedCount += self._applySkipEntry(track_id, played_at, time_played,
-                                                            entry.get("importExtras"), runState,
-                                                            playedFrom=played_from)
+                    skipsSaved, skipsEnriched = self._applySkipEntry(
+                        track_id, played_at, time_played, entry.get("importExtras"), runState,
+                        playedFrom=played_from)
+                    skipsSavedCount += skipsSaved
+                    enrichedCount += skipsEnriched
                     continue
 
                 # Check if a play for this track already exists within (duration + 60s) tolerance -
@@ -676,7 +687,8 @@ class ImportMixin:
                         existing_play = matches[0]
                         runState.claimedRowIds.add(existing_play["id"])
                         updated, enriched, matchCorrectedYears, matchTouchedTimestamp = self._reconcileSingleMatch(
-                            existing_play, track_id, played_at, time_played, isSkip, extras, extrasValues)
+                            existing_play, track_id, played_at, time_played, isSkip,
+                            played_from, extras, extrasValues)
                         if updated:
                             updatedCount += 1
                             correctedYears |= matchCorrectedYears
@@ -723,8 +735,12 @@ class ImportMixin:
                 # real-play path's own tight second look, not a widening of
                 # the matcher: the duration-wide window above would swallow a
                 # genuine second abandon of the same track later in a session.
-                if isSkip and self._claimNearbySkip(track_id, played_at, runState):
-                    continue
+                if isSkip:
+                    claimedSkip = self._claimNearbySkip(track_id, played_at, runState)
+                    if claimedSkip is not None:
+                        if self._enrichMatchedPlay(claimedSkip, played_from, extras, extrasValues):
+                            enrichedCount += 1
+                        continue
 
                 # Otherwise insert as usual, with the is_skip computed above
                 # from the batch threshold + this track's duration.
