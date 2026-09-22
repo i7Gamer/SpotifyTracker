@@ -43,10 +43,35 @@ class _LastfmCandidatePool:
 
 _LASTFM_CANDIDATE_POOLS: dict[tuple[str, str | None, str | None], _LastfmCandidatePool] = {}
 _LASTFM_CANDIDATE_POOLS_LOCK = threading.Lock()
+_LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT: float | None = None
+_LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS = 60
+
+
+def _lastfmPoolMaintenanceDue(now: float, intervalSeconds: float) -> bool:
+    """Whether the idle-pool registry should be scanned at this access.
+
+    The registry is process-wide and claims/finishes are frequent, so idle
+    retirement is deliberately amortized. A backwards clock jump starts a new
+    maintenance window immediately; an empty registry resets the marker so a
+    newly created pool is not suppressed by a previous test/instance clock.
+    Caller holds _LASTFM_CANDIDATE_POOLS_LOCK.
+    """
+    global _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT
+    if not _LASTFM_CANDIDATE_POOLS:
+        _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT = None
+        return False
+    lastMaintenanceAt = _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT
+    if (lastMaintenanceAt is None or now < lastMaintenanceAt
+            or now - lastMaintenanceAt >= intervalSeconds):
+        _LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT = now
+        return True
+    return False
 
 
 class LastfmBackfillMixin:
     """The three Last.fm backfillers - genre tags, artist biographies, album biographies - and their shared claim/lookup/inheritance helpers."""
+
+    LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS = _LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS
 
     def _startLastfmWorker(self, threadAttr: str, eventAttr: str, loop, threadName: str,
                             logPrefix: str) -> None:
@@ -448,16 +473,18 @@ class LastfmBackfillMixin:
         key = (kind, scopeUsername, dbPath)
         now = _dbmod.time.monotonic()
         with _LASTFM_CANDIDATE_POOLS_LOCK:
-            for oldKey, oldPool in list(_LASTFM_CANDIDATE_POOLS.items()):
-                lastUsed = oldPool.last_used if oldPool.last_used is not None else oldPool.fetched_at
-                if (oldKey != key and not oldPool.leases and not oldPool.in_flight
-                        and lastUsed is not None
-                        and now - lastUsed >= self.LASTFM_QUEUE_POOL_TTL_SECONDS):
-                    del _LASTFM_CANDIDATE_POOLS[oldKey]
             pool = _LASTFM_CANDIDATE_POOLS.get(key)
             if pool is None and create:
                 pool = _LastfmCandidatePool([], None)
                 _LASTFM_CANDIDATE_POOLS[key] = pool
+            if _lastfmPoolMaintenanceDue(
+                    now, self.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS):
+                for oldKey, oldPool in list(_LASTFM_CANDIDATE_POOLS.items()):
+                    lastUsed = oldPool.last_used if oldPool.last_used is not None else oldPool.fetched_at
+                    if (oldKey != key and not oldPool.leases and not oldPool.in_flight
+                            and lastUsed is not None
+                            and now - lastUsed >= self.LASTFM_QUEUE_POOL_TTL_SECONDS):
+                        del _LASTFM_CANDIDATE_POOLS[oldKey]
             if pool is not None:
                 pool.leases += 1
                 pool.last_used = now

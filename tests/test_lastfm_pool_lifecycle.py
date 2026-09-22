@@ -17,6 +17,7 @@ import Database.workers.lastfm_backfillers as workers
 THREAD_TIMEOUT_SECONDS = 5
 FETCH_TIMEOUT_SECONDS = THREAD_TIMEOUT_SECONDS * 2
 START_TIME = 100
+REGISTRY_ACCESS_REPEAT_COUNT = 5
 
 
 class PoolHarness(workers.LastfmBackfillMixin):
@@ -64,6 +65,9 @@ def test_idle_scope_is_evicted_but_inflight_batch_and_late_retry_survive(clock, 
 
     worker._pooledCandidates("album", "new", lambda _: [])
 
+    assert ("artist", "retired", "database-a") in workers._LASTFM_CANDIDATE_POOLS
+    clock[0] += worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS
+    worker._pooledCandidates("album", "new", lambda _: [])
     assert ("artist", "retired", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
     assert ("bio", "active", "database-a") in workers._LASTFM_CANDIDATE_POOLS
     worker._finishPooledCandidates("bio", "active", inflight, inflight)
@@ -154,7 +158,8 @@ def test_failed_refill_does_not_leave_a_locked_or_pinned_pool(clock):
         worker._pooledCandidates("artist", "user", fetch)
     batch = worker._pooledCandidates("artist", "user", fetch)
     worker._finishPooledCandidates("artist", "user", batch, [])
-    clock[0] += worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+    clock[0] += (worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+                 + worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS)
     worker._pooledCandidates("bio", "new", lambda _: [])
     assert ("artist", "user", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
     assert not Database._lastfm_active
@@ -171,7 +176,8 @@ def test_revalidation_failure_releases_pin_and_preserves_next_retry(clock):
     replay = worker._pooledCandidates("artist", "user", lambda _: fetched)
     assert replay == fetched[:worker.LASTFM_QUEUE_BATCH_SIZE]
     worker._finishPooledCandidates("artist", "user", replay, [])
-    clock[0] += worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+    clock[0] += (worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+                 + worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS)
     worker._pooledCandidates("bio", "new", lambda _: [])
     assert ("artist", "user", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
 
@@ -181,7 +187,8 @@ def test_stale_revalidation_does_not_pin_retired_pool(clock):
     worker._lastfmRevalidateRows = Mock(return_value=[])
     assert worker._pooledCandidates("artist", "user", lambda _: rows()) == []
     assert not Database._lastfm_active
-    clock[0] += worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+    clock[0] += (worker.LASTFM_QUEUE_POOL_TTL_SECONDS
+                 + worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS)
     worker._pooledCandidates("bio", "new", lambda _: [])
     assert ("artist", "user", "database-a") not in workers._LASTFM_CANDIDATE_POOLS
 
@@ -192,3 +199,49 @@ def test_finish_without_pool_releases_claims_without_creating_an_entry(clock):
     worker._finishPooledCandidates("artist", "absent", claimed, claimed)
     assert not Database._lastfm_active
     assert not workers._LASTFM_CANDIDATE_POOLS
+
+
+def test_pool_registry_maintenance_is_amortized_and_resumes_after_clock_rollback(
+        clock, monkeypatch):
+    class CountingRegistry(dict):
+        scanCount = 0
+
+        def items(self):
+            self.scanCount += 1
+            return super().items()
+
+    registry = CountingRegistry()
+    monkeypatch.setattr(workers, "_LASTFM_CANDIDATE_POOLS", registry)
+    monkeypatch.setattr(workers, "_LASTFM_CANDIDATE_POOLS_LAST_MAINTENANCE_AT", None,
+                        raising=False)
+    worker = PoolHarness()
+
+    worker._pooledCandidates("artist", "old", lambda _: [])
+    firstScanCount = registry.scanCount
+    for _ in range(REGISTRY_ACCESS_REPEAT_COUNT):
+        worker._pooledCandidates("artist", "old", lambda _: [])
+        worker._finishPooledCandidates("artist", "old", [], [])
+    assert registry.scanCount == firstScanCount
+
+    clock[0] += worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS
+    worker._pooledCandidates("artist", "old", lambda _: [])
+    assert registry.scanCount == firstScanCount + 1
+
+    clock[0] -= worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS + 1
+    worker._pooledCandidates("artist", "old", lambda _: [])
+    assert registry.scanCount == firstScanCount + 2
+
+
+def test_delayed_pool_maintenance_keeps_pinned_pool_then_retires_it(clock):
+    worker = PoolHarness()
+    claimed = worker._pooledCandidates("artist", "old", lambda _: rows())
+    oldKey = ("artist", "old", "database-a")
+
+    clock[0] += worker.LASTFM_QUEUE_POOL_TTL_SECONDS + worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS
+    worker._pooledCandidates("bio", "new", lambda _: [])
+    assert oldKey in workers._LASTFM_CANDIDATE_POOLS
+
+    worker._finishPooledCandidates("artist", "old", claimed, [])
+    clock[0] += worker.LASTFM_QUEUE_POOL_TTL_SECONDS + worker.LASTFM_POOL_MAINTENANCE_INTERVAL_SECONDS
+    worker._pooledCandidates("track", "newer", lambda _: [])
+    assert oldKey not in workers._LASTFM_CANDIDATE_POOLS
