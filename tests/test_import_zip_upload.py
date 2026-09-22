@@ -12,6 +12,7 @@ The guard is the reason this file exists at all: MAX_CONTENT_LENGTH bounds the
 REQUEST, and a 25 MB archive of 10 GB of zeroes sails straight through it.
 """
 import io
+import struct
 import threading
 import unittest
 import warnings
@@ -206,6 +207,28 @@ class TestExpandUploads(unittest.TestCase):
         result = expandUploads([_upload("export.zip", bytes(archive))], _GENEROUS_CAP)
 
         self.assertEqual(result.contents, [])
+        self.assertEqual(result.unreadableCount, 1)
+
+    def test_an_unsupported_compression_method_is_counted_not_raised(self):
+        """zipfile raises NotImplementedError for a method this build has no
+        decompressor for (WinZip AE-x encryption, method 99, is the one seen
+        in the wild). It subclasses RuntimeError so the except tuple already
+        covered it - this pins that, because the relationship is implicit and
+        a reviewer read the tuple as leaving the route open to a 500."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("a_odd.json", _PLAY_JSON)
+            archive.writestr("b_fine.json", '{"ms_played": 2}')
+        raw = bytearray(buffer.getvalue())
+        # Rewrite ONLY the first entry's method, in both headers that carry it:
+        # local (PK\x03\x04, +8) and central directory (PK\x01\x02, +10).
+        for signature, offset in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+            at = raw.find(signature)
+            struct.pack_into("<H", raw, at + offset, 99)
+
+        result = expandUploads([_upload("odd.zip", bytes(raw))], _GENEROUS_CAP)
+
+        self.assertEqual(result.contents, ['{"ms_played": 2}'])   #< the sibling survives
         self.assertEqual(result.unreadableCount, 1)
 
     def test_a_file_named_zip_that_is_not_one_falls_back_to_text(self):

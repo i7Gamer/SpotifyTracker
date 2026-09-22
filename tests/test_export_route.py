@@ -576,7 +576,7 @@ class TestExportLinksLiveOnTheImportPage(_AppTestBase):
 
         body = self._get(dash, self._makeDb(), "/import").data
 
-        self.assertIn(b'aria-label="Spotify history ZIP or JSON file(s)"', body)
+        self.assertIn(b'aria-label="Spotify history ZIP, JSON or CSV file(s)"', body)
 
 
 

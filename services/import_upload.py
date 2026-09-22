@@ -177,12 +177,17 @@ def _takeEntry(archive, info, budget, result):
     try:
         with archive.open(info) as entry:
             raw = budget.take(entry, name)
-    except (zipfile.BadZipFile, zlib.error, RuntimeError, OSError, EOFError) as error:
+    except (zipfile.BadZipFile, zlib.error, NotImplementedError, RuntimeError,
+            OSError, EOFError) as error:
         # BadZipFile/zlib.error: a corrupt deflate stream, a local header that
         # disagrees with the directory, or a CRC that does not match what was
         # inflated - which is also how a rewritten declared size surfaces.
-        # RuntimeError: the entry is encrypted. One bad entry must not drop
-        # its siblings, so this mirrors the unreadable-file path below.
+        # RuntimeError: the entry is encrypted. NotImplementedError: a
+        # compression method this Python build has no decompressor for - it
+        # SUBCLASSES RuntimeError, so it was already caught, but two reviewers
+        # read this tuple and disagreed about that, which is reason enough to
+        # spell it out. One bad entry must not drop its siblings, so this
+        # mirrors the unreadable-file path below.
         result.unreadableCount += 1
         logger.warning("Skipping archive entry %r: %s", name, error)
         return
