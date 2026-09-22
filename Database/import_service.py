@@ -26,6 +26,7 @@ from Database.dbmodule import dbmod as _dbmod
 #< a direct import, unlike _dbmod above: Database.utils imports nothing but the
 #  standard library, so it cannot take part in the cycle _dbmod exists to break
 from Database.utils import flaskDebugEnabled
+from Database.metadata_repair import WrappedRepairResult
 
 # Drop counters (see StreamingHistoryImporter._processPlay) whose plays WOULD
 # import on a later attempt: the lookup failed, the data didn't. An overwrite
@@ -150,6 +151,21 @@ class ImportMixin:
 
     # ---- writing plays ---------------------------------------------------------------
 
+    def _beginMetadataWrite(self):
+        """Reserve the writer before reading catalog state used by repair decisions."""
+        conn = self.repo.connection()
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    def _logCommittedMetadataRepair(self, source: str, result: WrappedRepairResult | None) -> None:
+        if result is not None:
+            _dbmod.logger.info(
+                "Metadata repair committed: source=%s user=%s repaired=%d repair_deleted=%d "
+                "history_deleted=%d mode=%s reason=%s",
+                source, self.user, result.repaired, result.repairDeleted, result.historyDeleted,
+                result.mode, result.reason or "within_limits")
+
     def appendMetadata(self, meta: dict, created_reason: str | None = None) -> bool:
         self.saveImagesFromTrack(meta)
         entry, track = self._splitEntryAndTrack(meta)
@@ -167,17 +183,20 @@ class ImportMixin:
         # upsertPlaylistName's `with conn:`) and runs only once the play is
         # durably committed, so it has no part in this transaction.
         try:
-            self.repo.upsertTrack(track, created_reason=created_reason)
+            conn = self._beginMetadataWrite()
+            impact = self.repo.upsertTrack(track, created_reason=created_reason)
             # Classify against the current threshold + the track's duration (percent
             # mode needs it); a sub-threshold event now lands as is_skip=1 in plays
             # rather than in a separate table.
             is_skip = self.repo.computeIsSkip(entry["timePlayed"], track.get("duration"))
             was_inserted = self.repo.insertPlay(self.user, entry["id"], entry["playedAt"], entry["timePlayed"], entry.get("playedFrom"),
                                   created_reason=created_reason, is_skip=is_skip)
+            repairResult = self.repo._invalidateWrappedForRepairs(conn, [impact]) if impact is not None else None
             self.repo.commit()
         except Exception:
             self.repo.rollbackQuietly()
             raise
+        self._logCommittedMetadataRepair("live", repairResult)
         self.updatePlaylists(entry.get("playedFrom"))
         return was_inserted
 
@@ -270,6 +289,8 @@ class ImportMixin:
             # same run-state fields itself (see _applyImportData's except).
             claimedRowIdsBefore = set(runState.claimedRowIds)
             insertedPlayKeysBefore = set(runState.insertedPlayKeys)
+            pendingRepairImpactsBefore = list(runState.pendingRepairImpacts)
+            correctedYearsBefore = set(runState.correctedYears)
             try:
                 staged = self._stageImportData(importer, exportedHistory, progressPrefix,
                                                hasPriorError, self.writeProgress, runState, deferCommit=False)
@@ -280,6 +301,9 @@ class ImportMixin:
                 self.repo.rollbackQuietly()
                 runState.claimedRowIds = claimedRowIdsBefore
                 runState.insertedPlayKeys = insertedPlayKeysBefore
+                runState.pendingRepairImpacts = pendingRepairImpactsBefore
+                runState.correctedYears = correctedYearsBefore
+                runState.committedRepairResult = None
                 self.writeProgress("failed", 0, 0, f"{progressPrefix}Import failed: {_dbmod.parseError(e)}", error=True)
                 raise
             if staged is None:
@@ -565,9 +589,16 @@ class ImportMixin:
         # Rolled-back writes must not stay claimed in a batch-shared run state
         claimedRowIdsBefore = set(runState.claimedRowIds)
         insertedPlayKeysBefore = set(runState.insertedPlayKeys)
+        pendingRepairImpactsBefore = list(runState.pendingRepairImpacts)
+        correctedYearsBefore = set(runState.correctedYears)
+        if not deferCommit:
+            runState.committedRepairResult = None
         try:
+            conn = self._beginMetadataWrite()
             for track in stagedTracks.values():
-                self.repo.upsertTrack(track, created_reason=f"history_import (user: {self.user})")
+                impact = self.repo.upsertTrack(track, created_reason=f"history_import (user: {self.user})")
+                if impact is not None:
+                    runState.pendingRepairImpacts.append(impact)
 
             insertedCount = 0
             updatedCount = 0
@@ -720,71 +751,58 @@ class ImportMixin:
             if track_file_hash and not retryableDropped:
                 self.repo.markFileImported(self.user, _exportContentHash(exportedHistory))
 
+            # Both corrections and new earlier listens can move discoveries
+            # in later years. A metadata-only repair has no history scope.
+            touchedYears = set(correctedYears)
+            if earliestTouchedTimestamp is not None:
+                touchedYears.add(_dbmod.convertToDatetime(earliestTouchedTimestamp, tz=self.tz).year)
             if deferCommit:
-                # Atomic overwrite batch: the caller commits once for the
-                # whole batch. deleteUserWrappedFromYear self-commits
-                # (INVARIANT above), so invalidating now would flush this
-                # transaction's still-uncommitted writes early - the caller
-                # invalidates these years itself after its own commit succeeds.
+                # The outer batch owns invalidation and commit after all
+                # files, including their final catalog membership, are known.
                 runState.correctedYears |= correctedYears
             else:
+                historyScopes = ((self.user, min(touchedYears)),) if touchedYears else ()
+                repairResult = (self.repo._invalidateWrappedForRepairs(
+                    conn, runState.pendingRepairImpacts, historyScopes)
+                    if runState.pendingRepairImpacts else None)
                 self.repo.commit()
-
-                # INVARIANT-safe only here: the Wrapped deletes self-commit, so
-                # they must never run while import rows are staged.
-                #
-                # Two ways a cached year goes wrong, and _wrappedCacheNeedsRecalc
-                # sees neither. A CORRECTION can move a play without changing its
-                # year's play count or max timestamp. And an INSERT into any year
-                # can move a later year's discoveries, which are anchored on
-                # all-time first listens - so the years to drop start at the
-                # oldest play written, not at the years written to.
-                touchedYears = set(correctedYears)
-                if earliestTouchedTimestamp is not None:
-                    touchedYears.add(
-                        _dbmod.convertToDatetime(earliestTouchedTimestamp, tz=self.tz).year)
-                self._invalidateWrappedFromEarliestOf(touchedYears, "Import")
-
-                # Only reached once this file's write has actually committed
-                # (an exception above jumps straight to the except below and
-                # never gets here), so a file whose commit itself fails is
-                # never double-counted here and again on a later re-import.
-                # A multi-file append batch (_importHistoryBatchLocked) sums
-                # this across every file for its own final progress line,
-                # which otherwise overwrites this per-file line in
-                # import_progress before the user's browser ever polls it -
-                # the overwrite batch never reaches this branch with a
-                # nonzero count (_guardStagedDrops aborts it first), so this
-                # accumulator stays 0 there.
-                runState.retryableDroppedTotal += retryableDropped
-                runState.unreadableDroppedTotal += unreadableDropped
-
-            droppedNoTrack = importStats.get("droppedNoTrack", 0)
-            summary = (f"{insertedCount} new, {updatedCount} corrected, {enrichedCount} enriched, "
-                       f"{skipsSavedCount} skips saved")
-            if droppedNoTrack:
-                summary += f", {droppedNoTrack} without track info dropped"
-            if unreadableDropped:
-                #< reached only the server log before; the file is still
-                #  hash-marked above, because a row the parser cannot read is
-                #  dropped again by any re-import, so no advice to retry
-                summary += f", {unreadableDropped} unreadable entries skipped"
-            if retryableDropped:
-                #< the same count that withheld the hash mark above - named
-                #  here because until now these drops reached only the server
-                #  log, and the user was told "Import complete" over them
-                summary += (f", {retryableDropped} could not be looked up "
-                            "(re-import this file to retry them)")
-            _dbmod.logger.info("Imported %d tracks for user %s: %s", len(stagedTracks), self.user, summary)
-
-            status = "complete" if isFinalFile else "running"
-            reportProgress(status, total, total, f"{progressPrefix}Import complete: {summary}", error=hasPriorError)
+                runState.pendingRepairImpacts.clear()
+                runState.committedRepairResult = repairResult
         except Exception as e:
             self.repo.rollbackQuietly()
             runState.claimedRowIds = claimedRowIdsBefore
             runState.insertedPlayKeys = insertedPlayKeysBefore
+            runState.pendingRepairImpacts = pendingRepairImpactsBefore
+            runState.correctedYears = correctedYearsBefore
+            runState.committedRepairResult = None
             self.writeProgress("failed", index, total, f"{progressPrefix}Import failed: {_dbmod.parseError(e)}", error=True)
             raise
+
+        # Reporting and legacy non-repair cache cleanup happen after the
+        # commit boundary. An error here must never pretend durable writes
+        # were rolled back or put committed repair impacts back into the run.
+        if not deferCommit:
+            if runState.committedRepairResult is not None:
+                self._logCommittedMetadataRepair("append", runState.committedRepairResult)
+            else:
+                self._invalidateWrappedFromEarliestOf(touchedYears, "Import")
+            runState.retryableDroppedTotal += retryableDropped
+            runState.unreadableDroppedTotal += unreadableDropped
+
+        droppedNoTrack = importStats.get("droppedNoTrack", 0)
+        summary = (f"{insertedCount} new, {updatedCount} corrected, {enrichedCount} enriched, "
+                   f"{skipsSavedCount} skips saved")
+        if droppedNoTrack:
+            summary += f", {droppedNoTrack} without track info dropped"
+        if unreadableDropped:
+            summary += f", {unreadableDropped} unreadable entries skipped"
+        if retryableDropped:
+            summary += (f", {retryableDropped} could not be looked up "
+                        "(re-import this file to retry them)")
+        _dbmod.logger.info("Imported %d tracks for user %s: %s", len(stagedTracks), self.user, summary)
+
+        status = "complete" if isFinalFile else "running"
+        reportProgress(status, total, total, f"{progressPrefix}Import complete: {summary}", error=hasPriorError)
 
     def importHistoryBatch(self, fileContents: list[str], overwriteRange: bool = False,
                            unreadableFileCount: int = 0) -> list[str]:
@@ -1005,9 +1023,10 @@ class ImportMixin:
         # imported files to FAILED/ and importHistoryBatch never raised the
         # milestone recalc flag. Each loop is guarded on its own so a Wrapped
         # hiccup still lets the cover art queue.
-        rewrittenYears = self._wrappedYearsToInvalidate(minStart, maxEnd, coveredYears,
-                                                        runState.correctedYears)
-        self._invalidateWrappedFromEarliestOf(rewrittenYears, "Overwrite import")
+        if runState.committedRepairResult is None:
+            rewrittenYears = self._wrappedYearsToInvalidate(minStart, maxEnd, coveredYears,
+                                                            runState.correctedYears)
+            self._invalidateWrappedFromEarliestOf(rewrittenYears, "Overwrite import")
         for track in runState.pendingImageTracks.values():
             try:
                 self.saveImagesFromTrack(track)
@@ -1117,8 +1136,11 @@ class ImportMixin:
         def noProgress(*args, **kwargs):
             return None
 
+        runState.committedRepairResult = None
+        runState.pendingRepairImpacts.clear()
         try:
             self.writeProgress("running", 0, total, f"Overwrite: applying {total} file(s)")
+            conn = self._beginMetadataWrite()
             deletedPlays, deletedSkips, skippedYears = self._deletePlaysInCoveredRange(minStart, maxEnd, coveredYears)
             message = f"Overwrite: staged deletion of {deletedPlays} plays and {deletedSkips} skip events in the covered range"
             if skippedYears:
@@ -1134,20 +1156,36 @@ class ImportMixin:
                                       progressPrefix, isFinalFile, False, True,
                                       runState, True, noProgress)
 
+            repairResult = None
+            if runState.pendingRepairImpacts:
+                rewrittenYears = self._wrappedYearsToInvalidate(minStart, maxEnd, coveredYears,
+                                                                runState.correctedYears)
+                historyScopes = ((self.user, min(rewrittenYears)),) if rewrittenYears else ()
+                repairResult = self.repo._invalidateWrappedForRepairs(conn, runState.pendingRepairImpacts,
+                                                                     historyScopes)
             self.repo.commit()
-            return True
+            runState.pendingRepairImpacts.clear()
+            runState.committedRepairResult = repairResult
         except Exception as e:
             # _applyImportData's except already rolled back the whole
             # transaction (the delete plus every prior file's staged writes)
             # when the failure came from an apply; call it again defensively
             # (a no-op if nothing is pending) in case it came from the delete.
             self.repo.rollbackQuietly()
+            runState.pendingRepairImpacts.clear()
+            runState.committedRepairResult = None
+            runState.correctedYears.clear()
+            runState.claimedRowIds.clear()
+            runState.insertedPlayKeys.clear()
             _dbmod.logger.error("Overwrite import aborted after a failure - no changes were applied, "
                         "original data is intact: %s", _dbmod.parseError(e))
             self.writeProgress("failed", 0, total,
                                f"Overwrite import aborted: no changes were applied, original data is intact - {_dbmod.parseError(e)}",
                                error=True)
             return False
+
+        self._logCommittedMetadataRepair("overwrite", runState.committedRepairResult)
+        return True
 
     @staticmethod
     def _sumImportStats(stagedFiles: list) -> dict:

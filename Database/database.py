@@ -49,6 +49,7 @@ except ModuleNotFoundError:
 #  run, utils' own sys.path fix (see Database/utils.py) is what makes the
 #  repo-root config module importable at all
 from config import WEEKDAY_NAMES, IMPORT_KEYWORD_ENV_VAR
+from Database.metadata_repair import TrackRepairImpact, WrappedRepairResult
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,8 @@ class _ImportRunState:
     def __init__(self):
         self.claimedRowIds: set[int] = set()      #< existing rows updated or confirmed identical by this run
         self.insertedPlayKeys: set[tuple] = set() #< (track_id, played_at) of rows inserted by this run
+        self.pendingRepairImpacts: list[TrackRepairImpact] = []
+        self.committedRepairResult: WrappedRepairResult | None = None
         self.correctedYears: set[int] = set()     #< years to drop from Wrapped cache once a deferred-commit
                                                    #  batch (atomic overwrite) actually commits - see
                                                    #  _importHistoryLocked's deferCommit

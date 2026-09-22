@@ -40,6 +40,7 @@ FIRST_IMPORTS = (
     "Database.backup_settings", #< the migrators' dependency-light resolver
     "Database.Migrators.migrate1_32_0", #< settings seeding imports the leaf directly
     "Database.telemetry",
+    "Database.metadata_repair",
     "Database.import_service",
     "Database.media_fetch",
     "Database.queries.merges",

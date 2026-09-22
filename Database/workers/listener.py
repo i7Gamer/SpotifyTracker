@@ -512,7 +512,7 @@ class ListenerMixin:
         # full snapshot still supplies their metadata, without changing any
         # original listening facts. A repair failure must not block cleanup.
         try:
-            self._repairFallbackTrackMetadata([item.get("track") for item in apiItems])
+            self._repairFallbackTrackMetadata([item.get("track") for item in apiItems], source="history")
         except Exception as error:
             _dbmod.logger.warning("Web API metadata repair failed for user %s: %s",
                                   self.user, _dbmod.parseError(error))

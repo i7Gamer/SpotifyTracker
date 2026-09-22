@@ -606,7 +606,7 @@ class MergeQueries:
         return {"groups": groups, "merged": sum(len(g["members"]) for g in groups)}
 
     @staticmethod
-    def _mergeGroupTrackIds(conn, trackIds) -> list[str]:
+    def _mergeGroupTrackIds(conn, trackIds, limit: int | None = None) -> list[str]:
         """Expand track ids to every track that shares a merge group with them.
 
         The scope deleteCachedWrappedForTracks needs, and it is wider than what
@@ -624,19 +624,28 @@ class MergeQueries:
         chain" rule in mergeTracksByIsrc), so root-of-root is root.
 
         Call it BEFORE the write when a group is dissolving (unmergeTrack) and
-        AFTER when one is forming, so it sees the membership that changed."""
+        AFTER when one is forming, so it sees the membership that changed.
+        Repair invalidation passes a limit+1 probe ceiling; existing merge
+        callers omit it and still receive the complete group."""
         ids = list(dict.fromkeys(trackIds))
         if not ids:
             return []
+        if limit is not None and len(ids) >= limit:
+            return sorted(ids)[:limit]
         roots = {row["canonical_id"] or row["id"] for row in conn.execute(
             "SELECT id, canonical_id FROM tracks WHERE id IN (SELECT value FROM json_each(?))",
             (json.dumps(ids),))}
         group = set(ids) | roots
+        if limit is not None and len(group) >= limit:
+            return sorted(group)[:limit]
         if roots:
-            group.update(row["id"] for row in conn.execute(
-                "SELECT id FROM tracks WHERE canonical_id IN (SELECT value FROM json_each(?))",
-                (json.dumps(sorted(roots)),)))
-        return sorted(group)
+            sql = "SELECT id FROM tracks WHERE canonical_id IN (SELECT value FROM json_each(?))"
+            args = (json.dumps(sorted(roots)),)
+            if limit is not None:
+                sql += " LIMIT ?"
+                args += (limit,)
+            group.update(row["id"] for row in conn.execute(sql, args))
+        return sorted(group) if limit is None else sorted(group)[:limit]
 
     def unmergeTrack(self, trackId: str, decidedBy: str) -> None:
         """Take one track back out of its merge, and KEEP it out.
