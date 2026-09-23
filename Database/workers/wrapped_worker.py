@@ -177,8 +177,9 @@ class WrappedWorkerMixin:
         """Runs all queries to precalculate the Spotify Wrapped stats and caches them in user_wrapped table."""
         #< read before the first query, compared again inside the save's own
         #  transaction: a merge/split invalidation landing mid-computation
-        #  makes this snapshot a torn read that must not be cached
-        startGeneration = self.repo.getWrappedInvalidationGeneration()
+        #  makes this snapshot a torn read that must not be cached. Per user,
+        #  so it also sees invalidations of this user's plays alone
+        startGeneration = self.repo.getWrappedInvalidationGeneration(self.user)
         # 1. Total plays and milliseconds
         totalPlays, totalMs = self.getPlayTotals(yearStart, yearEnd)
 

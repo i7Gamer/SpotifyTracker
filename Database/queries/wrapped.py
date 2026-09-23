@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 from Database.metadata_repair import TrackRepairImpact, WrappedRepairResult
-from Database.queries._base import WRAPPED_INVALIDATION_GENERATION_KEY, WRAPPED_YEAR_TZ_SLACK_SECONDS, json
+from Database.queries._base import (
+    WRAPPED_INVALIDATION_GENERATION_KEY, WRAPPED_USER_INVALIDATION_GENERATION_KEY_PREFIX,
+    WRAPPED_YEAR_TZ_SLACK_SECONDS, json,
+)
 
 
 WRAPPED_REPAIR_MAX_EXPANDED_TRACKS = 128
@@ -236,11 +239,23 @@ class WrappedQueries:
              WRAPPED_YEAR_TZ_SLACK_SECONDS)
         ).rowcount
 
-    def getWrappedInvalidationGeneration(self) -> int:
-        row = self._conn().execute(
-            "SELECT value FROM app_settings WHERE key = ?",
-            (WRAPPED_INVALIDATION_GENERATION_KEY,)).fetchone()
-        return int(row["value"]) if row else 0
+    def getWrappedInvalidationGeneration(self, username: str | None = None) -> int:
+        """The stamp a recalculation starts under. With `username`, the SUM of
+        the instance-wide counter and that user's own: both only ever count
+        up, so the sum moves whenever either does, and one int still compares
+        with != as before."""
+        return self._readWrappedGeneration(self._conn(), username)
+
+    @staticmethod
+    def _readWrappedGeneration(conn, username: str | None) -> int:
+        keys = [WRAPPED_INVALIDATION_GENERATION_KEY]
+        if username is not None:
+            keys.append(WRAPPED_USER_INVALIDATION_GENERATION_KEY_PREFIX + username)
+        placeholders = ", ".join("?" for _ in keys)
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) AS generation "
+            f"FROM app_settings WHERE key IN ({placeholders})", keys).fetchone()
+        return int(row["generation"])
 
     def _expandWrappedRepairTracks(self, conn, impacts: list[TrackRepairImpact]) -> list[str] | None:
         """Return a complete small dependency set, or None as soon as it is too large.
@@ -323,6 +338,18 @@ class WrappedQueries:
             """,
             (WRAPPED_INVALIDATION_GENERATION_KEY,))
 
+    @staticmethod
+    def _bumpUserWrappedGeneration(conn, username: str) -> None:
+        """Invalidate in-flight recalculations of ONE user's years - for a
+        change to that user's plays alone, which no other user's figures read.
+        Anything that moves the shared catalog must use _bumpWrappedGeneration."""
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value) VALUES (?, '1')
+            ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+            """,
+            (WRAPPED_USER_INVALIDATION_GENERATION_KEY_PREFIX + username,))
+
     def getCachedWrapped(self, username: str, year: int) -> dict | None:
         row = self._conn().execute(
             "SELECT * FROM user_wrapped WHERE username = ? AND year = ?",
@@ -364,10 +391,7 @@ class WrappedQueries:
             if expectedGeneration is not None:
                 if not conn.in_transaction:
                     conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT value FROM app_settings WHERE key = ?",
-                    (WRAPPED_INVALIDATION_GENERATION_KEY,)).fetchone()
-                if (int(row["value"]) if row else 0) != expectedGeneration:
+                if self._readWrappedGeneration(conn, username) != expectedGeneration:
                     return False
             conn.execute(
                 """
