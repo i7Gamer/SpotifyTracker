@@ -299,7 +299,7 @@ class DatabaseBackfillPageContractTest(DatabaseTestCase):
         )
         self.assertIn("backfillPage", db._addToDatabaseFromListener.call_args.kwargs)
 
-    def test_pause_end_anchor_is_reoffered_by_page_processing(self):
+    def test_pause_end_anchor_suppresses_the_copy_in_page_processing(self):
         end_ts = timeToInt(SECOND_PLAYED_AT)
         start_ts = end_ts - TRACK_DURATION_SECONDS - PAUSE_SECONDS
         evidence = [("track", start_ts, end_ts + INSERT_LAG_SECONDS)]
@@ -307,10 +307,7 @@ class DatabaseBackfillPageContractTest(DatabaseTestCase):
 
         db.process_backfill_page([_item("track", SECOND_PLAYED_AT)])
 
-        self.assertEqual(
-            [item["track"]["id"] for item in self._submitted_items(db)],
-            ["track"],
-        )
+        self.assertEqual(self._submitted_items(db), [])
 
     def test_gapless_previous_track_end_does_not_filter_next_track(self):
         first_ts = timeToInt(FIRST_PLAYED_AT)

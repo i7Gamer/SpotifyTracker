@@ -276,14 +276,43 @@ class TestWebApiBackfillSQLiteContract(DatabaseTestCase):
         _run_listener_page(self.db, items)
         self.assertEqual([row["track_id"] for row in _rows(self.db)], ["retry-me", "already-ok"])
 
-    def test_listener_end_boundary_preserves_possible_api_repeat_and_replay_is_idempotent(self):
+    def test_listener_end_time_reading_is_one_play_and_replay_is_idempotent(self):
+        """#38 kept this as a possible repeat (2 rows). Live 2026-09-23: 84 such
+        copies in 11h, and the listener had seen the same track start at the
+        API time in none of them - it is the same listen, by end time."""
         _seed_listener_play(self.db, "listener-boundary", BASE_TS + 180, BASE_TS + 360)
         item = _api_item("api-boundary", BASE_TS + 360)
 
         _run_listener_page(self.db, [item])
-        self.assertEqual(len(_rows(self.db)), 2)
+        self.assertEqual(len(_rows(self.db)), 1)
         _run_listener_page(self.db, [item])
+        self.assertEqual(len(_rows(self.db)), 1)
+
+    def test_back_to_back_repeat_by_end_time_survives_page_replay_and_reconciliation(self):
+        """F1 end to end: the listener saw the first of two consecutive plays;
+        the API reports both by end time. One row absorbs one stamp."""
+        _seed_listener_play(self.db, "track", BASE_TS, BASE_TS + 180)
+        items = [_api_item("track", BASE_TS + 360), _api_item("track", BASE_TS + 180)]
+
+        for _ in range(2):
+            _run_listener_page(self.db, items)
+            self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS, BASE_TS + 360])
+        _run_listener_page(self.db, list(reversed(items)))
         self.assertEqual(len(_rows(self.db)), 2)
+
+    def test_listener_start_a_few_seconds_off_is_neither_inserted_nor_churned(self):
+        """Live 2026-09-23: a listener start 3.39s from the API stamp was
+        inserted by the 2s prefilter and deleted by 5s reconciliation on
+        every poll, wiping the user's Wrapped cache each time."""
+        offsetSeconds = 3
+        _seed_listener_play(self.db, "track", BASE_TS, BASE_TS + 180)
+        item = _api_item("track", BASE_TS + offsetSeconds)
+
+        with patch.object(self.db.repo, "_deleteUserWrappedFromYear") as wrappedDrop:
+            for _ in range(2):
+                _run_listener_page(self.db, [item])
+                self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS])
+        wrappedDrop.assert_not_called()
 
     def test_failed_initial_query_reoffers_through_atomic_guard_without_losing_repeat(self):
         _seed_listener_play(self.db, "physical", BASE_TS + 2, BASE_TS + 100)

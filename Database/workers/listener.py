@@ -584,7 +584,8 @@ class ListenerMixin:
                         match = page.match(
                             trackId, timestamp, evidence,
                             toleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS,
-                            startToleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS)
+                            startToleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS,
+                            listenerEndArms=False)   #< deleting stays start-only
                         if match is not None and page.claim(match, timestamp):
                             matchedTimes.add(timestamp)
                     # Stored API events reserve primary rows too, but only

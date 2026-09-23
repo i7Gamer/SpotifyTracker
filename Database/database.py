@@ -49,6 +49,7 @@ except ModuleNotFoundError:
 #  run, utils' own sys.path fix (see Database/utils.py) is what makes the
 #  repo-root config module importable at all
 from config import WEEKDAY_NAMES, IMPORT_KEYWORD_ENV_VAR
+from Database.backfill_matching import LISTENER_END_MATCH_TOLERANCE_SECONDS, LISTENER_START_MATCH_TOLERANCE_SECONDS
 from Database.metadata_repair import TrackRepairImpact, WrappedRepairResult
 
 logger = logging.getLogger(__name__)
@@ -236,13 +237,17 @@ class Database(MediaFetchMixin, ImportMixin, WorkerLifecycleMixin):
                                                #  end instead of its start (see the start/end ambiguity note
                                                #  on BACKFILL_INSERT_GUARD_EXTRA_SECONDS): imported start +
                                                #  track duration must land within this window of the DB row
-    DUPLICATE_RECORDING_TOLERANCE_SECONDS = 5  #< max gap between two same-track local plays for them to count as
+    DUPLICATE_RECORDING_TOLERANCE_SECONDS = LISTENER_START_MATCH_TOLERANCE_SECONDS
+                                                #< max gap between two same-track local plays for them to count as
                                                 #  the same real listen recorded twice (once by the live listener,
                                                 #  once by Web API backfill) rather than a genuine replay. Proximity
                                                 #  alone is NOT proof - real exports contain skip-then-restart pairs
                                                 #  seconds apart - so reconciliation additionally requires the
-                                                #  cluster to span different sources (see _reconcileWithWebApiHistory)
-    BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS = 10  #< max gap between a backfill row's played_at (Spotify's
+                                                #  cluster to span different sources (see _reconcileWithWebApiHistory).
+                                                #  The SAME value the backfill prefilter uses for listener starts:
+                                                #  wider here re-creates the insert-then-delete loop of 2026-09-23
+    BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS = LISTENER_END_MATCH_TOLERANCE_SECONDS
+                                                     #< max gap between a backfill row's played_at (Spotify's
                                                      #  end-time reading) and a same-track listener row's
                                                      #  created_at for the two to count as the same listen. A
                                                      #  listener row is inserted at the track-change moment, so

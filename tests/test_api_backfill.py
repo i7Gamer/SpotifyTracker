@@ -588,10 +588,9 @@ class ApiBackfillTestCase(unittest.TestCase):
 
     @patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api")
     @patch("Database.Listeners.spotifyListener._refresh_spotify_access_token")
-    def test_check_web_api_backfill_reoffers_play_reported_as_end_time(self, mock_refresh, mock_fetch):
-        """Cache-only matching reoffers a duration-derived end-time reading.
-        Only an exact API-cache timestamp is a confirmation; a live-cache
-        duration guess cannot suppress a possible listen."""
+    def test_check_web_api_backfill_suppresses_play_reported_as_end_time(self, mock_refresh, mock_fetch):
+        """Cache-only matching: the live cache saw the play start, the API
+        reports start + duration - the same listen by end time, as before #38."""
         mock_refresh.return_value = "token123"
         true_start = "2026-07-13T10:00:00Z"
         end_time = "2026-07-13T10:03:00Z"  # true_start + 180s duration
@@ -616,7 +615,7 @@ class ApiBackfillTestCase(unittest.TestCase):
         with patch("Database.Listeners.spotifyListener.time.monotonic", return_value=_MONOTONIC_NOW):
             listener._checkWebApiBackfill(callback)
 
-        callback.assert_called_once()
+        callback.assert_not_called()
 
     @patch("Database.Listeners.spotifyListener._fetch_recently_played_from_web_api")
     @patch("Database.Listeners.spotifyListener._refresh_spotify_access_token")
@@ -1054,10 +1053,10 @@ class BackfillDatabaseDedupTestCase(unittest.TestCase):
 
         callback.assert_not_called()
 
-    def test_a_paused_plays_end_only_match_is_reoffered_for_page_claiming(self):
-        """An end-only listener match is ambiguous: C5b reoffers it so page
-        claiming can make the one-to-one decision instead of suppressing it in
-        the listener prefilter."""
+    def test_a_paused_plays_end_only_match_suppresses_the_copy(self):
+        """The listener's created_at is the paused play's observed end, so an
+        API stamp there is the same listen. #38 reoffered it as a possible
+        repeat; on live data (2026-09-23) that inserted 84 duplicates in 11h."""
         pauseSeconds = 186
         insertLagSeconds = 1  #< callback-to-insert latency observed live
         endTs = timeToInt(self.SECOND_PLAYED_AT)
@@ -1068,7 +1067,7 @@ class BackfillDatabaseDedupTestCase(unittest.TestCase):
 
         callback = self._runBackfill(MagicMock(return_value=recorded), items=items)
 
-        self.assertEqual(self._backfilledTrackIds(callback), ["track1"])
+        callback.assert_not_called()
 
     def test_a_recorded_end_outside_the_tolerance_does_not_suppress(self):
         """The end-time arm must stay a point match, not a window: a recorded
@@ -1210,9 +1209,10 @@ class BackfillCrossReleaseDedupTestCase(unittest.TestCase):
 
         callback.assert_not_called()
 
-    def test_the_end_time_reading_of_the_same_listener_play_is_reoffered(self):
-        """A listener row's duration-derived end-time match is ambiguous, so
-        page claiming must reoffer it instead of suppressing a possible repeat."""
+    def test_the_end_time_reading_of_the_same_listener_play_is_suppressed(self):
+        """start + duration is the same listen reported by end time, also under
+        a sibling release id. The page claim, not a reoffer, is what keeps a
+        back-to-back repeat (see test_backfill_matching's F1 case)."""
         playedAt = timeToInt(self.FIRST_PLAYED_AT)
         self._recordListenerPlay(playedAt)
         items = [{"track": {"id": self.WEB_API_ID, "duration_ms": self.DURATION_MS},
@@ -1220,7 +1220,7 @@ class BackfillCrossReleaseDedupTestCase(unittest.TestCase):
 
         callback = self._runAgainstRepo(items)
 
-        callback.assert_called_once()
+        callback.assert_not_called()
 
     def test_a_genuinely_missing_play_of_the_sibling_id_still_comes_through(self):
         """Aliasing must not turn one recorded listen into a blanket amnesty for

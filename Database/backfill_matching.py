@@ -12,6 +12,15 @@ from Database.utils import timeToInt
 
 
 WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS = 2
+LISTENER_START_MATCH_TOLERANCE_SECONDS = 5  #< max gap between a listener row's start and an API stamp for
+                                            #  the two to be one listen. Shared with reconciliation
+                                            #  (Database.DUPLICATE_RECORDING_TOLERANCE_SECONDS): a narrower
+                                            #  prefilter inserts what reconciliation then deletes, every poll
+                                            #  (live 2026-09-23: a 3.39s gap looped 36 times in 8h)
+LISTENER_END_MATCH_TOLERANCE_SECONDS = 10  #< max gap between an API stamp and a listener row's created_at,
+                                           #  its observed end, pauses included. A point match: live insert
+                                           #  lag is ~1s, anything minutes away is a different listen
+                                           #  (Database.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS)
 MILLISECONDS_PER_SECOND = 1_000
 _LISTENER_SOURCE_PREFIX = "listener_play"
 _LIVE_CACHE_SOURCE = "listener_cache"
@@ -82,15 +91,23 @@ class BackfillPage:
               toleranceSeconds: float | None = None,
               skipToleranceSeconds: float | None = None,
               startToleranceSeconds: float = WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
-              derivedStartToleranceSeconds: float | None = None):
+              derivedStartToleranceSeconds: float | None = None,
+              listenerEndArms: bool = True):
         """Return a confirmed candidate without consuming it.
 
         API rows use exact normalized timestamp identity, even when classified
-        as skips. Listener starts retain a tight clock tolerance; their duration
-        and observed end cannot distinguish a paused copy from a later repeat
-        missing its predecessor at the page boundary. Reoffer that ambiguity.
-        NULL/import/unknown rows retain the legacy guard window; only the page
-        prefilter opts into the old duration-derived start interpretation.
+        as skips. A non-skip listener row is one listen with the API stamp when
+        the stamp is its start (LISTENER_START_MATCH_TOLERANCE_SECONDS), its
+        observed end (created_at, pauses included) or its start plus the
+        track's duration - Spotify's played_at is documented as either. The
+        claim keeps that one-to-one: a row absorbs one stamp per page, so a
+        back-to-back repeat the listener missed still comes through.
+        #38 reoffered the end readings as possible repeats; live data refuted
+        it (2026-09-23: 84 of 95 backfill rows after the deploy were copies,
+        and at the API time the listener had seen the same track start in 0).
+        Reconciliation deletes, so it passes listenerEndArms=False and stays
+        start-only. NULL/import/unknown rows retain the legacy guard window;
+        only the page prefilter opts into their duration-derived start.
         """
         timestamp = float(playedAt)
         descriptor = self._events.get((trackId, timestamp), {})
@@ -125,10 +142,17 @@ class BackfillPage:
                 if distance <= skip_tolerance:
                     candidates.append((2, distance, str(row_id), row))
                 continue
-            if distance <= startToleranceSeconds:
+            is_listener = reason.startswith(_LISTENER_SOURCE_PREFIX) or reason == _LIVE_CACHE_SOURCE
+            start_tolerance = (max(startToleranceSeconds, LISTENER_START_MATCH_TOLERANCE_SECONDS)
+                               if is_listener else startToleranceSeconds)
+            if distance <= start_tolerance:
                 candidates.append((2, distance, str(row_id), row))
                 continue
-            if reason.startswith(_LISTENER_SOURCE_PREFIX) or reason == _LIVE_CACHE_SOURCE:
+            if is_listener:
+                if listenerEndArms:
+                    end_distance = self._listener_end_distance(row, timestamp, descriptor)
+                    if end_distance is not None:
+                        candidates.append((3, end_distance, str(row_id), row))
                 continue
             if toleranceSeconds is not None and distance <= toleranceSeconds:
                 candidates.append((3, distance, str(row_id), row))
@@ -141,6 +165,21 @@ class BackfillPage:
         if not candidates:
             return None
         return min(candidates, key=lambda candidate: candidate[:3])[3]
+
+    @staticmethod
+    def _listener_end_distance(row: Mapping, timestamp: float, descriptor: Mapping) -> float | None:
+        """How far the API stamp sits from this listener row's end, or None
+        when neither end reading lands within its tolerance."""
+        distances = []
+        observed_end = row.get("listenerCreatedAt")
+        if observed_end is not None:
+            distances.append((abs(timestamp - float(observed_end)), LISTENER_END_MATCH_TOLERANCE_SECONDS))
+        duration_ms = descriptor.get("durationMs") or 0
+        if duration_ms:
+            derived = abs(timestamp - duration_ms / MILLISECONDS_PER_SECOND - float(row["playedAt"]))
+            distances.append((derived, WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS))
+        within = [distance for distance, tolerance in distances if distance <= tolerance]
+        return min(within) if within else None
 
     def claim(self, row: Mapping, playedAt: float) -> bool:
         """Record a confirmed read or committed match; failed writes never call this."""

@@ -4,10 +4,16 @@
 import unittest
 
 from Database.backfill_matching import (
+    LISTENER_END_MATCH_TOLERANCE_SECONDS,
+    LISTENER_START_MATCH_TOLERANCE_SECONDS,
+    WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
     BackfillPage,
     cache_backfill_evidence,
     missing_backfill_items,
 )
+
+TRACK_SECONDS = 180
+PAUSE_SECONDS = 186  #< a mid-track pause: start-to-end exceeds the track's duration
 
 
 def _item(track_id, played_at, duration_ms=180_000):
@@ -57,34 +63,79 @@ class TestBackfillPage(unittest.TestCase):
         self.assertFalse(page.claim(row, 101))
         self.assertIsNone(page.match("track", 101, [row]))
 
-    def test_listener_end_only_match_is_reoffered(self):
-        page = BackfillPage([_item("track", 200)])
-        row = {
-            "rowId": 7,
-            "trackId": "track",
-            "aliases": {"track"},
-            "playedAt": 100,
-            "listenerCreatedAt": 200,
-            "createdReason": "listener_play (user: alice)",
-            "isSkip": False,
-        }
+    @staticmethod
+    def _listenerRow(start, observedEnd=None, source="listener_play (user: alice)"):
+        return {"rowId": 7, "trackId": "track", "aliases": {"track"}, "playedAt": start,
+                "listenerCreatedAt": observedEnd, "createdReason": source, "isSkip": False}
 
-        self.assertIsNone(page.match("track", 200, [row]))
+    def test_listener_end_only_match_suppresses_the_end_time_reading(self):
+        """A paused play: its API end-time stamp matches only the listener's
+        observed end (created_at). #38 reoffered this as a possible repeat;
+        live data refuted that (2026-09-23: 84 of 95 backfill rows after the
+        deploy were such copies, and in 0 of them had the listener seen the
+        same track start at the API time)."""
+        start = 100
+        end = start + TRACK_SECONDS + PAUSE_SECONDS
+        page = BackfillPage([_item("track", end)])
+        row = self._listenerRow(start, observedEnd=end - 1)
 
-    def test_start_tolerance_can_be_explicitly_widened_for_reconciliation(self):
-        page = BackfillPage([_item("track", 104)])
-        row = {
-            "rowId": 7,
-            "trackId": "track",
-            "aliases": {"track"},
-            "playedAt": 100,
-            "listenerCreatedAt": None,
-            "createdReason": "listener_play (user: alice)",
-            "isSkip": False,
-        }
+        self.assertIs(page.match("track", end, [row]), row)
 
-        self.assertIsNone(page.match("track", 104, [row]))
-        self.assertIs(page.match("track", 104, [row], startToleranceSeconds=5), row)
+    def test_listener_end_arm_is_a_point_match(self):
+        start = 100
+        end = start + TRACK_SECONDS + PAUSE_SECONDS
+        page = BackfillPage([_item("track", end)])
+        inside = self._listenerRow(start, observedEnd=end - LISTENER_END_MATCH_TOLERANCE_SECONDS)
+        outside = self._listenerRow(start, observedEnd=end - LISTENER_END_MATCH_TOLERANCE_SECONDS - 1)
+
+        self.assertIs(page.match("track", end, [inside]), inside)
+        self.assertIsNone(page.match("track", end, [outside]))
+
+    def test_listener_duration_derived_start_suppresses_the_end_time_reading(self):
+        start = 100
+        apiTime = start + TRACK_SECONDS
+        page = BackfillPage([_item("track", apiTime)])
+        inside = self._listenerRow(start + WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS)
+        outside = self._listenerRow(start + WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS + 1)
+
+        self.assertIs(page.match("track", apiTime, [inside]), inside)
+        self.assertIsNone(page.match("track", apiTime, [outside]))
+
+    def test_listener_start_tolerance_is_shared_with_reconciliation_by_default(self):
+        """Live 2026-09-23: a listener start 3.39s from the API stamp was
+        'missing' to the 2s prefilter yet a 'duplicate' to 5s reconciliation,
+        so it was inserted and deleted every poll."""
+        page = BackfillPage([_item("track", 103.39)])
+        row = self._listenerRow(100)
+        tooFar = self._listenerRow(103.39 - LISTENER_START_MATCH_TOLERANCE_SECONDS - 0.01)
+
+        self.assertIs(page.match("track", 103.39, [row]), row)
+        self.assertIsNone(page.match("track", 103.39, [tooFar]))
+
+    def test_reconciliation_can_opt_out_of_listener_end_arms(self):
+        start = 100
+        end = start + TRACK_SECONDS + PAUSE_SECONDS
+        page = BackfillPage([_item("track", end), _item("track", start + TRACK_SECONDS)])
+        paused = self._listenerRow(start, observedEnd=end)
+
+        self.assertIsNone(page.match("track", end, [paused], listenerEndArms=False))
+        self.assertIsNone(page.match("track", start + TRACK_SECONDS, [paused], listenerEndArms=False))
+
+    def test_reconciliation_never_deletes_what_the_prefilter_would_insert(self):
+        """The loop invariant: if reconciliation would call a backfill copy a
+        duplicate of a listener row, the prefilter must already have
+        suppressed it - otherwise every poll inserts and deletes it again."""
+        reconcileTolerance = LISTENER_START_MATCH_TOLERANCE_SECONDS
+        for offset in (0, 1.9, 2.1, 3.39, 4.9, 5.0, 5.1, 10):
+            with self.subTest(offset=offset):
+                page = BackfillPage([_item("track", 100 + offset)])
+                row = self._listenerRow(100, observedEnd=100 + TRACK_SECONDS)
+                reconciled = page.match("track", 100 + offset, [row], toleranceSeconds=reconcileTolerance,
+                                        startToleranceSeconds=reconcileTolerance, listenerEndArms=False)
+                prefiltered = page.match("track", 100 + offset, [row],
+                                         derivedStartToleranceSeconds=WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS)
+                if reconciled is not None:
+                    self.assertIsNotNone(prefiltered)
 
     def test_non_listener_and_skip_matching_remain_explicit(self):
         page = BackfillPage([_item("track", 250), _item("track", 110)])
@@ -161,10 +212,25 @@ class TestBackfillClaimEdges(unittest.TestCase):
                 self.assertIsNone(page.match("track", 190, [row], toleranceSeconds=150,
                                              skipToleranceSeconds=20))
 
-    def test_live_cache_end_only_match_is_reoffered(self):
-        page = [_item("track", 280)]
+    def test_live_cache_duration_derived_match_suppresses(self):
+        page = [_item("track", 100 + TRACK_SECONDS)]
         evidence = cache_backfill_evidence([_item("track", 100)], [])
-        self.assertEqual(len(missing_backfill_items(page, evidence)), 1)
+        self.assertEqual(missing_backfill_items(page, evidence), [])
+
+    def test_one_listener_row_absorbs_at_most_one_end_time_reading(self):
+        """F1 (#38's reason for dropping the end arms), kept fixed by the
+        claim: back-to-back repeats reported by end time. The listener saw
+        only the first; the second is a real play and must come through."""
+        start = 100
+        firstEnd = start + TRACK_SECONDS
+        secondEnd = firstEnd + TRACK_SECONDS
+        row = {"rowId": 7, "trackId": "track", "aliases": {"track"}, "playedAt": start,
+               "listenerCreatedAt": firstEnd, "createdReason": "listener_play", "isSkip": False}
+        items = [_item("track", secondEnd), _item("track", firstEnd)]
+        for ordered in (items, list(reversed(items))):
+            with self.subTest(order=[item["played_at"] for item in ordered]):
+                missing = missing_backfill_items(ordered, [row])
+                self.assertEqual([item["played_at"] for item in missing], [secondEnd])
 
     def test_duplicate_live_cache_observations_share_one_logical_claim(self):
         item = _item("track", 100)
