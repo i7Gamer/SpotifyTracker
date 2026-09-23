@@ -14,6 +14,7 @@ from Database.backfill_matching import (
 
 TRACK_SECONDS = 180
 PAUSE_SECONDS = 186  #< a mid-track pause: start-to-end exceeds the track's duration
+CLOCK_SKEW_SECONDS = 1  #< listener vs API clock: inside every tolerance, never an exact match
 
 
 def _item(track_id, played_at, duration_ms=180_000):
@@ -222,15 +223,19 @@ class TestBackfillClaimEdges(unittest.TestCase):
         claim: back-to-back repeats reported by end time. The listener saw
         only the first; the second is a real play and must come through."""
         start = 100
-        firstEnd = start + TRACK_SECONDS
-        secondEnd = firstEnd + TRACK_SECONDS
+        end = start + TRACK_SECONDS
         row = {"rowId": 7, "trackId": "track", "aliases": {"track"}, "playedAt": start,
-               "listenerCreatedAt": firstEnd, "createdReason": "listener_play", "isSkip": False}
-        items = [_item("track", secondEnd), _item("track", firstEnd)]
+               "listenerCreatedAt": end, "createdReason": "listener_play", "isSkip": False}
+        # Two API plays: one stamped at the row's start, one at its end. Each
+        # alone would match the row; two stamps are two plays, so only the
+        # claim decides which one the row absorbs.
+        # Skewed off the row by a clock second: an exact stamp is reserved by
+        # its own rule, so only an inexact pair exercises the claim.
+        items = [_item("track", end + CLOCK_SKEW_SECONDS), _item("track", start + CLOCK_SKEW_SECONDS)]
         for ordered in (items, list(reversed(items))):
             with self.subTest(order=[item["played_at"] for item in ordered]):
                 missing = missing_backfill_items(ordered, [row])
-                self.assertEqual([item["played_at"] for item in missing], [secondEnd])
+                self.assertEqual([item["played_at"] for item in missing], [end + CLOCK_SKEW_SECONDS])
 
     def test_duplicate_live_cache_observations_share_one_logical_claim(self):
         item = _item("track", 100)

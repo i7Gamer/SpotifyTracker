@@ -289,14 +289,16 @@ class TestWebApiBackfillSQLiteContract(DatabaseTestCase):
         self.assertEqual(len(_rows(self.db)), 1)
 
     def test_back_to_back_repeat_by_end_time_survives_page_replay_and_reconciliation(self):
-        """F1 end to end: the listener saw the first of two consecutive plays;
-        the API reports both by end time. One row absorbs one stamp."""
+        """F1 end to end: the listener saw the first of two consecutive plays.
+        The API stamps sit at that row's start and at its end - each alone
+        matches the row, so only the claim keeps the second play."""
+        skewSeconds = 1  #< off by a clock second: an exact stamp is reserved by its own rule
         _seed_listener_play(self.db, "track", BASE_TS, BASE_TS + 180)
-        items = [_api_item("track", BASE_TS + 360), _api_item("track", BASE_TS + 180)]
+        items = [_api_item("track", BASE_TS + 180 + skewSeconds), _api_item("track", BASE_TS + skewSeconds)]
 
         for _ in range(2):
             _run_listener_page(self.db, items)
-            self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS, BASE_TS + 360])
+            self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS, BASE_TS + 180 + skewSeconds])
         _run_listener_page(self.db, list(reversed(items)))
         self.assertEqual(len(_rows(self.db)), 2)
 
