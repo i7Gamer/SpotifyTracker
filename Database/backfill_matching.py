@@ -79,6 +79,9 @@ class BackfillPage:
         self._events: dict[tuple[str, float], dict] = {}
         self._times_by_track: dict[str, set[float]] = {}
         self._claims: dict[object, float] = {}
+        #< False once the page's own evidence lookup failed: the insert guard
+        #  is then the only check and must read listener ends itself
+        self.evidenceComplete = True
         for item in items:
             track_id = _item_track_id(item)
             timestamp = _item_timestamp(item)

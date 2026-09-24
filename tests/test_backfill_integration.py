@@ -416,3 +416,44 @@ class TestBackfillPageWindowReachesEveryMatchArm(DatabaseTestCase):
         self.db.process_backfill_page([_api_item("track", BASE_TS)])
 
         self.db._addToDatabaseFromListener.assert_not_called()
+
+
+class TestInsertGuardAfterAFailedPageLookup(DatabaseTestCase):
+    """The insert guard reads evidence by played_at only (fast, indexed), so a
+    long-paused listener play - start more than duration + 60s before the
+    API's end stamp - is invisible to it. That is fine while the page
+    prefilter, which also reads listener ends, has run; after a failed
+    initial lookup the guard is the only check (Copilot on #40)."""
+
+    PAUSE_SECONDS = 186  #< well past the guard's 60s margin
+
+    def setUp(self):
+        super().setUp()
+        self.db = self._makeDb({}, [], username="alice")
+        self.db.saveImagesFromTrack = MagicMock()
+        self.db.updatePlaylists = MagicMock()
+
+    def test_a_long_paused_listener_play_is_not_duplicated_when_the_page_lookup_fails(self):
+        _seed_listener_play(self.db, "track", BASE_TS - 180 - self.PAUSE_SECONDS, BASE_TS + 1)
+
+        with patch.object(self.db.repo, "getTrackPlayTimesInRange",
+                          side_effect=RuntimeError("synthetic initial query failure")):
+            self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.assertEqual(len(_rows(self.db)), 1)
+
+    def test_the_guard_stays_on_the_indexed_range_when_the_page_lookup_succeeded(self):
+        """The created_at arm scans the user's whole history (measured ~25ms
+        per insert on a 100k-play user, under the write reservation)."""
+        guardLookups = []
+        original = self.db.repo._getTrackPlayEvidence
+
+        def spy(*args, includeListenerEnds=False, **kwargs):
+            guardLookups.append(includeListenerEnds)
+            return original(*args, includeListenerEnds=includeListenerEnds, **kwargs)
+
+        with patch.object(self.db.repo, "_getTrackPlayEvidence", side_effect=spy):
+            self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.assertEqual(len(_rows(self.db)), 1)
+        self.assertEqual(guardLookups, [True, False])   #< page prefilter, then the insert guard

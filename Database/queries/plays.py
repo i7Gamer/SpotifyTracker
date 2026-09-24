@@ -205,9 +205,9 @@ class PlayQueries:
 
         ``listenerCreatedAt`` is retained as evidence only for real listener
         plays, whose insert observes the end; other sources and skips get
-        None. The query still includes listener ends within the window, but
-        the matcher deliberately reoffers end-only ambiguity instead of using
-        it to suppress a possible repeat. Each physical row is returned once;
+        None. The query also reaches listener rows by that end, since a paused
+        play can start far before the window, and the matcher suppresses on it
+        (see BackfillPage.match). Each physical row is returned once;
         its aliases describe alternative release IDs for that same row."""
         return self._getTrackPlayEvidence(username, startTs, endTs, page=page, includeListenerEnds=True)
 
@@ -217,10 +217,9 @@ class PlayQueries:
         timeClause = "p.played_at BETWEEN ? AND ?"
         params = [username, startTs, endTs]
         if includeListenerEnds:
-            # The initial page snapshot retains observed ends as evidence.
-            # Atomic guards cannot use end-only matches, so keep their frequent
-            # lookups on the indexed username/played_at range instead of
-            # scanning the user's history for an unindexed created_at arm.
+            # The created_at arm is unindexed: it scans the user's history
+            # (~25ms on a 100k-play user). The page lookup pays it once; the
+            # per-insert guard only when that lookup failed (findMatchingBackfillPlay).
             timeClause += (" OR (p.created_reason LIKE 'listener_play%' AND p.is_skip=0 "
                            "AND p.created_at BETWEEN ? AND ?)")
             params += [startTs, endTs]
@@ -262,9 +261,15 @@ class PlayQueries:
         Each physical row carries its stable ``rowId`` and an alias set; the
         page matcher claims the physical row once rather than duplicating it
         once per alias.
+
+        Reads by played_at only while the page's own lookup succeeded: that
+        lookup already checked listener ends, and this runs per insert under
+        the write reservation. After it failed, this is the only check, so a
+        long-paused play - start beyond this reach - is found by its end.
         """
         reach = max(toleranceSeconds, skipToleranceSeconds or 0)
-        rows = self._getTrackPlayEvidence(username, playedAt - reach, playedAt + reach, page=page)
+        rows = self._getTrackPlayEvidence(username, playedAt - reach, playedAt + reach, page=page,
+                                          includeListenerEnds=not page.evidenceComplete)
         return page.match(trackId, playedAt, rows,
                           toleranceSeconds=toleranceSeconds,
                           skipToleranceSeconds=skipToleranceSeconds)
