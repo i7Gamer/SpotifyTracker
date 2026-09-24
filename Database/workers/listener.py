@@ -584,7 +584,8 @@ class ListenerMixin:
                         match = page.match(
                             trackId, timestamp, evidence,
                             toleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS,
-                            startToleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS)
+                            startToleranceSeconds=self.DUPLICATE_RECORDING_TOLERANCE_SECONDS,
+                            listenerEndArms=False)   #< deleting stays start-only
                         if match is not None and page.claim(match, timestamp):
                             matchedTimes.add(timestamp)
                     # Stored API events reserve primary rows too, but only
@@ -601,8 +602,11 @@ class ListenerMixin:
                 if deletedCount:
                     # Removing an early listen can move discoveries in later
                     # years. Invalidate with the deletes so an in-flight
-                    # calculation cannot save its pre-cleanup snapshot.
-                    self.repo._bumpWrappedGeneration(conn)
+                    # calculation cannot save its pre-cleanup snapshot. Only this
+                    # user's plays changed, so only this user's stamp moves: the
+                    # instance-wide one discarded every other user's in-flight
+                    # Wrapped on each cleanup.
+                    self.repo._bumpUserWrappedGeneration(conn, self.user)
                     self.repo._deleteUserWrappedFromYear(conn, self.user, min(deletedYears))
                     self.repo.commit()
                     _dbmod.logger.info(

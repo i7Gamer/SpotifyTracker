@@ -38,3 +38,8 @@ pytest-cov==7.1.0
 # It was already installed here as somebody else's transitive dependency, which
 # is exactly why it needed declaring: nothing guaranteed a fresh clone got it.
 beautifulsoup4==4.15.0
+# Pinned for the same reason, and it already happened: soupsieve 2.10
+# answers `.card:has(~ *)` as false for the last of three cards even with a
+# section after it, so the page-gap guard failed on an unchanged main
+# (CI, 2026-09-24). 2.9.2 and browsers agree the card has a following sibling.
+soupsieve==2.9.2

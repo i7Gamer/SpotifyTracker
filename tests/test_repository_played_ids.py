@@ -16,7 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from Database.repository import Repository
-from Database.backfill_matching import BackfillPage
+from Database.backfill_matching import LISTENER_MAX_PLAY_SPAN_SECONDS, BackfillPage
 
 
 def _track(trackId, artistIds, albumId):
@@ -625,7 +625,9 @@ class TestPlayTimesInRangeAliases(unittest.TestCase):
         history_count = 10_000
         progress_step = 100
         max_progress_callbacks = 20
-        history_start = self.base - history_count * 2
+        #< before the listener-end lookup's span bound: inside it, the guard
+        #  legitimately reads rows (at most LISTENER_MAX_PLAY_SPAN_SECONDS of them)
+        history_start = self.base - LISTENER_MAX_PLAY_SPAN_SECONDS - history_count * 2
         self._upsert("track")
         conn = self.repo.connection()
         conn.executemany(

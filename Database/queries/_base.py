@@ -155,6 +155,10 @@ TRACK_MERGE_SETTING_KEY = "track_merge_enabled"
 # Bumped by every wrapped-cache invalidation; an in-flight recalculation that
 # started under an older value discards its save. See deleteAllWrapped.
 WRAPPED_INVALIDATION_GENERATION_KEY = "wrapped_invalidation_generation"
+# Per-user counterpart ("<prefix><username>"), for an invalidation that can only
+# move ONE user's figures. A recalculation checks the sum of both counters; see
+# getWrappedInvalidationGeneration.
+WRAPPED_USER_INVALIDATION_GENERATION_KEY_PREFIX = "wrapped_invalidation_generation:"
 # How far either side of a UTC year boundary a play still counts as possibly
 # belonging to the neighbouring year, for deleteCachedWrappedForTracks. A
 # Wrapped year is bucketed in the USER's timezone (the worker builds its bounds

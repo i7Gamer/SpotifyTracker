@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from Database.Formatters.spotifyClient import Client
+from Database.backfill_matching import LISTENER_MAX_PLAY_SPAN_SECONDS
 from Database.Listeners.spotifyListener import Listener
 from Database.database import Database
 from conftest import DatabaseTestCase
@@ -276,14 +277,45 @@ class TestWebApiBackfillSQLiteContract(DatabaseTestCase):
         _run_listener_page(self.db, items)
         self.assertEqual([row["track_id"] for row in _rows(self.db)], ["retry-me", "already-ok"])
 
-    def test_listener_end_boundary_preserves_possible_api_repeat_and_replay_is_idempotent(self):
+    def test_listener_end_time_reading_is_one_play_and_replay_is_idempotent(self):
+        """#38 kept this as a possible repeat (2 rows). Live 2026-09-23: 84 such
+        copies in 11h, and the listener had seen the same track start at the
+        API time in none of them - it is the same listen, by end time."""
         _seed_listener_play(self.db, "listener-boundary", BASE_TS + 180, BASE_TS + 360)
         item = _api_item("api-boundary", BASE_TS + 360)
 
         _run_listener_page(self.db, [item])
-        self.assertEqual(len(_rows(self.db)), 2)
+        self.assertEqual(len(_rows(self.db)), 1)
         _run_listener_page(self.db, [item])
+        self.assertEqual(len(_rows(self.db)), 1)
+
+    def test_back_to_back_repeat_by_end_time_survives_page_replay_and_reconciliation(self):
+        """F1 end to end: the listener saw the first of two consecutive plays.
+        The API stamps sit at that row's start and at its end - each alone
+        matches the row, so only the claim keeps the second play."""
+        skewSeconds = 1  #< off by a clock second: an exact stamp is reserved by its own rule
+        _seed_listener_play(self.db, "track", BASE_TS, BASE_TS + 180)
+        items = [_api_item("track", BASE_TS + 180 + skewSeconds), _api_item("track", BASE_TS + skewSeconds)]
+
+        for _ in range(2):
+            _run_listener_page(self.db, items)
+            self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS, BASE_TS + 180 + skewSeconds])
+        _run_listener_page(self.db, list(reversed(items)))
         self.assertEqual(len(_rows(self.db)), 2)
+
+    def test_listener_start_a_few_seconds_off_is_neither_inserted_nor_churned(self):
+        """Live 2026-09-23: a listener start 3.39s from the API stamp was
+        inserted by the 2s prefilter and deleted by 5s reconciliation on
+        every poll, wiping the user's Wrapped cache each time."""
+        offsetSeconds = 3
+        _seed_listener_play(self.db, "track", BASE_TS, BASE_TS + 180)
+        item = _api_item("track", BASE_TS + offsetSeconds)
+
+        with patch.object(self.db.repo, "_deleteUserWrappedFromYear") as wrappedDrop:
+            for _ in range(2):
+                _run_listener_page(self.db, [item])
+                self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS])
+        wrappedDrop.assert_not_called()
 
     def test_failed_initial_query_reoffers_through_atomic_guard_without_losing_repeat(self):
         _seed_listener_play(self.db, "physical", BASE_TS + 2, BASE_TS + 100)
@@ -353,3 +385,83 @@ class TestWebApiBackfillSQLiteContract(DatabaseTestCase):
         self.db.repo.commit()
         self.db._reconcileWithWebApiHistory([_api_item("unrelated", BASE_TS, isrc="DIFFERENT")])
         self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS, BASE_TS + 1])
+
+
+class TestBackfillPageWindowReachesEveryMatchArm(DatabaseTestCase):
+    """The prefilter can only suppress a row its range query returns. With
+    the window padded by the 2s start tolerance alone, a listener row the
+    matcher accepts at 3-5s (start) or up to 10s (observed end) past the
+    NEWEST stamp was never read (Copilot on #40). The insert guard's wider
+    lookup still caught it, but only after a reoffer and a catalog write."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = self._makeDb({}, [], username="alice")
+        self.db.saveImagesFromTrack = MagicMock()
+        self.db.updatePlaylists = MagicMock()
+        self.db._addToDatabaseFromListener = MagicMock()
+
+    def test_listener_start_just_after_the_newest_stamp_is_suppressed_by_the_prefilter(self):
+        startLagSeconds = 4  #< inside the 5s listener-start tolerance, outside the old 2s padding
+        _seed_listener_play(self.db, "track", BASE_TS + startLagSeconds, BASE_TS + startLagSeconds + 180)
+
+        self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.db._addToDatabaseFromListener.assert_not_called()
+
+    def test_listener_end_just_after_the_newest_stamp_is_suppressed_by_the_prefilter(self):
+        pauseSeconds = 186
+        endLagSeconds = 8  #< inside the 10s observed-end tolerance, outside the old 2s padding
+        _seed_listener_play(self.db, "track", BASE_TS - 180 - pauseSeconds, BASE_TS + endLagSeconds)
+
+        self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.db._addToDatabaseFromListener.assert_not_called()
+
+
+
+class TestInsertGuardReadsListenerEnds(DatabaseTestCase):
+    """The insert guard is the transactional recheck, so it must reach a
+    listener row by its observed end whatever the page lookup saw: that
+    lookup can fail, and a row can commit between it and the guard (Copilot
+    on #40). A long-paused play starts outside the guard's played_at reach."""
+
+    PAUSE_SECONDS = 186  #< well past the guard's duration + 60s reach
+
+    def setUp(self):
+        super().setUp()
+        self.db = self._makeDb({}, [], username="alice")
+        self.db.saveImagesFromTrack = MagicMock()
+        self.db.updatePlaylists = MagicMock()
+
+    def _seedPausedPlay(self, pauseSeconds=PAUSE_SECONDS):
+        _seed_listener_play(self.db, "track", BASE_TS - 180 - pauseSeconds, BASE_TS + 1)
+
+    def test_a_long_paused_listener_play_is_not_duplicated_when_the_page_lookup_fails(self):
+        self._seedPausedPlay()
+
+        with patch.object(self.db.repo, "getTrackPlayTimesInRange",
+                          side_effect=RuntimeError("synthetic initial query failure")):
+            self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.assertEqual(len(_rows(self.db)), 1)
+
+    def test_a_listener_row_committed_after_the_page_lookup_is_not_duplicated(self):
+        """The page lookup ran before the row existed and succeeded empty."""
+        self._seedPausedPlay()
+
+        with patch.object(self.db.repo, "getTrackPlayTimesInRange", return_value=[]):
+            self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.assertEqual(len(_rows(self.db)), 1)
+
+    def test_the_end_lookup_is_bounded_to_the_longest_listener_play_span(self):
+        """The bound is what keeps the created_at arm on the (username,
+        played_at) index instead of scanning the user's history per insert."""
+        tooLongAgo = LISTENER_MAX_PLAY_SPAN_SECONDS + 180
+        self._seedPausedPlay(pauseSeconds=tooLongAgo)
+
+        with patch.object(self.db.repo, "getTrackPlayTimesInRange", return_value=[]):
+            self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.assertEqual(len(_rows(self.db)), 2)

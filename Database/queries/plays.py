@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from Database.backfill_matching import LISTENER_MAX_PLAY_SPAN_SECONDS
 from Database.queries._base import (
     ALBUM_SORT_COLUMNS,
     ARTIST_SORT_COLUMNS,
@@ -205,9 +206,9 @@ class PlayQueries:
 
         ``listenerCreatedAt`` is retained as evidence only for real listener
         plays, whose insert observes the end; other sources and skips get
-        None. The query still includes listener ends within the window, but
-        the matcher deliberately reoffers end-only ambiguity instead of using
-        it to suppress a possible repeat. Each physical row is returned once;
+        None. The query also reaches listener rows by that end, since a paused
+        play can start far before the window, and the matcher suppresses on it
+        (see BackfillPage.match). Each physical row is returned once;
         its aliases describe alternative release IDs for that same row."""
         return self._getTrackPlayEvidence(username, startTs, endTs, page=page, includeListenerEnds=True)
 
@@ -217,13 +218,15 @@ class PlayQueries:
         timeClause = "p.played_at BETWEEN ? AND ?"
         params = [username, startTs, endTs]
         if includeListenerEnds:
-            # The initial page snapshot retains observed ends as evidence.
-            # Atomic guards cannot use end-only matches, so keep their frequent
-            # lookups on the indexed username/played_at range instead of
-            # scanning the user's history for an unindexed created_at arm.
-            timeClause += (" OR (p.created_reason LIKE 'listener_play%' AND p.is_skip=0 "
-                           "AND p.created_at BETWEEN ? AND ?)")
-            params += [startTs, endTs]
+            # A listener row is reached by its observed end too - a paused play
+            # starts far before the window. The outer played_at range keeps the
+            # created_at arm on the (username, played_at) index; unbounded, it
+            # scanned the user's whole history (~28ms per call on 100k plays).
+            timeClause = (f"p.played_at BETWEEN ? AND ? AND ({timeClause}"
+                          " OR (p.created_reason LIKE 'listener_play%' AND p.is_skip=0"
+                          " AND p.created_at BETWEEN ? AND ?))")
+            params = [username, startTs - LISTENER_MAX_PLAY_SPAN_SECONDS, endTs, startTs, endTs,
+                      startTs, endTs]
         rows = conn.execute(
             "SELECT p.id AS row_id, p.track_id, p.played_at, p.created_reason, p.is_skip, "
             "CASE WHEN p.created_reason LIKE 'listener_play%' AND p.is_skip=0 THEN p.created_at "
@@ -262,9 +265,14 @@ class PlayQueries:
         Each physical row carries its stable ``rowId`` and an alias set; the
         page matcher claims the physical row once rather than duplicating it
         once per alias.
+
+        Reaches listener rows by their observed end as well: the page lookup
+        may have failed, or a long-paused play - start beyond this reach - may
+        have committed since it ran, and this recheck is the last one.
         """
         reach = max(toleranceSeconds, skipToleranceSeconds or 0)
-        rows = self._getTrackPlayEvidence(username, playedAt - reach, playedAt + reach, page=page)
+        rows = self._getTrackPlayEvidence(username, playedAt - reach, playedAt + reach, page=page,
+                                          includeListenerEnds=True)
         return page.match(trackId, playedAt, rows,
                           toleranceSeconds=toleranceSeconds,
                           skipToleranceSeconds=skipToleranceSeconds)

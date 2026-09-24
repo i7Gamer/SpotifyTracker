@@ -1471,12 +1471,15 @@ class TestFindMatchingBackfillPlay(RepositoryTestCase):
                                  is_skip=is_skip)
         self.repo.commit()
 
-    def test_listener_observed_end_without_start_proof_is_reoffered(self):
-        """An end-only match cannot distinguish a paused copy from a repeat
-        whose earlier API event has fallen out of the finite page."""
+    def test_listener_observed_end_without_start_proof_suppresses(self):
+        """A long-paused play: its start is far outside the guard's reach, its
+        observed end (created_at) is the API stamp. #38 reoffered this; live
+        data showed such stamps are the same listen (2026-09-23), and the guard
+        is the last check - the page lookup may have failed or run before this
+        row committed."""
         self._insertPlayCreatedAt("t2", 2000.0, 5000.0, "listener_play (user: alice)")
 
-        self.assertFalse(self._match("alice", "t2", 5000.0, 100))
+        self.assertTrue(self._match("alice", "t2", 5000.0, 100))
 
     def test_non_listener_insert_time_is_not_playback_evidence(self):
         """An import or backfill row's created_at is the import/poll moment,
@@ -1485,11 +1488,11 @@ class TestFindMatchingBackfillPlay(RepositoryTestCase):
 
         self.assertFalse(self._match("alice", "t2", 5000.0, 100))
 
-    def test_listener_end_clock_tolerance_cannot_prove_a_copy(self):
+    def test_listener_end_match_is_a_point_match(self):
         self._insertPlayCreatedAt("t2", 2000.0, 5000.0, "listener_play (user: alice)")
 
         self.assertFalse(self._match("alice", "t2", 5011.0, 100))
-        self.assertFalse(self._match("alice", "t2", 5010.0, 100))
+        self.assertTrue(self._match("alice", "t2", 5010.0, 100))
 
     def test_skip_tolerance_matches_a_skip_by_its_played_at(self):
         """2026-08-14: the listener recorded a 3.6s skip at 16:29:06, the Web
