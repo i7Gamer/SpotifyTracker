@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from Database.Formatters.spotifyClient import Client
+from Database.backfill_matching import LISTENER_MAX_PLAY_SPAN_SECONDS
 from Database.Listeners.spotifyListener import Listener
 from Database.database import Database
 from conftest import DatabaseTestCase
@@ -418,14 +419,14 @@ class TestBackfillPageWindowReachesEveryMatchArm(DatabaseTestCase):
         self.db._addToDatabaseFromListener.assert_not_called()
 
 
-class TestInsertGuardAfterAFailedPageLookup(DatabaseTestCase):
-    """The insert guard reads evidence by played_at only (fast, indexed), so a
-    long-paused listener play - start more than duration + 60s before the
-    API's end stamp - is invisible to it. That is fine while the page
-    prefilter, which also reads listener ends, has run; after a failed
-    initial lookup the guard is the only check (Copilot on #40)."""
 
-    PAUSE_SECONDS = 186  #< well past the guard's 60s margin
+class TestInsertGuardReadsListenerEnds(DatabaseTestCase):
+    """The insert guard is the transactional recheck, so it must reach a
+    listener row by its observed end whatever the page lookup saw: that
+    lookup can fail, and a row can commit between it and the guard (Copilot
+    on #40). A long-paused play starts outside the guard's played_at reach."""
+
+    PAUSE_SECONDS = 186  #< well past the guard's duration + 60s reach
 
     def setUp(self):
         super().setUp()
@@ -433,8 +434,11 @@ class TestInsertGuardAfterAFailedPageLookup(DatabaseTestCase):
         self.db.saveImagesFromTrack = MagicMock()
         self.db.updatePlaylists = MagicMock()
 
+    def _seedPausedPlay(self, pauseSeconds=PAUSE_SECONDS):
+        _seed_listener_play(self.db, "track", BASE_TS - 180 - pauseSeconds, BASE_TS + 1)
+
     def test_a_long_paused_listener_play_is_not_duplicated_when_the_page_lookup_fails(self):
-        _seed_listener_play(self.db, "track", BASE_TS - 180 - self.PAUSE_SECONDS, BASE_TS + 1)
+        self._seedPausedPlay()
 
         with patch.object(self.db.repo, "getTrackPlayTimesInRange",
                           side_effect=RuntimeError("synthetic initial query failure")):
@@ -442,18 +446,22 @@ class TestInsertGuardAfterAFailedPageLookup(DatabaseTestCase):
 
         self.assertEqual(len(_rows(self.db)), 1)
 
-    def test_the_guard_stays_on_the_indexed_range_when_the_page_lookup_succeeded(self):
-        """The created_at arm scans the user's whole history (measured ~25ms
-        per insert on a 100k-play user, under the write reservation)."""
-        guardLookups = []
-        original = self.db.repo._getTrackPlayEvidence
+    def test_a_listener_row_committed_after_the_page_lookup_is_not_duplicated(self):
+        """The page lookup ran before the row existed and succeeded empty."""
+        self._seedPausedPlay()
 
-        def spy(*args, includeListenerEnds=False, **kwargs):
-            guardLookups.append(includeListenerEnds)
-            return original(*args, includeListenerEnds=includeListenerEnds, **kwargs)
-
-        with patch.object(self.db.repo, "_getTrackPlayEvidence", side_effect=spy):
+        with patch.object(self.db.repo, "getTrackPlayTimesInRange", return_value=[]):
             self.db.process_backfill_page([_api_item("track", BASE_TS)])
 
         self.assertEqual(len(_rows(self.db)), 1)
-        self.assertEqual(guardLookups, [True, False])   #< page prefilter, then the insert guard
+
+    def test_the_end_lookup_is_bounded_to_the_longest_listener_play_span(self):
+        """The bound is what keeps the created_at arm on the (username,
+        played_at) index instead of scanning the user's history per insert."""
+        tooLongAgo = LISTENER_MAX_PLAY_SPAN_SECONDS + 180
+        self._seedPausedPlay(pauseSeconds=tooLongAgo)
+
+        with patch.object(self.db.repo, "getTrackPlayTimesInRange", return_value=[]):
+            self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.assertEqual(len(_rows(self.db)), 2)

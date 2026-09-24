@@ -21,6 +21,13 @@ LISTENER_END_MATCH_TOLERANCE_SECONDS = 10  #< max gap between an API stamp and a
                                            #  its observed end, pauses included. A point match: live insert
                                            #  lag is ~1s, anything minutes away is a different listen
                                            #  (Database.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS)
+LISTENER_MAX_PLAY_SPAN_SECONDS = 2 * 24 * 60 * 60  #< how far a listener row's observed end (created_at)
+                                                   #  may trail its start and still be searched for by it.
+                                                   #  Bounds the created_at lookup to the (username,
+                                                   #  played_at) index: ~0.04ms instead of ~28ms scanning
+                                                   #  a 100k-play history. Live 2026-09-23: 99% of listener
+                                                   #  rows span under 15h, 99.9% under 59h - the tail is
+                                                   #  late flushes, whose created_at is no play end anyway
 BACKFILL_PAGE_WINDOW_PADDING_SECONDS = max(WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
                                            LISTENER_START_MATCH_TOLERANCE_SECONDS,
                                            LISTENER_END_MATCH_TOLERANCE_SECONDS)
@@ -79,9 +86,6 @@ class BackfillPage:
         self._events: dict[tuple[str, float], dict] = {}
         self._times_by_track: dict[str, set[float]] = {}
         self._claims: dict[object, float] = {}
-        #< False once the page's own evidence lookup failed: the insert guard
-        #  is then the only check and must read listener ends itself
-        self.evidenceComplete = True
         for item in items:
             track_id = _item_track_id(item)
             timestamp = _item_timestamp(item)

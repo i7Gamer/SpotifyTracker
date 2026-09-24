@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from Database.backfill_matching import LISTENER_MAX_PLAY_SPAN_SECONDS
 from Database.queries._base import (
     ALBUM_SORT_COLUMNS,
     ARTIST_SORT_COLUMNS,
@@ -217,12 +218,15 @@ class PlayQueries:
         timeClause = "p.played_at BETWEEN ? AND ?"
         params = [username, startTs, endTs]
         if includeListenerEnds:
-            # The created_at arm is unindexed: it scans the user's history
-            # (~25ms on a 100k-play user). The page lookup pays it once; the
-            # per-insert guard only when that lookup failed (findMatchingBackfillPlay).
-            timeClause += (" OR (p.created_reason LIKE 'listener_play%' AND p.is_skip=0 "
-                           "AND p.created_at BETWEEN ? AND ?)")
-            params += [startTs, endTs]
+            # A listener row is reached by its observed end too - a paused play
+            # starts far before the window. The outer played_at range keeps the
+            # created_at arm on the (username, played_at) index; unbounded, it
+            # scanned the user's whole history (~28ms per call on 100k plays).
+            timeClause = (f"p.played_at BETWEEN ? AND ? AND ({timeClause}"
+                          " OR (p.created_reason LIKE 'listener_play%' AND p.is_skip=0"
+                          " AND p.created_at BETWEEN ? AND ?))")
+            params = [username, startTs - LISTENER_MAX_PLAY_SPAN_SECONDS, endTs, startTs, endTs,
+                      startTs, endTs]
         rows = conn.execute(
             "SELECT p.id AS row_id, p.track_id, p.played_at, p.created_reason, p.is_skip, "
             "CASE WHEN p.created_reason LIKE 'listener_play%' AND p.is_skip=0 THEN p.created_at "
@@ -262,14 +266,13 @@ class PlayQueries:
         page matcher claims the physical row once rather than duplicating it
         once per alias.
 
-        Reads by played_at only while the page's own lookup succeeded: that
-        lookup already checked listener ends, and this runs per insert under
-        the write reservation. After it failed, this is the only check, so a
-        long-paused play - start beyond this reach - is found by its end.
+        Reaches listener rows by their observed end as well: the page lookup
+        may have failed, or a long-paused play - start beyond this reach - may
+        have committed since it ran, and this recheck is the last one.
         """
         reach = max(toleranceSeconds, skipToleranceSeconds or 0)
         rows = self._getTrackPlayEvidence(username, playedAt - reach, playedAt + reach, page=page,
-                                          includeListenerEnds=not page.evidenceComplete)
+                                          includeListenerEnds=True)
         return page.match(trackId, playedAt, rows,
                           toleranceSeconds=toleranceSeconds,
                           skipToleranceSeconds=skipToleranceSeconds)

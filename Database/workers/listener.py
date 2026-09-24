@@ -41,9 +41,7 @@ class ListenerMixin:
                 evidence = self.repo.getTrackPlayTimesInRange(self.user, *window, page=page)
             except Exception as e:
                 # A failed lookup answered nothing. Reoffer conservatively and
-                # let the insert guard settle already-recorded rows - with the
-                # listener-end evidence this lookup would have supplied.
-                page.evidenceComplete = False
+                # let the insert guard settle already-recorded rows.
                 _dbmod.logger.debug(
                     "Backfill dedup database lookup failed, conservatively reoffering plays: %s",
                     _dbmod.parseError(e),
