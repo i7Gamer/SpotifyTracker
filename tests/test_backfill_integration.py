@@ -384,3 +384,35 @@ class TestWebApiBackfillSQLiteContract(DatabaseTestCase):
         self.db.repo.commit()
         self.db._reconcileWithWebApiHistory([_api_item("unrelated", BASE_TS, isrc="DIFFERENT")])
         self.assertEqual([row["played_at"] for row in _rows(self.db)], [BASE_TS, BASE_TS + 1])
+
+
+class TestBackfillPageWindowReachesEveryMatchArm(DatabaseTestCase):
+    """The prefilter can only suppress a row its range query returns. With
+    the window padded by the 2s start tolerance alone, a listener row the
+    matcher accepts at 3-5s (start) or up to 10s (observed end) past the
+    NEWEST stamp was never read (Copilot on #40). The insert guard's wider
+    lookup still caught it, but only after a reoffer and a catalog write."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = self._makeDb({}, [], username="alice")
+        self.db.saveImagesFromTrack = MagicMock()
+        self.db.updatePlaylists = MagicMock()
+        self.db._addToDatabaseFromListener = MagicMock()
+
+    def test_listener_start_just_after_the_newest_stamp_is_suppressed_by_the_prefilter(self):
+        startLagSeconds = 4  #< inside the 5s listener-start tolerance, outside the old 2s padding
+        _seed_listener_play(self.db, "track", BASE_TS + startLagSeconds, BASE_TS + startLagSeconds + 180)
+
+        self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.db._addToDatabaseFromListener.assert_not_called()
+
+    def test_listener_end_just_after_the_newest_stamp_is_suppressed_by_the_prefilter(self):
+        pauseSeconds = 186
+        endLagSeconds = 8  #< inside the 10s observed-end tolerance, outside the old 2s padding
+        _seed_listener_play(self.db, "track", BASE_TS - 180 - pauseSeconds, BASE_TS + endLagSeconds)
+
+        self.db.process_backfill_page([_api_item("track", BASE_TS)])
+
+        self.db._addToDatabaseFromListener.assert_not_called()

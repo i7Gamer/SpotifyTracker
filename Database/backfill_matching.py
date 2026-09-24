@@ -21,6 +21,13 @@ LISTENER_END_MATCH_TOLERANCE_SECONDS = 10  #< max gap between an API stamp and a
                                            #  its observed end, pauses included. A point match: live insert
                                            #  lag is ~1s, anything minutes away is a different listen
                                            #  (Database.BACKFILL_END_TIME_MATCH_TOLERANCE_SECONDS)
+BACKFILL_PAGE_WINDOW_PADDING_SECONDS = max(WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
+                                           LISTENER_START_MATCH_TOLERANCE_SECONDS,
+                                           LISTENER_END_MATCH_TOLERANCE_SECONDS)
+                                           #< the page's evidence query must reach every row
+                                           #  match() can accept: a narrower pad left listener
+                                           #  rows 3-10s past the newest stamp unread, so the
+                                           #  prefilter reoffered what it would have suppressed
 MILLISECONDS_PER_SECOND = 1_000
 _LISTENER_SOURCE_PREFIX = "listener_play"
 _LIVE_CACHE_SOURCE = "listener_cache"
@@ -202,8 +209,8 @@ def backfill_page_window(items: list) -> tuple[float, float] | None:
         ((item.get("track") or {}).get("duration_ms", 0) or 0) // MILLISECONDS_PER_SECOND for item in items
     )
     return (
-        min(timestamps) - longest_track_seconds - WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
-        max(timestamps) + WEB_API_BACKFILL_DEDUP_TOLERANCE_SECONDS,
+        min(timestamps) - longest_track_seconds - BACKFILL_PAGE_WINDOW_PADDING_SECONDS,
+        max(timestamps) + BACKFILL_PAGE_WINDOW_PADDING_SECONDS,
     )
 
 
