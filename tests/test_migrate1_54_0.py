@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from Database.Migrators import dbversion
 from Database.Migrators.migrate1_54_0 import Migrator
-from test_migration_chain import MigrationChainTestCase
+from test_migration_chain import APP_VERSION, MigrationChainTestCase
 
 
 FROM_VERSION = "1.54.0"
@@ -63,6 +63,6 @@ class TestMigrate1_54_0(MigrationChainTestCase):
             self._runChain()
 
         snapshot.assert_called_once_with(self.runtimeDir)
-        self.assertEqual(dbversion.readDbVersion(self.dbPath), TO_VERSION)
+        self.assertEqual(dbversion.readDbVersion(self.dbPath), APP_VERSION)
         self.assertEqual(self._versions(), versionsAfterUpgrade)
         self.assertEqual(self._nonVersionDump(), before)
