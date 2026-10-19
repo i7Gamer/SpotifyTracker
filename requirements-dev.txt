@@ -41,4 +41,4 @@ beautifulsoup4==4.15.0
 # Soup Sieve 2.10 caches the sibling :has() result incorrectly for the last of
 # three .card siblings before a section. The page-gap guard uses NOCACHE to
 # evaluate the shipped selector without that cache (tests/test_css_accessibility.py).
-soupsieve==2.10
+soupsieve==3.0.3
