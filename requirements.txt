@@ -26,7 +26,7 @@ cryptography==50.0.2
 # Bump the SHA deliberately, with any fallout fixed in the same commit - same
 # reasoning as the pinned ruff/eslint versions in the lint workflow.
 spotapi @ git+https://github.com/TzurSoffer/SpotAPI@d538654574e2fb9511d1d09012aee962d380df8c
-pillow==12.3.0
+pillow==13.0.0
 requests==2.34.2
 # Sits under the listener, which is this project's most incident-prone
 # subsystem (the 401 reconnect storm, register_device INVALID_USER, the atexit
