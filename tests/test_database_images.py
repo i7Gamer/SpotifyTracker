@@ -4,6 +4,7 @@ import sys
 import os
 import threading
 import tempfile
+import shutil
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -579,6 +580,49 @@ class TestDownloadImageTaskExtension(DatabaseTestCase):
                 db._downloadImageTask(imgDir, "https://img.example/x", "img1", IMAGE_KIND_TRACK)
 
             self.assertEqual(db.repo.imageStatus("img1", IMAGE_KIND_TRACK), IMAGE_STATUS_OK)
+
+
+def _imageBytesAs(imageFormat):
+    """A tiny real image encoded as `imageFormat` - every one used here is a
+    format this Pillow build can both write and read, so a refusal can only
+    come from the decode allowlist, never from a codec that isn't there."""
+    from io import BytesIO
+    from PIL import Image
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(buffer, format=imageFormat)
+    return buffer.getvalue()
+
+
+class TestDownloadedImagesDecodeOnlyWebFormats(DatabaseTestCase):
+    """Pillow's decoders are where its advisories live (FlashPix, TIFF, PDF,
+    multi-frame loaders...), and Image.open probes EVERY registered format by
+    default. Cover and artist art is only ever served as a web format, so the
+    download decodes only those - anything else is refused before a decoder
+    for it ever runs."""
+
+    def _download(self, imageBytes, imgId):
+        db = self._makeDb({}, [])
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        imgDir = Path(tmpdir)
+        with patch.object(Database, "_mediaGet", return_value=_imageResponse(imageBytes)):
+            db._downloadImageTask(imgDir, "https://img.example/x", imgId, IMAGE_KIND_TRACK)
+        return db, imgDir
+
+    def test_each_web_format_is_still_stored(self):
+        for imageFormat in ("JPEG", "PNG", "WEBP"):
+            with self.subTest(imageFormat=imageFormat):
+                db, imgDir = self._download(_imageBytesAs(imageFormat), "img1")
+                self.assertTrue((imgDir / "img1.jpeg").exists())
+                self.assertEqual(db.repo.imageStatus("img1", IMAGE_KIND_TRACK), IMAGE_STATUS_OK)
+
+    def test_a_decodable_non_web_format_is_refused_and_failed(self):
+        """TIFF and BMP decode fine in Pillow - only the allowlist stops them."""
+        for imageFormat in ("TIFF", "BMP"):
+            with self.subTest(imageFormat=imageFormat):
+                db, imgDir = self._download(_imageBytesAs(imageFormat), "img2")
+                self.assertEqual(list(imgDir.iterdir()), [])
+                self.assertEqual(db.repo.imageStatus("img2", IMAGE_KIND_TRACK), IMAGE_STATUS_FAILED)
 
 
 class TestSaveImgEmptyUrlGuard(DatabaseTestCase):

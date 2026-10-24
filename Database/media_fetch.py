@@ -35,6 +35,13 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 # missing-file heal then deleted a healthy row and re-fetched on every hit.
 STORED_IMAGE_EXTENSION = ".jpeg"
 
+# The only formats a downloaded image may be decoded as. Image.open otherwise
+# probes every format Pillow registers, and its decoders - FlashPix, TIFF, PDF,
+# the multi-frame loaders - are where its security advisories keep landing.
+# Cover and artist art is served as JPEG (PNG/WEBP kept as cheap headroom), so
+# anything else is refused as an undecodable image before its decoder runs.
+ALLOWED_IMAGE_DECODE_FORMATS = ("JPEG", "PNG", "WEBP")
+
 # Bounds both outbound requests below - the CDN image download and the Web API
 # artist lookup. Each runs on a background image thread and has a fallback
 # behind it (the cookie client, or a later retry through the pending claim), so
@@ -150,7 +157,7 @@ class MediaFetchMixin:
             with self._mediaGet(url, timeout=MEDIA_FETCH_HTTP_TIMEOUT_SECONDS, stream=True) as response:
                 response.raise_for_status()
                 content = self._readCappedBody(response)
-            img = _dbmod.Image.open(_dbmod.BytesIO(content))
+            img = _dbmod.Image.open(_dbmod.BytesIO(content), formats=ALLOWED_IMAGE_DECODE_FORMATS)
             # Decoded HERE rather than left to img.save() below. Image.open only
             # reads the header, so a truncated or corrupt body opens fine and
             # raises in the middle of the storage step - where the rule below
