@@ -61,7 +61,7 @@ requests==2.34.2
 # NOT soak-tested against a live dealer connection - the suite mocks the
 # socket. If reconnect behaviour regresses after a deploy, this is the first
 # thing to suspect and 17.0.1 is the rollback.
-websockets==17.2
+websockets==17.3
 waitress==3.0.2
 tzdata==2026.5
 # Neither of these is used anywhere in this codebase - spotapi/utils/saver.py
