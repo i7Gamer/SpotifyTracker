@@ -11,7 +11,7 @@
 # Pinned for the same reason ruff and eslint are pinned in the lint workflow: a
 # new pytest major can change collection or deprecate an API and turn CI red on
 # a push that touched none of it.
-pytest==9.1.1
+pytest==9.2.0
 pytest-xdist==3.8.0
 
 # Used to find untested paths - routes/system.py's three polled status
